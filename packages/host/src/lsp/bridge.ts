@@ -13,10 +13,13 @@ export class LspBridge {
   constructor(public root: string) {}
   async allProblems(): Promise<DiagnosticLite[]> {
     const out: DiagnosticLite[] = [];
+    const MAX = 500;
     for (const [uri, diags] of vscode.languages.getDiagnostics()) {
       for (const d of diags) {
         out.push(toLite(uri, d));
+        if (out.length >= MAX) break;
       }
+      if (out.length >= MAX) break;
     }
     out.sort((a, b) => {
       const sev = severityRank(b.severity) - severityRank(a.severity);
@@ -27,7 +30,9 @@ export class LspBridge {
     return out;
   }
   async problemsFor(file: string): Promise<DiagnosticLite[]> {
-    const abs = path.isAbsolute(file) ? file : path.join(this.root, file);
+    const abs = path.isAbsolute(file) ? path.normalize(file) : path.normalize(path.join(this.root, file));
+    const rel = path.relative(this.root, abs);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return [];
     const uri = vscode.Uri.file(abs);
     const diags = vscode.languages.getDiagnostics(uri);
     return diags.map((d) => toLite(uri, d));
@@ -39,7 +44,10 @@ export class LspBridge {
     if (all.length === 0) return { hasErrors: false, hasWarnings: false, text: "" };
     const hasErrors = all.some((d) => d.severity === "error");
     const hasWarnings = all.some((d) => d.severity === "warning");
-    const lines = all.map((d) => `  - [${d.severity}] ${d.file}:${d.line}:${d.column}  ${d.message}${d.source ? `  (${d.source})` : ""}`);
+    const MAX_LINES = 200;
+    const shown = all.slice(0, MAX_LINES);
+    const lines = shown.map((d) => `  - [${d.severity}] ${d.file}:${d.line}:${d.column}  ${d.message}${d.source ? `  (${d.source})` : ""}`);
+    if (all.length > shown.length) lines.push(`  ... and ${all.length - shown.length} more (truncated)`);
     const header = hasErrors
       ? `LSP reported ${all.length} problem(s) in the file(s) you just edited. Fix the errors before continuing:`
       : `LSP reported ${all.length} warning(s)/info in the file(s) you just edited. Review and address if relevant:`;

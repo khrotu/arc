@@ -55,14 +55,16 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
   const effortLevels: Record<string, string> = { none: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "xhigh" };
   const eff = req.reasoningEffort ? effortLevels[req.reasoningEffort] : undefined;
   let skipStreamOptions = false;
+  let skipTemperature = false;
   const buildBody = (skipReasoning: boolean): Record<string, unknown> => {
     const wantsThink = hasThinking && !skipReasoning && caps.isSupported(modelKey, "thinking");
     const wantsEffort = !skipReasoning && eff && caps.isSupported(modelKey, "reasoning_effort");
     const useStreamOptions = !skipStreamOptions && caps.isSupported(modelKey, "stream_options");
+    const omitTemperature = skipTemperature || (req.temperature === undefined && (!!eff || hasThinking));
     const body: Record<string, unknown> = {
       model: remoteModel,
       stream: true,
-      temperature: req.temperature ?? 0.2,
+      ...(omitTemperature ? {} : { temperature: req.temperature ?? 0.2 }),
       messages: sanitizeToolChains(req.messages).map((m) => toOpenAIMessage(m, wantsThink, req.provider.kind)),
     };
     if (useStreamOptions) body.stream_options = { include_usage: true };
@@ -95,7 +97,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
   if (req.provider.apiKey) headers.authorization = `Bearer ${req.provider.apiKey}`;
   Object.assign(headers, attributionHeaders(req.provider.kind));
   Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId));
-  const MAX_ATTEMPTS = 2;
+  const MAX_ATTEMPTS = 3;
   const policy = policyFor(req.provider.kind);
   let res!: Response;
   let lastText = "";
@@ -120,6 +122,10 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
       continue;
     }
     if (res.status === 400 && UNSUPPORTED_PARAM_RE.test(lastText)) {
+      if (!skipTemperature && /temperature/i.test(lastText)) {
+        skipTemperature = true;
+        continue;
+      }
       if (eff && lastText.includes("reasoning_effort")) {
         caps.markUnsupported(modelKey, "reasoning_effort");
         skipReasoning = true;
@@ -241,7 +247,6 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
             const structuredThinking = detailsThinking || contentThinking || plainThinking;
             if (structuredThinking) q.push({ type: "thinking", delta: structuredThinking });
             if (delta.content) {
-              //nodel if you're one of these fuckwit providers that use think tags then truly go fuck yourself
               const text = delta.content as string;
               let s = text;
               while (s) {

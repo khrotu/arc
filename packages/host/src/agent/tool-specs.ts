@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ToolSpec } from "../providers/transport.js";
 type JsonSchema = Record<string, unknown>;
 const obj = (properties: Record<string, JsonSchema>, required: string[] = []): JsonSchema => ({
@@ -219,6 +220,14 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
       k: num("Optional max results (default 10)."),
     }, ["query"]),
   },
+  "syms.context": {
+    description: "One-call code context: returns entry-point symbols, callers/callees, and code blocks for a task. Use instead of N grep/read round-trips when exploring unfamiliar code.",
+    parameters: obj({
+      query: str("Task description or symbol name (e.g. 'user authentication' or 'validateToken')."),
+      maxNodes: num("Optional max symbols (default 20, max 60)."),
+      includeCode: bool("Include code blocks (default true)."),
+    }, ["query"]),
+  },
   "mcp.call": {
     description: "Call a tool exposed by a connected MCP server.",
     parameters: obj({
@@ -351,10 +360,10 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     }, ["question"]),
   },
   "handoff": {
-    description: "Hand the conversation to a heavier or lighter model.",
+    description: "Hand the conversation to a different model tier. USE THIS when the task exceeds your capabilities: escalate to a heavier model for hard reasoning, complex refactors, ambiguous architecture, or repeated failures; de-escalate to a lighter/cheaper model for grunt work, bulk edits, or simple follow-ups once the hard part is done. Your todo plan, conversation, and file context carry over automatically — you do NOT lose progress. You are the current tier (see Environment / model label in context); heavier = default→heavy or light→default, lighter = reverse. Prefer escalating early over failing repeatedly: if you have tried 2 approaches and are stuck, hand off with a clear reason stating what was tried, what failed, and what the next model should do first.",
     parameters: obj({
-      reason: str("Why the handoff is needed."),
-      direction: enumStr(["escalate", "de-escalate"], "escalate to a heavier model or de-escalate to a lighter one."),
+      reason: str("Why the handoff is needed: what you tried, what failed or is beyond you, and what the next model should do first."),
+      direction: enumStr(["escalate", "de-escalate"], "escalate to a heavier/more capable model or de-escalate to a lighter/cheaper one."),
     }, ["reason"]),
   },
   "clarification.askUser": {
@@ -672,9 +681,16 @@ export function buildToolSpecs(
   const tools = mcpTools ?? [];
   const maxIndividual = opts?.maxIndividualMcpTools ?? 40;
   if (tools.length > 0 && tools.length <= maxIndividual) {
+    const seen = new Set<string>();
     for (const t of tools) {
-      const specName = mcpToolSpecName(t.server, t.name);
+      let specName = mcpToolSpecName(t.server, t.name);
       if (!VALID_SPEC_NAME.test(specName)) continue;
+      if (seen.has(specName)) {
+        const suffix = createHash("sha256").update(`${t.server} ${t.name}`).digest("hex").slice(0, 6);
+        specName = `${specName}_${suffix}`;
+        if (!VALID_SPEC_NAME.test(specName) || seen.has(specName)) continue;
+      }
+      seen.add(specName);
       if (mcpEnabled.has("mcp.call") || mcpEnabled.has(specName)) {
         mcpReverse.set(specName, { server: t.server, tool: t.name });
         specs.push({
@@ -689,11 +705,12 @@ export function buildToolSpecs(
 }
 const MCP_TOOL_SEP = "__";
 const VALID_SPEC_NAME = /^[a-zA-Z0-9_-]+$/;
-function safeServerName(server: string): string {
-  return server.replace(/[^a-zA-Z0-9_.-]/g, "_");
+function safeSpecPart(part: string): string {
+  const clean = part.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  return clean || "unnamed";
 }
 export function mcpToolSpecName(server: string, tool: string): string {
-  return `mcp${MCP_TOOL_SEP}${safeServerName(server)}${MCP_TOOL_SEP}${tool}`;
+  return `mcp${MCP_TOOL_SEP}${safeSpecPart(server)}${MCP_TOOL_SEP}${safeSpecPart(tool)}`;
 }
 export function isMcpToolSpec(name: string): boolean {
   return name.startsWith("mcp__") && name.indexOf("__", 5) > 5;

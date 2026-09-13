@@ -18,8 +18,19 @@ export default function ConversationSearch({ client, onClose }: Props) {
     inputRef.current?.focus();
     const handler = (e: MessageEvent) => {
       if (e.data?.type === "chat/searchResults") {
-        if (e.data.query !== undefined && e.data.query !== latestQueryRef.current) return;
-        setResults(e.data.results);
+        if (typeof e.data.query !== "string" || e.data.query !== latestQueryRef.current) return;
+        const raw: unknown[] = Array.isArray(e.data.results) ? e.data.results : [];
+        setResults(
+          raw
+            .filter((r: unknown): r is Record<string, unknown> => !!r && typeof r === "object" && typeof (r as Record<string, unknown>).id === "string")
+            .map((r) => ({
+              id: r.id as string,
+              title: typeof r.title === "string" ? r.title : "(untitled)",
+              matches: Array.isArray(r.matches)
+                ? r.matches.map((m: unknown) => (typeof m === "string" ? m : m && typeof (m as Record<string, unknown>).text === "string" ? ((m as Record<string, unknown>).text as string) : "")).filter(Boolean)
+                : [],
+            })),
+        );
         setLoading(false);
       }
     };
@@ -28,7 +39,7 @@ export default function ConversationSearch({ client, onClose }: Props) {
   }, []);
   useEffect(() => {
     const t = setTimeout(() => {
-      if (!query.trim()) { setResults([]); return; }
+      if (!query.trim()) { setResults([]); setLoading(false); return; }
       setLoading(true);
       latestQueryRef.current = query.trim();
       client.send({ type: "chat/search", query: latestQueryRef.current });

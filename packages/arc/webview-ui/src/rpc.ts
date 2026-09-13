@@ -19,6 +19,7 @@ export function createClient(): RpcClient {
   window.addEventListener("message", (ev: MessageEvent) => {
     if (!ev.data || typeof ev.data !== "object") return;
     const msg = ev.data as HostEvent;
+    if (typeof (msg as { type?: unknown }).type !== "string") return;
     if (msg && (msg as { type?: string }).type === "config/get" && (msg as { inReplyTo?: string }).inReplyTo) {
       const cb = pending.get((msg as { inReplyTo: string }).inReplyTo);
       if (cb) {

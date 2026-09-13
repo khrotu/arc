@@ -3,7 +3,8 @@
   "compilerOptions": {
     "outDir": "dist",
     "rootDir": ".",
-    "types": ["vscode", "node"]
+    "types": ["vscode", "node"],
+    "noEmit": true
   },
   "include": ["src", "webview-ui/src", "esbuild.config.mjs"]
 }

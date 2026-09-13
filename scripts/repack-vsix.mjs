@@ -109,17 +109,30 @@ async function verify(path, src) {
   }
 }
 const target = process.argv[2];
-const TEXT_EXTS = new Set([".md", ".json", ".xml", ".txt", ".js", ".css", ".svg", ".html"]);
+const TEXT_EXTS = new Set([".md", ".json", ".xml", ".txt", ".js", ".cjs", ".mjs", ".css", ".svg", ".html", ".vsixmanifest", ".tokens"]);
 const before = statSync(target).size;
 const src = (await readEntries(target))
   .map((e) => {
-    if (e.dir || !TEXT_EXTS.has(extname(e.name).toLowerCase())) return e;
-    const data = Buffer.from(e.data.toString("utf8").replace(/\r\n/g, "\n"));
-    return { ...e, data, crc: crc32(data) };
+    if (e.dir || !TEXT_EXTS.has(extname(e.name).toLowerCase())) return { ...e, madeBy: 20, attrs: e.dir ? 0x10 << 16 : 0x20 << 16 };
+    let text;
+    try {
+      text = e.data.toString("utf8");
+      Buffer.from(text, "utf8");
+    } catch {
+      return { ...e, madeBy: 20, attrs: e.dir ? 0x10 << 16 : 0x20 << 16 };
+    }
+    const data = Buffer.from(text.replace(/\r\n/g, "\n"), "utf8");
+    return { ...e, data, crc: crc32(data), madeBy: 20, attrs: e.dir ? 0x10 << 16 : 0x20 << 16 };
   })
   .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 const tmp = target + ".repack";
-writeFileSync(tmp, await buildZip(src));
-await verify(tmp, src);
-renameSync(tmp, target);
+try {
+  writeFileSync(tmp, await buildZip(src));
+  await verify(tmp, src);
+  renameSync(tmp, target);
+} catch (e) {
+  const { rmSync: rmTmp } = await import("node:fs");
+  try { rmTmp(tmp, { force: true }); } catch {}
+  throw e;
+}
 console.log(`repacked: ${(before / 1024).toFixed(2)} KB -> ${(statSync(target).size / 1024).toFixed(2)} KB (${src.length} entries)`);

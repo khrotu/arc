@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import type { EmbeddingVector } from "./backend.js";
 interface VectorIndexSecurity {
   encrypt?: (content: Buffer) => Promise<Buffer>;
@@ -18,39 +19,59 @@ export interface SearchHit {
 }
 export class VectorIndex {
   private records = new Map<string, VectorRecord>();
-  add(rec: VectorRecord): void {
-    this.records.set(rec.id, rec);
+  private expectedDim = 0;
+  add(rec: VectorRecord): boolean {
+    if (!Array.isArray(rec.vector) || rec.vector.length === 0) return false;
+    if (typeof rec.id !== "string" || rec.id.length === 0 || Buffer.byteLength(rec.id) > 4096) return false;
+    const vector = rec.vector.slice();
+    for (const x of vector) {
+      if (!Number.isFinite(x)) return false;
+    }
+    if (this.expectedDim === 0) this.expectedDim = vector.length;
+    else if (vector.length !== this.expectedDim) return false;
+    this.records.set(rec.id, { id: rec.id, vector, meta: { ...rec.meta } });
+    return true;
   }
   remove(id: string): boolean {
-    return this.records.delete(id);
+    const ok = this.records.delete(id);
+    if (ok && this.records.size === 0) this.expectedDim = 0;
+    return ok;
   }
   get(id: string): VectorRecord | undefined {
-    return this.records.get(id);
+    const rec = this.records.get(id);
+    if (!rec) return undefined;
+    return { id: rec.id, vector: [...rec.vector], meta: { ...rec.meta } };
   }
   size(): number {
     return this.records.size;
   }
   clear(): void {
     this.records.clear();
+    this.expectedDim = 0;
   }
   search(query: EmbeddingVector, k: number): SearchHit[] {
     if (this.records.size === 0) return [];
+    if (!Array.isArray(query.values) || query.values.length === 0) return [];
+    const limit = Number.isFinite(k) ? Math.max(0, Math.min(Math.floor(k), 1000)) : 0;
+    if (limit === 0) return [];
     const q = normalize(query.values);
     if (!q) return [];
     const scored: SearchHit[] = [];
     for (const rec of this.records.values()) {
+      if (rec.vector.length !== q.length) continue;
       const v = normalize(rec.vector);
       if (!v) continue;
       const score = cosine(q, v);
-      scored.push({ id: rec.id, score, meta: rec.meta });
+      if (!Number.isFinite(score)) continue;
+      scored.push({ id: rec.id, score, meta: { ...rec.meta } });
     }
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, k);
+    return scored.slice(0, limit);
   }
   filter(predicate: (rec: VectorRecord) => boolean): VectorRecord[] {
     const out: VectorRecord[] = [];
     for (const rec of this.records.values()) {
-      if (predicate(rec)) out.push(rec);
+      if (predicate(rec)) out.push({ id: rec.id, vector: [...rec.vector], meta: { ...rec.meta } });
     }
     return out;
   }
@@ -65,7 +86,7 @@ export class VectorIndex {
     let totalVec = 0;
     for (const rec of recs) {
       const idEnc = Buffer.from(rec.id, "utf-8");
-      if (idEnc.length > 65535) throw new Error(`Record id too long: ${idEnc.length} > 65535`);
+      if (idEnc.length > 4096) throw new Error(`Record id too long: ${idEnc.length} > 4096`);
       idBufs.push(idEnc);
       totalId += idEnc.length;
       const metaEnc = Buffer.from(JSON.stringify(rec.meta), "utf-8");
@@ -96,38 +117,66 @@ export class VectorIndex {
       bufs.push(dim, vecBufs[i]);
     }
     const out = Buffer.concat(bufs);
-    await fs.writeFile(filePath, security.encrypt ? await security.encrypt(out) : out, { mode: 0o600 });
+    const payload = security.encrypt ? await security.encrypt(out) : out;
+    const tmpPath = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+    try {
+      await fs.writeFile(tmpPath, payload, { mode: 0o600 });
+      await fs.rename(tmpPath, filePath);
+    } finally {
+      await fs.unlink(tmpPath).catch(() => {});
+    }
   }
   static async load(filePath: string): Promise<VectorIndex> {
     const idx = new VectorIndex();
     const stored = await fs.readFile(filePath);
-    const buf = stored.toString("ascii", 0, 4) === "ARCX" ? stored : security.decrypt ? await security.decrypt(stored) : stored;
-    if (buf.length < 16) return idx;
+    let buf = stored;
+    if (security.decrypt) {
+      let decrypted: Buffer;
+      try {
+        decrypted = await security.decrypt(stored);
+      } catch {
+        throw new Error(`Cannot decrypt index file: ${filePath}`);
+      }
+      if (decrypted.toString("ascii", 0, 4) !== "ARCX") {
+        throw new Error(`Decrypted index file is not an Arc index: ${filePath}`);
+      }
+      buf = decrypted;
+    }
+    if (buf.length < 16) throw new Error(`Truncated index file: ${filePath}`);
     const magic = buf.toString("ascii", 0, 4);
     if (magic !== "ARCX") throw new Error(`Not an Arc index file: ${filePath}`);
     const version = buf.readUInt32LE(4);
     if (version !== 1) throw new Error(`Unsupported index version: ${version}`);
     const count = buf.readUInt32LE(8);
+    if (count > 10_000_000) throw new Error(`Corrupt index record count: ${filePath}`);
     let off = 16;
     for (let i = 0; i < count; i++) {
-      if (off + 2 > buf.length) break;
+      if (off + 2 > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const idLen = buf.readUInt16LE(off); off += 2;
-      if (off + idLen > buf.length) break;
+      if (idLen > 4096) throw new Error(`Corrupt index record id: ${filePath}`);
+      if (off + idLen > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const id = buf.toString("utf-8", off, off + idLen); off += idLen;
-      if (off + 2 > buf.length) break;
+      if (off + 2 > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const metaLen = buf.readUInt16LE(off); off += 2;
-      if (off + metaLen > buf.length) break;
+      if (metaLen > 1024 * 1024) throw new Error(`Corrupt index record meta: ${filePath}`);
+      if (off + metaLen > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const metaJson = buf.toString("utf-8", off, off + metaLen); off += metaLen;
-      const meta = JSON.parse(metaJson) as Record<string, unknown>;
-      if (off + 2 > buf.length) break;
+      let meta: Record<string, unknown>;
+      try {
+        meta = JSON.parse(metaJson) as Record<string, unknown>;
+      } catch {
+        throw new Error(`Corrupt index record meta: ${filePath}`);
+      }
+      if (off + 2 > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const dim = buf.readUInt16LE(off); off += 2;
-      if (off + dim * 4 > buf.length) break;
+      if (dim === 0 || dim > 100_000) throw new Error(`Corrupt index record dim: ${filePath}`);
+      if (off + dim * 4 > buf.length) throw new Error(`Truncated index file: ${filePath}`);
       const vector: number[] = [];
       for (let j = 0; j < dim; j++) {
         vector.push(buf.readFloatLE(off));
         off += 4;
       }
-      idx.add({ id, vector, meta });
+      if (!idx.add({ id, vector, meta })) throw new Error(`Corrupt index record (dim ${dim}): ${filePath}`);
     }
     return idx;
   }

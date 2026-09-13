@@ -21,9 +21,9 @@ export function parseRetryAfterMs(value: string | null | undefined): number | un
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   const seconds = Number(trimmed);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  if (Number.isFinite(seconds)) return Math.min(Math.max(0, seconds * 1000), 300_000);
   const dateMs = Date.parse(trimmed);
-  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  if (Number.isFinite(dateMs)) return Math.min(Math.max(0, dateMs - Date.now()), 300_000);
   return undefined;
 }
 export function computeBackoffDelay(attempt: number, policy: RetryPolicy = DEFAULT_RETRY_POLICY, retryAfterMs?: number): number {
@@ -59,16 +59,40 @@ export async function withRetry(
 ): Promise<Response> {
   const sleep = opts?.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   let res: Response | undefined;
+  let lastError: unknown;
   for (let attempt = 0; attempt <= policy.maxRetries; attempt++) {
-    res = await attemptFn(attempt);
+    try {
+      res = await attemptFn(attempt);
+    } catch (e) {
+      lastError = e;
+      const retryable = isRetryableError(e);
+      if (!retryable || attempt >= policy.maxRetries) throw e;
+      if (opts?.budget && !opts.budget.tryConsume()) throw e;
+      const delayMs = computeBackoffDelay(attempt, policy);
+      opts?.onRetry?.({ attempt, status: 0, retryAfterMs: undefined, delayMs });
+      await sleep(delayMs);
+      continue;
+    }
     if (res.ok) return res;
     const retryable = isRetryableStatus(res.status);
-    const hasBudget = !opts?.budget || opts.budget.tryConsume();
-    if (!retryable || attempt >= policy.maxRetries || !hasBudget) return res;
+    if (!retryable || attempt >= policy.maxRetries) return res;
+    if (opts?.budget && !opts.budget.tryConsume()) return res;
+    await res.body?.cancel().catch(() => undefined);
     const retryAfterMs = parseRetryAfterMs(res.headers?.get?.("retry-after"));
     const delayMs = computeBackoffDelay(attempt, policy, retryAfterMs);
     opts?.onRetry?.({ attempt, status: res.status, retryAfterMs, delayMs });
     await sleep(delayMs);
   }
-  return res!;
+  if (!res) throw lastError instanceof Error ? lastError : new Error("request failed");
+  return res;
+}
+function isRetryableError(e: unknown): boolean {
+  if (e instanceof DOMException && e.name === "AbortError") return false;
+  if (e && typeof e === "object" && "cause" in e) {
+    const cause = (e as { cause?: { code?: string } }).cause;
+    if (cause && typeof cause.code === "string" && ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EPIPE"].includes(cause.code)) {
+      return true;
+    }
+  }
+  return e instanceof TypeError;
 }

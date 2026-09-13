@@ -2,7 +2,7 @@ import { AsyncEventQueue, readableToAsyncIterable } from "../util/stream.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
 import { withRetry, policyFor } from "./retry.js";
-import { attributionHeaders } from "./attribution.js";
+import { attributionHeaders, opencodeSessionHeader } from "./attribution.js";
 import { readBodyLimited } from "../security/network.js";
 import { redactSecrets } from "../security/redact.js";
 import { hostLog } from "../log/logger.js";
@@ -52,9 +52,17 @@ export function applyPromptCaching(body: Record<string, unknown>): Record<string
   }
   if (Array.isArray(out.messages) && out.messages.length > 1) {
     const messages = (out.messages as { role: string; content: unknown }[]).slice();
-    const cutIdx = messages.length - 2;
-    messages[cutIdx] = { ...messages[cutIdx], content: markCacheControl(messages[cutIdx].content) };
-    out.messages = messages;
+    let cutIdx = -1;
+    for (let i = messages.length - 2; i >= 0; i--) {
+      if (messages[i].role !== "tool") {
+        cutIdx = i;
+        break;
+      }
+    }
+    if (cutIdx >= 0) {
+      messages[cutIdx] = { ...messages[cutIdx], content: markCacheControl(messages[cutIdx].content) };
+      out.messages = messages;
+    }
   }
   return out;
 }
@@ -70,8 +78,8 @@ export const anthropicTransport: Transport = {
         const images = (m as any).images as { image_url: { url: string } }[] | undefined;
         if (images?.length) {
           for (const img of images) {
-            const match = img.image_url.url.match(/^data:(image\/\w+);base64,(.+)$/);
-            if (match) content.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
+            const match = img.image_url.url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+            if (match) content.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2].replace(/\s+/g, "") } });
           }
         }
         return { role: "user" as const, content };
@@ -85,26 +93,25 @@ export const anthropicTransport: Transport = {
           ],
         };
       }
-      return { role: m.role as "user" | "assistant", content: m.content };
-    });
-    const convWithImages = conv.map((c) => {
-      if (c.role !== "user" || typeof c.content !== "string") return c;
-      const orig = req.messages.find((m) => m.content === c.content && (m.role === "user" || m.role === "tool"));
-      const images = (orig as any)?.images as { image_url: { url: string } }[] | undefined;
-      if (!images?.length) return c;
-      const parts: unknown[] = [{ type: "text", text: c.content }];
-      for (const img of images) {
-        const match = img.image_url.url.match(/^data:(image\/\w+);base64,(.+)$/);
-        if (match) {
-          parts.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
+      if (m.role === "user") {
+        const images = (m as { images?: { image_url: { url: string } }[] }).images;
+        if (images?.length) {
+          const parts: unknown[] = [{ type: "text", text: m.content }];
+          for (const img of images) {
+            const match = img.image_url.url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+            if (match) {
+              parts.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2].replace(/\s+/g, "") } });
+            }
+          }
+          return { role: "user" as const, content: parts };
         }
       }
-      return { role: "user", content: parts };
+      return { role: m.role as "user" | "assistant", content: m.content };
     });
     const body: Record<string, unknown> = {
       model: remoteModel,
       max_tokens: req.maxTokens ?? 4096,
-      messages: convWithImages,
+      messages: conv,
       stream: true,
     };
     if (systemMsgs) body.system = systemMsgs;
@@ -135,6 +142,7 @@ export const anthropicTransport: Transport = {
           "anthropic-beta": "prompt-caching-2024-07-31",
           "anthropic-dangerous-direct-browser-access": "true",
           ...attributionHeaders(req.provider.kind),
+          ...opencodeSessionHeader(base, req.provider.kind, req.conversationId),
         },
         body: JSON.stringify(cachedBody),
         signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000),
@@ -199,7 +207,7 @@ export const anthropicTransport: Transport = {
               if (j.type === "content_block_start" && j.content_block) {
                 if (j.content_block.type === "tool_use" && typeof j.index === "number") {
                   toolBlocks.set(j.index, {
-                    id: j.content_block.id ?? `tc-${Date.now()}`,
+                    id: j.content_block.id ?? `tc-${j.index}-${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`,
                     name: j.content_block.name ?? "tool",
                     json: "",
                   });

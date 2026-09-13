@@ -18,6 +18,22 @@ afterEach(async () => {
   await fs.rm(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 describe("CheckpointStore", () => {
+  it("drops invalid blob hashes on load", async () => {
+    const f = path.join(root, "a.txt");
+    await fs.writeFile(f, "hello\n", "utf-8");
+    await store.snapshot("t1", root, ["a.txt"]);
+    const snap = await store.load(root, "t1");
+    expect(snap).toBeDefined();
+    snap!.files["evil"] = "../../../../etc/passwd";
+    snap!.files["short"] = "abc123";
+    const metaDir = path.join(storeDir, "turns", encodeURIComponent(root));
+    await fs.writeFile(path.join(metaDir, "t1.json"), JSON.stringify(snap), "utf-8");
+    const fresh = new CheckpointStore({ dir: storeDir });
+    const reloaded = await fresh.load(root, "t1");
+    expect(reloaded!.files["evil"]).toBeUndefined();
+    expect(reloaded!.files["short"]).toBeUndefined();
+    expect(reloaded!.files["a.txt"]).toMatch(/^[0-9a-f]{32}$/);
+  });
   it("snapshots and restores edited files", async () => {
     const f = path.join(root, "a.txt");
     await fs.writeFile(f, "before\n", "utf-8");
@@ -58,7 +74,7 @@ describe("CheckpointStore", () => {
     await store.snapshot("t1", root, ["mine.txt"]);
     const t1 = Date.now();
     expect(t1 - t0).toBeLessThan(1000);
-    const blobDir = path.join(storeDir, "blobs");
+    const blobDir = path.join(storeDir, "objects");
     const blobs = await fs.readdir(blobDir).catch(() => []);
     let total = 0;
     async function count(d: string) {
@@ -79,5 +95,21 @@ describe("CheckpointStore", () => {
     const r = await store.restore(root, "t1");
     expect(r.conflicts).toContain("a.txt");
     expect(await fs.readFile(f, "utf-8")).toBe("snap");
+  });
+  it("gc keeps blobs still referenced by another workspace root", async () => {
+    const rootB = path.join(work, "ws-b");
+    await fs.mkdir(rootB, { recursive: true });
+    const fa = path.join(root, "a.txt");
+    const fb = path.join(rootB, "b.txt");
+    await fs.writeFile(fa, "shared-content", "utf-8");
+    await fs.writeFile(fb, "shared-content", "utf-8");
+    await store.snapshot("t1", root, ["a.txt"]);
+    await store.snapshot("t1", rootB, ["b.txt"]);
+    await store.restoreRange(root, 0, Date.now());
+    expect(await store.listTurns(root)).toEqual([]);
+    await fs.writeFile(fb, "changed", "utf-8");
+    const r = await store.restore(rootB, "t1");
+    expect(r.restored).toContain("b.txt");
+    expect(await fs.readFile(fb, "utf-8")).toBe("shared-content");
   });
 });

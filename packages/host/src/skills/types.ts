@@ -12,5 +12,6 @@ export interface SkillsLockEntry {
   source: string;
   version: string;
   revision: string;
+  hash?: string;
 }
 export type SkillsLock = Record<string, SkillsLockEntry>;

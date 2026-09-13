@@ -2,7 +2,9 @@ import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 import { getArcDir, getLocalWorkspaceArcDir, getWorkspaceArcDir } from "../arc-dir.js";
 import { parseSkillMd, readSkillBody } from "./parser.js";
-import type { SkillMetadata } from "./types.js";
+import { loadSkillsLock } from "./lock.js";
+import { hostWarn } from "../log/logger.js";
+import type { SkillMetadata, SkillsLock } from "./types.js";
 export { type SkillMetadata } from "./types.js";
 export class SkillRegistry {
   private skills = new Map<string, SkillMetadata>();
@@ -14,11 +16,12 @@ export class SkillRegistry {
     this.skills.clear();
     await this.loadFromDir(path.join(getArcDir(), "skills"), "global");
     if (this.workspaceRoot) {
-      await this.loadFromDir(path.join(getWorkspaceArcDir(this.workspaceRoot), "skills"), "workspace");
-      if (this.includeRepositoryFiles) await this.loadFromDir(path.join(getLocalWorkspaceArcDir(this.workspaceRoot), "skills"), "workspace");
+      const lock = await loadSkillsLock(this.workspaceRoot).catch(() => ({} as SkillsLock));
+      await this.loadFromDir(path.join(getWorkspaceArcDir(this.workspaceRoot), "skills"), "workspace", lock);
+      if (this.includeRepositoryFiles) await this.loadFromDir(path.join(getLocalWorkspaceArcDir(this.workspaceRoot), "skills"), "workspace", lock);
     }
   }
-  private async loadFromDir(baseDir: string, scope: "workspace" | "global"): Promise<void> {
+  private async loadFromDir(baseDir: string, scope: "workspace" | "global", lock?: SkillsLock): Promise<void> {
     let entries: string[];
     try {
       entries = await readDirSafe(baseDir);
@@ -33,7 +36,18 @@ export class SkillRegistry {
         const skillPath = stat?.isDirectory() ? skillMd : entry.endsWith(".md") ? skillDir : undefined;
         if (!skillPath) continue;
         const meta = await parseSkillMd(skillPath, scope);
-        if (meta) this.skills.set(meta.name, meta);
+        if (!meta) continue;
+        if (lock?.[meta.name]?.hash) {
+          try {
+            const { createHash } = await import("node:crypto");
+            const raw = await fsp.readFile(skillPath, "utf-8");
+            if (createHash("sha256").update(raw).digest("hex") !== lock[meta.name].hash) {
+              hostWarn(`[arc] skill '${meta.name}' does not match skills-lock.json pin; skipping. Re-pin to trust the new version.`);
+              continue;
+            }
+          } catch {}
+        }
+        this.skills.set(meta.name, meta);
       } catch {
       }
     }

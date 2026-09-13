@@ -106,7 +106,7 @@ notebook-demo.ipynb  Jupyter notebook for notebook.read/editCell/addCell/deleteC
 | browser.domSnapshot | Get full page snapshot |
 | browser.drag | Drag from one selector to another |
 | browser.dialog | Handle browser dialogs (alert, confirm, prompt) |
-| browser.runCode | Run arbitrary Playwright code |
+| browser.runCode | Run a constrained page-automation snippet (goto/click/fill/evaluate/...) |
 | browser.hover | Hover over a selector |
 | browser.scroll | Scroll to a selector or by pixels |
 | browser.waitFor | Wait for selector, URL, or state |

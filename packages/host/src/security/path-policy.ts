@@ -36,7 +36,7 @@ export function classifyWorkspacePath(workspaceRoot: string, requested: string):
     const networkOrDevice = /^(?:\\\\|\\\?\\|\\\.\\)/.test(requested);
     const driveRelative = /^[a-zA-Z]:[^\\/]/.test(requested);
     const extraColon = requested.slice(2).includes(":");
-    const reservedDevice = requested.split(/[\\/]/).some((segment) => /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(segment));
+    const reservedDevice = requested.split(/[\\/]/).some((segment) => /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?=[ .]|$)/i.test(segment.replace(/[ .]+$/, "")));
     if (networkOrDevice || driveRelative || extraColon || reservedDevice) {
       const resolved = path.resolve(workspaceRoot, requested);
       return {
@@ -59,5 +59,5 @@ export function resolveAuthorizedPath(workspaceRoot: string, requested: string, 
   const decision = classifyWorkspacePath(workspaceRoot, requested);
   if (decision.blockedReason) throw new Error(decision.blockedReason);
   if (decision.external && !allowExternal) throw new Error(`Path escapes the workspace: ${requested}`);
-  return decision.resolved;
+  return decision.canonical;
 }

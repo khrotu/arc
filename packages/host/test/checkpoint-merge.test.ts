@@ -60,7 +60,9 @@ describe("CheckpointStore restore resilience", () => {
     await store.snapshot("t1", root, ["a.txt", "b.txt"]);
     await fs.writeFile(a, "x");
     await fs.writeFile(b, "y");
-    const missingBlob = path.join(storeDir, "blobs", (await store.load(root, "t1"))!.files["a.txt"].slice(0, 2), (await store.load(root, "t1"))!.files["a.txt"]);
+    const snap = await store.load(root, "t1");
+    const hash = snap!.files["a.txt"];
+    const missingBlob = path.join(storeDir, "objects", hash.slice(0, 2), `${hash}.bin`);
     await fs.unlink(missingBlob);
     const r = await store.restore(root, "t1");
     expect(r.restored).toContain("b.txt");

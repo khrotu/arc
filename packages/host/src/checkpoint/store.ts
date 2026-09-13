@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { resolveAuthorizedPath } from "../security/path-policy.js";
+import { loadArcIgnore } from "../util/arcignore.js";
 export interface TurnSnapshot {
   turnId: string;
   ts: number;
@@ -26,10 +27,32 @@ export class CheckpointStore {
   static hash(content: string | Buffer): string {
     return crypto.createHash("sha256").update(content).digest("hex").slice(0, 32);
   }
+  static isBlobHash(hash: string): boolean {
+    return /^[0-9a-f]{32}$/.test(hash) || hash === "__none__";
+  }
+  private async eachLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const out: R[] = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const at = next++;
+        out[at] = await fn(items[at]);
+      }
+    });
+    await Promise.all(workers);
+    return out;
+  }
   async snapshot(turnId: string, root: string, files: string[], todoItems?: TurnSnapshot["todoItems"], label?: string): Promise<TurnSnapshot> {
     const prev = await this.load(root, turnId);
     const map: Record<string, string> = { ...(prev?.files ?? {}) };
-    await Promise.all(files.map(async (rel) => {
+    let effectiveFiles = files;
+    try {
+      const ignore = await loadArcIgnore(root);
+      if (ignore.patterns.length || ignore.negations.length) {
+        effectiveFiles = files.filter((f) => !ignore.isIgnored(f.replace(/\\/g, "/")));
+      }
+} catch {  }
+    await this.eachLimit(effectiveFiles, 32, async (rel) => {
       const abs = resolveAuthorizedPath(root, rel);
       let content: Buffer;
       try {
@@ -40,20 +63,32 @@ export class CheckpointStore {
       }
       const h = CheckpointStore.hash(content);
       map[rel] = h;
-      const blobPath = this.blobPath(h);
-      try {
-        await fs.access(blobPath);
-      } catch {
-        await fs.mkdir(path.dirname(blobPath), { recursive: true, mode: 0o700 });
-        await fs.writeFile(blobPath, this.opts.encrypt ? await this.opts.encrypt(content) : content, { mode: 0o600 });
-      }
-    }));
+      await fs.mkdir(path.dirname(this.blobPath(h)), { recursive: true, mode: 0o700 });
+      await this.writeBlob(h, content);
+    });
     const snap: TurnSnapshot = { turnId, ts: Date.now(), files: map, root };
-    if ((todoItems && todoItems.length) || prev?.todoItems) snap.todoItems = todoItems?.length ? todoItems : prev?.todoItems;
+    const fresh = new Set(effectiveFiles);
+    for (const [rel, hash] of Object.entries(prev?.files ?? {})) {
+      if (fresh.has(rel) || !CheckpointStore.isBlobHash(hash) || hash === "__none__") continue;
+      try {
+        await fs.stat(resolveAuthorizedPath(root, rel));
+      } catch {
+        map[rel] = "__none__";
+        snap.files[rel] = "__none__";
+      }
+    }
+    if (todoItems !== undefined) snap.todoItems = todoItems;
+    else if (prev?.todoItems) snap.todoItems = prev.todoItems;
     if (label || prev?.label) snap.label = label ?? prev?.label;
     const metaPath = this.metaPath(root, turnId);
     await fs.mkdir(path.dirname(metaPath), { recursive: true, mode: 0o700 });
-    await fs.writeFile(metaPath, JSON.stringify(snap, null, 2), { encoding: "utf-8", mode: 0o600 });
+    const tmpMeta = `${metaPath}.tmp.${process.pid}.${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+    try {
+      await fs.writeFile(tmpMeta, JSON.stringify(snap), { encoding: "utf-8", mode: 0o600 });
+      await fs.rename(tmpMeta, metaPath);
+    } finally {
+      await fs.unlink(tmpMeta).catch(() => undefined);
+    }
     this.cacheFor(root).set(turnId, snap);
     return snap;
   }
@@ -71,27 +106,41 @@ export class CheckpointStore {
       if (!ids.includes(id)) cache.delete(id);
     }
     const loaded = await Promise.all(ids.map(async (id) => ({ id, snap: await this.load(root, id).catch(() => undefined) })));
-    loaded.sort((a, b) => (b.snap?.ts ?? 0) - (a.snap?.ts ?? 0) || (a.id < b.id ? 1 : -1));
+    loaded.sort((a, b) => (b.snap?.ts ?? 0) - (a.snap?.ts ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return loaded.map((t) => t.id);
   }
   async load(root: string, turnId: string): Promise<TurnSnapshot | undefined> {
     const cached = this.cacheFor(root).get(turnId);
-    if (cached) return cached;
+    if (cached) return structuredClone(cached);
     try {
       const raw = await fs.readFile(this.metaPath(root, turnId), "utf-8");
       const snap = JSON.parse(raw) as TurnSnapshot;
       if (!snap || typeof snap !== "object" || !snap.files || typeof snap.files !== "object") return undefined;
+      for (const [rel, hash] of Object.entries(snap.files)) {
+        if (typeof rel !== "string" || typeof hash !== "string" || !CheckpointStore.isBlobHash(hash)) {
+          delete snap.files[rel];
+        }
+      }
       this.cacheFor(root).set(turnId, snap);
-      return snap;
+      return structuredClone(snap);
     } catch {
       return undefined;
     }
+  }
+  async restoreSingleFile(root: string, rel: string, hash: string): Promise<RestoreResult> {
+    if (!CheckpointStore.isBlobHash(hash) || hash === "__none__") {
+      return { restored: [], conflicts: [], errors: [`${rel}: invalid blob hash`] };
+    }
+    const snap: TurnSnapshot = { turnId: "(single)", ts: Date.now(), root, files: { [rel]: hash } };
+    return this.restoreFiles(root, [snap]);
   }
   async restore(root: string, turnId: string): Promise<RestoreResult> {
     const snap = await this.load(root, turnId);
     if (!snap) throw new Error(`No snapshot for turn ${turnId}`);
     const result = await this.restoreFiles(root, [snap]);
-    await this.deleteNewerThan(root, turnId);
+    if (!result.errors?.length) {
+      await this.deleteNewerThan(root, turnId);
+    }
     return result;
   }
   async restoreRange(root: string, afterTs: number, beforeTs: number): Promise<RestoreResult> {
@@ -106,16 +155,18 @@ export class CheckpointStore {
     const chosen = new Map<string, string>();
     for (const s of targets) {
       for (const [rel, h] of Object.entries(s.files)) {
-        if (!chosen.has(rel)) chosen.set(rel, h);
+        chosen.set(rel, h);
       }
     }
     const ordered: TurnSnapshot[] = [{ turnId: "(range)", ts: targets[0].ts, root, files: Object.fromEntries(chosen) }];
     const result = await this.restoreFiles(root, ordered);
-    await Promise.all(targets.map(async (t) => {
-      await fs.unlink(this.metaPath(root, t.turnId)).catch(() => undefined);
-      this.cacheFor(root).delete(t.turnId);
-    }));
-    await this.gcBlobs(root);
+    if (!result.errors?.length) {
+      await Promise.all(targets.map(async (t) => {
+        await fs.unlink(this.metaPath(root, t.turnId)).catch(() => undefined);
+        this.cacheFor(root).delete(t.turnId);
+      }));
+      await this.gcBlobs(root);
+    }
     return result;
   }
   private async restoreFiles(root: string, snaps: TurnSnapshot[]): Promise<RestoreResult> {
@@ -124,7 +175,10 @@ export class CheckpointStore {
     const errors: string[] = [];
     for (const snap of snaps) {
       const entries = Object.entries(snap.files);
-      const outcomes = await Promise.all(entries.map(async ([rel, hash]) => {
+      const outcomes = await this.eachLimit(entries, 32, async ([rel, hash]) => {
+        if (!CheckpointStore.isBlobHash(hash)) {
+          return { rel, ok: false, conflict: false, error: "invalid blob hash" };
+        }
         const abs = resolveAuthorizedPath(root, rel);
         try {
           if (hash === "__none__") {
@@ -137,14 +191,28 @@ export class CheckpointStore {
           } catch {}
           const conflict = !!(current && CheckpointStore.hash(current) !== hash);
           const stored = await fs.readFile(this.blobPath(hash));
-          const blob = this.opts.decrypt ? await this.opts.decrypt(stored) : stored;
+          const raw = this.opts.decrypt ? await this.opts.decrypt(stored) : stored;
+          if (CheckpointStore.hash(raw) !== hash) {
+            return { rel, ok: false, conflict: false, error: "blob content hash mismatch (corrupt)" };
+          }
           await fs.mkdir(path.dirname(abs), { recursive: true });
-          await fs.writeFile(abs, blob);
+          let existingMode: number | undefined;
+          try {
+            existingMode = (await fs.stat(abs)).mode;
+          } catch {}
+          if (existingMode !== undefined) {
+            await fs.writeFile(abs, raw);
+            try {
+              await fs.chmod(abs, existingMode);
+            } catch {}
+          } else {
+            await fs.writeFile(abs, raw);
+          }
           return { rel, ok: true, conflict };
         } catch (e) {
           return { rel, ok: false, conflict: false, error: (e as Error)?.message ?? String(e) };
         }
-      }));
+      });
       for (const o of outcomes) {
         if (!o.ok && o.error) errors.push(`${o.rel}: ${o.error}`);
         else {
@@ -166,26 +234,42 @@ export class CheckpointStore {
     }));
     await this.gcBlobs(root);
   }
-  private async gcBlobs(root: string): Promise<void> {
+  private async gcBlobs(_root: string): Promise<void> {
     try {
-      const remaining = await this.listTurns(root);
       const referenced = new Set<string>();
-      await Promise.all(remaining.map(async (id) => {
-        const snap = await this.load(root, id);
-        if (snap) {
-          for (const hash of Object.values(snap.files)) {
-            if (hash !== "__none__") referenced.add(hash);
-          }
-        }
+      const turnsBase = path.join(this.opts.dir, "turns");
+      let rootDirs: string[] = [];
+      try {
+        rootDirs = (await fs.readdir(turnsBase)).map((name) => path.join(turnsBase, name));
+      } catch {
+        rootDirs = [this.turnsDir(_root)];
+      }
+      await Promise.all(rootDirs.map(async (dir) => {
+        let entries: string[] = [];
+        try {
+          entries = (await fs.readdir(dir)).filter((e) => e.endsWith(".json"));
+        } catch { return; }
+        await Promise.all(entries.map(async (e) => {
+          try {
+            const snap = JSON.parse(await fs.readFile(path.join(dir, e), "utf-8")) as TurnSnapshot;
+            if (snap && snap.files && typeof snap.files === "object") {
+              for (const hash of Object.values(snap.files)) {
+                if (typeof hash === "string" && CheckpointStore.isBlobHash(hash) && hash !== "__none__") referenced.add(hash);
+              }
+            }
+          } catch { }
+        }));
       }));
-      const blobsDir = path.join(this.opts.dir, "blobs");
+      const blobsDir = path.join(this.opts.dir, "objects");
       const blobDirs = await fs.readdir(blobsDir, { withFileTypes: true });
       await Promise.all(blobDirs.map(async (dirEnt) => {
         if (!dirEnt.isDirectory()) return;
         const subDir = path.join(blobsDir, dirEnt.name);
         const files = await fs.readdir(subDir);
         await Promise.all(files.map(async (f) => {
-          if (!referenced.has(f)) await fs.unlink(path.join(subDir, f)).catch(() => {});
+          if (f.includes(".tmp.")) return;
+          const hash = f.endsWith(".bin") ? f.slice(0, -4) : f;
+          if (!referenced.has(hash)) await fs.unlink(path.join(subDir, f)).catch(() => {});
         }));
       }));
     } catch {}
@@ -206,9 +290,10 @@ export class CheckpointStore {
     const removed: string[] = [];
     const modified: string[] = [];
     const allFiles = new Set([...Object.keys(snapA.files), ...Object.keys(snapB.files)]);
+    const norm = (h: string | undefined): string | undefined => (!h || h === "__none__" ? undefined : h);
     for (const file of allFiles) {
-      const hashA = snapA.files[file];
-      const hashB = snapB.files[file];
+      const hashA = norm(snapA.files[file]);
+      const hashB = norm(snapB.files[file]);
       if (!hashA && hashB) added.push(file);
       else if (hashA && !hashB) removed.push(file);
       else if (hashA !== hashB) modified.push(file);
@@ -221,10 +306,43 @@ export class CheckpointStore {
       m = new Map();
       this.metaCache.set(root, m);
     }
+    while (m.size > 200) {
+      const oldest = m.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      m.delete(oldest);
+    }
     return m;
   }
   private blobPath(hash: string): string {
-    return path.join(this.opts.dir, "blobs", hash.slice(0, 2), hash);
+    return path.join(this.opts.dir, "objects", hash.slice(0, 2), `${hash}.bin`);
+  }
+  private async writeBlob(hash: string, content: string | Buffer): Promise<void> {
+    const blobPath = this.blobPath(hash);
+    try {
+      const existing = await fs.readFile(blobPath);
+      const raw = this.opts.decrypt ? await this.opts.decrypt(existing) : existing;
+      if (CheckpointStore.hash(raw) === hash) return;
+    } catch {}
+    const payload = this.opts.encrypt
+      ? await this.opts.encrypt(Buffer.isBuffer(content) ? content : Buffer.from(content))
+      : content;
+    const tmp = `${blobPath}.tmp.${process.pid}.${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+    try {
+      await fs.writeFile(tmp, payload, { mode: 0o600 });
+      await fs.rename(tmp, blobPath);
+    } finally {
+      await fs.unlink(tmp).catch(() => undefined);
+    }
+    try {
+      const check = await fs.readFile(blobPath);
+      const checkRaw = this.opts.decrypt ? await this.opts.decrypt(check) : check;
+      if (CheckpointStore.hash(checkRaw) !== hash) {
+        await fs.unlink(blobPath).catch(() => undefined);
+        throw new Error(`blob verification failed for ${hash}`);
+      }
+    } catch (e) {
+      if ((e as Error)?.message?.includes("verification failed")) throw e;
+    }
   }
   private turnsDir(root: string): string {
     const id = encodeURIComponent(root);

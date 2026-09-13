@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EmbeddingBackend } from "./backend.js";
 import { VectorIndex } from "./vector-index.js";
+import { loadArcIgnore } from "../util/arcignore.js";
+import { globToRegExp } from "../util/glob.js";
 export interface ChunkOptions {
   maxChunkChars?: number;
   overlapChars?: number;
@@ -36,10 +38,12 @@ export interface IndexProgress {
   filesIndexed: number;
   chunksEmbedded: number;
   errors: number;
+  chunksTruncated?: number;
 }
 export class Indexer {
   private index = new VectorIndex();
   private pathsById = new Map<string, { file: string; start: number; end: number }>();
+  private idsByFile = new Map<string, Set<string>>();
   constructor(private opts: IndexerOptions) {}
   getIndex(): VectorIndex { return this.index; }
   async save(filePath: string): Promise<void> {
@@ -54,38 +58,56 @@ export class Indexer {
   }
   private rebuildPathMap(): void {
     this.pathsById.clear();
+    this.idsByFile.clear();
     for (const rec of this.index.filter(() => true)) {
       const file = rec.meta.file as string | undefined;
       const start = rec.meta.start as number | undefined;
       const end = rec.meta.end as number | undefined;
       if (file && typeof start === "number" && typeof end === "number") {
-        this.pathsById.set(rec.id, { file, start, end });
+        this.track(rec.id, file, start, end);
       }
     }
   }
   async indexWorkspace(root: string): Promise<IndexProgress> {
-    const files = await walk(root, this.opts.opts?.include ?? DEFAULT_INCLUDE, this.opts.opts?.exclude ?? DEFAULT_EXCLUDE);
+    let ignore: { isIgnored: (f: string) => boolean };
+    try {
+      ignore = await loadArcIgnore(root);
+    } catch {
+      ignore = { isIgnored: () => false };
+    }
+    const files = await walk(root, this.opts.opts?.include ?? DEFAULT_INCLUDE, this.opts.opts?.exclude ?? DEFAULT_EXCLUDE, { ignore });
+    const filtered = files.filter((f) => !ignore.isIgnored(f));
     const progress: IndexProgress = { filesScanned: files.length, filesIndexed: 0, chunksEmbedded: 0, errors: 0 };
-    for (const file of files) {
+    const batchSize = Math.max(1, Math.floor(this.opts.batchSize ?? 64));
+    for (const file of filtered) {
       try {
-        const full = path.join(root, file);
+        const full = await safeJoin(root, file);
+        if (!full) {
+          progress.errors += 1;
+          continue;
+        }
         const stat = await fs.stat(full);
-        if (!stat.isFile()) continue;
+        if (!stat.isFile() || stat.size > 1024 * 1024) continue;
         const text = await fs.readFile(full, "utf-8");
-        const chunks = chunkText(text, this.opts.opts?.chunk ?? {});
-        for (const c of chunks) {
-          const id = `${file}#${c.start}-${c.end}-${randomUUID().slice(0, 6)}`;
-          this.pathsById.set(id, { file, start: c.start, end: c.end });
+        if (text.includes("\0")) continue;
+        const { chunks, truncated } = chunkText(text, this.opts.opts?.chunk ?? {});
+        if (truncated) progress.chunksTruncated = (progress.chunksTruncated ?? 0) + 1;
+        const staged: { id: string; vector: number[]; start: number; end: number; text: string }[] = [];
+        for (let b = 0; b < chunks.length; b += batchSize) {
+          const slice = chunks.slice(b, b + batchSize);
+          const vecs = await this.opts.backend.embed({ model: this.opts.backend.model, input: slice.map((c) => c.text) });
+          if (vecs.length !== slice.length) throw new Error(`embed returned ${vecs.length} vectors for ${slice.length} chunks`);
+          for (let k = 0; k < slice.length; k++) {
+            staged.push({ id: `${file}#${slice[k].start}-${slice[k].end}-${randomUUID().slice(0, 6)}`, vector: vecs[k].values, start: slice[k].start, end: slice[k].end, text: slice[k].text });
+          }
+        }
+        this.removeFile(file);
+        for (const s of staged) {
+          this.track(s.id, file, s.start, s.end);
+          this.index.add({ id: s.id, vector: s.vector, meta: { file, start: s.start, end: s.end, text: s.text.slice(0, 400) } });
         }
         progress.chunksEmbedded += chunks.length;
         progress.filesIndexed += 1;
-        const inputs = chunks.map((c) => c.text);
-        const vecs = await this.opts.backend.embed({ model: this.opts.backend.model, input: inputs });
-        for (let i = 0; i < chunks.length; i++) {
-          const id = Array.from(this.pathsById.entries()).find(([, v]) => v.file === file && v.start === chunks[i].start && v.end === chunks[i].end)?.[0];
-          if (!id) continue;
-          this.index.add({ id, vector: vecs[i].values, meta: { file, start: chunks[i].start, end: chunks[i].end, text: chunks[i].text.slice(0, 400) } });
-        }
       } catch {
         progress.errors += 1;
       }
@@ -93,27 +115,76 @@ export class Indexer {
     return progress;
   }
   async reindexFile(root: string, file: string): Promise<number> {
-    const full = path.join(root, file);
+    try {
+      const ignore = await loadArcIgnore(root);
+      if (ignore.isIgnored(file)) {
+        this.removeFile(file);
+        return 0;
+      }
+    } catch {  }
+    const full = await safeJoin(root, file);
+    if (!full) {
+      this.removeFile(file);
+      return 0;
+    }
     let text: string;
     try {
+      const stat = await fs.stat(full);
+      if (!stat.isFile() || stat.size > 1024 * 1024) {
+        this.removeFile(file);
+        return 0;
+      }
       text = await fs.readFile(full, "utf-8");
     } catch {
       this.removeFile(file);
       return 0;
     }
+    if (text.includes("\0")) {
+      this.removeFile(file);
+      return 0;
+    }
+    const { chunks } = chunkText(text, this.opts.opts?.chunk ?? {});
+    if (chunks.length === 0) {
+      this.removeFile(file);
+      return 0;
+    }
+    const batchSize = Math.max(1, Math.floor(this.opts.batchSize ?? 64));
+    const staged: { id: string; vector: number[]; start: number; end: number; text: string }[] = [];
+    for (let b = 0; b < chunks.length; b += batchSize) {
+      const slice = chunks.slice(b, b + batchSize);
+      const vecs = await this.opts.backend.embed({ model: this.opts.backend.model, input: slice.map((c) => c.text) });
+      if (vecs.length !== slice.length) throw new Error(`embed returned ${vecs.length} vectors for ${slice.length} chunks`);
+      for (let k = 0; k < slice.length; k++) {
+        staged.push({ id: `${file}#${slice[k].start}-${slice[k].end}-${randomUUID().slice(0, 6)}`, vector: vecs[k].values, start: slice[k].start, end: slice[k].end, text: slice[k].text });
+      }
+    }
     this.removeFile(file);
-    const chunks = chunkText(text, this.opts.opts?.chunk ?? {});
-    if (chunks.length === 0) return 0;
-    const inputs = chunks.map((c) => c.text);
-    const vecs = await this.opts.backend.embed({ model: this.opts.backend.model, input: inputs });
-    for (let i = 0; i < chunks.length; i++) {
-      const id = `${file}#${chunks[i].start}-${chunks[i].end}-${randomUUID().slice(0, 6)}`;
-      this.pathsById.set(id, { file, start: chunks[i].start, end: chunks[i].end });
-      this.index.add({ id, vector: vecs[i].values, meta: { file, start: chunks[i].start, end: chunks[i].end, text: chunks[i].text.slice(0, 400) } });
+    for (const s of staged) {
+      this.track(s.id, file, s.start, s.end);
+      this.index.add({ id: s.id, vector: s.vector, meta: { file, start: s.start, end: s.end, text: s.text.slice(0, 400) } });
     }
     return chunks.length;
   }
+  private track(id: string, file: string, start: number, end: number): void {
+    this.pathsById.set(id, { file, start, end });
+    let set = this.idsByFile.get(file);
+    if (!set) {
+      set = new Set();
+      this.idsByFile.set(file, set);
+    }
+    set.add(id);
+  }
   removeFile(file: string): number {
+    const ids = this.idsByFile.get(file);
+    if (ids) {
+      for (const id of ids) {
+        this.pathsById.delete(id);
+        this.index.remove(id);
+      }
+      const removed = ids.size;
+      this.idsByFile.delete(file);
+      return removed;
+    }
     let removed = 0;
     for (const [id, meta] of Array.from(this.pathsById.entries())) {
       if (meta.file === file) {
@@ -121,6 +192,11 @@ export class Indexer {
         this.pathsById.delete(id);
         removed++;
       }
+    }
+    const orphans = this.index.filter((rec) => rec.meta.file === file);
+    for (const rec of orphans) {
+      this.index.remove(rec.id);
+      removed++;
     }
     return removed;
   }
@@ -131,10 +207,10 @@ export class Indexer {
     return hits.map((h) => ({
       id: h.id,
       score: h.score,
-      file: String(h.meta.file),
-      start: Number(h.meta.start),
-      end: Number(h.meta.end),
-      text: String(h.meta.text),
+      file: typeof h.meta.file === "string" ? h.meta.file : "",
+      start: typeof h.meta.start === "number" ? h.meta.start : 0,
+      end: typeof h.meta.end === "number" ? h.meta.end : 0,
+      text: typeof h.meta.text === "string" ? h.meta.text : "",
     }));
   }
 }
@@ -143,28 +219,67 @@ export interface TextChunk {
   start: number;
   end: number;
 }
-export function chunkText(text: string, opts: ChunkOptions = {}): TextChunk[] {
-  const max = opts.maxChunkChars ?? 1500;
-  const overlap = opts.overlapChars ?? 200;
-  if (text.length <= max) return [{ text, start: 0, end: text.length }];
+export function chunkText(text: string, opts: ChunkOptions = {}): { chunks: TextChunk[]; truncated: boolean } {
+  const max = Math.min(8000, Math.max(64, opts.maxChunkChars ?? 1500));
+  const overlap = Math.min(Math.max(0, opts.overlapChars ?? 200), max - 1);
+  if (text.length <= max) return { chunks: [{ text, start: 0, end: text.length }], truncated: false };
   const chunks: TextChunk[] = [];
   let i = 0;
-  while (i < text.length) {
+  let done = false;
+  while (i < text.length && chunks.length < 512) {
     let end = Math.min(text.length, i + max);
     if (end < text.length) {
       const nl = text.indexOf("\n", end - 100);
-      if (nl > 0 && nl < end + 100) end = nl + 1;
+      if (nl > i && nl < end + 100) end = nl + 1;
     }
     const slice = text.slice(i, end);
     chunks.push({ text: slice, start: i, end });
-    if (end >= text.length) break;
+    if (end >= text.length) {
+      done = true;
+      break;
+    }
     i = Math.max(i + 1, end - overlap);
   }
-  return chunks;
+  return { chunks, truncated: !done };
 }
-export async function walk(root: string, include: string[], exclude: string[]): Promise<string[]> {
+async function safeJoin(root: string, file: string): Promise<string | undefined> {
+  if (!file || file.includes("\0") || path.isAbsolute(file)) return undefined;
+  const absRoot = path.resolve(root);
+  const full = path.resolve(root, file);
+  const rel = path.relative(absRoot, full);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return undefined;
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(absRoot);
+  } catch {
+    realRoot = absRoot;
+  }
+  try {
+    const real = await fs.realpath(full);
+    const realRel = path.relative(realRoot, real);
+    if (realRel === "" || realRel === ".." || realRel.startsWith(`..${path.sep}`) || path.isAbsolute(realRel)) return undefined;
+  } catch (e) {
+    if ((e as { code?: string })?.code !== "ENOENT") return undefined;
+    try {
+      const realParent = await fs.realpath(path.dirname(full));
+      const parentRel = path.relative(realRoot, realParent);
+      if (parentRel === ".." || parentRel.startsWith(`..${path.sep}`) || path.isAbsolute(parentRel)) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return full;
+}
+export async function walk(
+  root: string,
+  include: string[],
+  exclude: string[],
+  opts: { ignore?: { isIgnored: (f: string) => boolean }; maxFiles?: number } = {},
+): Promise<string[]> {
   const out: string[] = [];
+  const maxFiles = opts.maxFiles ?? 50_000;
   async function visit(dir: string) {
+    if (out.length >= maxFiles) return;
     let entries: import("node:fs").Dirent[];
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
@@ -172,13 +287,16 @@ export async function walk(root: string, include: string[], exclude: string[]): 
       return;
     }
     for (const ent of entries) {
+      if (out.length >= maxFiles) return;
       const full = path.join(dir, ent.name);
       const rel = path.relative(root, full).replace(/\\/g, "/");
       if (ent.isDirectory()) {
         if (matchesAny(rel + "/", exclude)) continue;
+        if (opts.ignore?.isIgnored(`${rel}/`)) continue;
         await visit(full);
       } else if (ent.isFile()) {
         if (matchesAny(rel, exclude)) continue;
+        if (opts.ignore?.isIgnored(rel)) continue;
         if (matchesAny(rel, include)) out.push(rel);
       }
     }
@@ -186,36 +304,12 @@ export async function walk(root: string, include: string[], exclude: string[]): 
   await visit(root);
   return out;
 }
-function matchesAny(p: string, patterns: string[]): boolean {
+export function matchesAny(p: string, patterns: string[]): boolean {
   for (const pat of patterns) {
     if (matchGlob(p, pat)) return true;
   }
   return false;
 }
 function matchGlob(path: string, pattern: string): boolean {
-  const regex = globToRegex(pattern);
-  return regex.test(path);
-}
-function globToRegex(pattern: string): RegExp {
-  let re = "^";
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "*") {
-      if (pattern[i + 1] === "*") {
-        re += ".*";
-        i++;
-        if (pattern[i + 1] === "/") i++;
-      } else {
-        re += "[^/]*";
-      }
-    } else if (c === "?") {
-      re += "[^/]";
-    } else if ("\\^$.|+()[]{}".includes(c)) {
-      re += "\\" + c;
-    } else {
-      re += c;
-    }
-  }
-  re += "$";
-  return new RegExp(re);
+  return globToRegExp(pattern).test(path);
 }

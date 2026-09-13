@@ -12,6 +12,12 @@ describe("applyEdit", () => {
     expect(r.after).toBe("hello there");
     expect(r.strategy).toBe("exact");
   });
+  it("refuses loose matches that span most of the file", () => {
+    const filler = Array.from({ length: 500 }, (_, i) => `padding line ${i}`).join("\n");
+    const before = `alpha marker\n${filler}\nomega marker`;
+    const r = applyEdit({ before, search: "alpha marker\nomega marker", replace: "X" });
+    expect(r.ok).toBe(false);
+  });
   it("tolerates trailing-whitespace drift", () => {
     const r = applyEdit({ before: "a\n  b   \nc", search: "a\n  b\nc", replace: "a\nb\nc" });
     expect(r.ok).toBe(true);

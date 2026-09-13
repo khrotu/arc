@@ -12,6 +12,28 @@ export interface DifficultyModel {
   strongScore: number;
 }
 export function loadDifficultyModel(json: DifficultyModel): DifficultyModel {
+  if (!json || typeof json !== "object") throw new Error("Invalid difficulty model: not an object.");
+  if (!json.vocab || typeof json.vocab !== "object") throw new Error("Invalid difficulty model: bad vocab.");
+  if (!Array.isArray(json.idf) || json.idf.length === 0 || !json.idf.every(Number.isFinite)) {
+    throw new Error("Invalid difficulty model: bad idf.");
+  }
+  if (!Array.isArray(json.folds) || json.folds.length === 0) throw new Error("Invalid difficulty model: bad folds.");
+  const vocabSize = Object.keys(json.vocab).length;
+  for (const [term, idx] of Object.entries(json.vocab)) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= json.idf.length) {
+      throw new Error(`Invalid difficulty model: vocab index out of range for '${term}'.`);
+    }
+  }
+  if (vocabSize !== json.idf.length) throw new Error("Invalid difficulty model: vocab/idf size mismatch.");
+  for (const fold of json.folds) {
+    if (!fold || !Array.isArray(fold.coef) || fold.coef.length !== json.idf.length || !fold.coef.every(Number.isFinite)) {
+      throw new Error("Invalid difficulty model: bad fold coefficients.");
+    }
+    if (!Number.isFinite(fold.intercept) || !Number.isFinite(fold.sigmoidA) || !Number.isFinite(fold.sigmoidB)) {
+      throw new Error("Invalid difficulty model: bad fold parameters.");
+    }
+  }
+  if (!Number.isFinite(json.weakScore) || !Number.isFinite(json.strongScore)) throw new Error("Invalid difficulty model: bad scores.");
   return json;
 }
 const TOKEN_RE = /\b\w\w+\b/g;

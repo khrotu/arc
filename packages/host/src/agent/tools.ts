@@ -10,6 +10,20 @@ import { makeProxyDispatcher } from "../util/proxy.js";
 import { parseNotebook, serializeNotebook, listCells, readCell, editCellSource, addCell, deleteCell } from "../notebook/notebook.js";
 import type { SandboxProfile } from "../sandbox/sandbox.js";
 import type { DiffHunk } from "../protocol/process.js";
+import { loadArcIgnore } from "../util/arcignore.js";
+import { globToRegExpSource } from "../util/glob.js";
+function toRel(root: string, p: string): string {
+  const rel = path.relative(root, path.resolve(root, p)).replace(/\\/g, "/");
+  return rel.startsWith("..") ? p.replace(/\\/g, "/") : rel;
+}
+async function isArcIgnored(root: string, p: string): Promise<boolean> {
+  try {
+    const ignore = await loadArcIgnore(root);
+    return ignore.isIgnored(toRel(root, p));
+  } catch {
+    return false;
+  }
+}
 const ANSI_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, "");
@@ -34,13 +48,27 @@ export function listBackgroundProcesses(): { id: string; command: string; exited
 export function killActiveProcesses(): { count: number; pids: number[] } {
   const pids: number[] = [];
   let count = 0;
+  const seen = new Set<ChildProcess>();
+  for (const bg of bgProcesses.values()) {
+    if (seen.has(bg.proc)) continue;
+    seen.add(bg.proc);
+    bg.exited = true;
+    if (bg.proc.pid && !bg.proc.killed) {
+      pids.push(bg.proc.pid);
+      terminateProcessTree(bg.proc);
+      count++;
+    }
+  }
   for (const proc of activeProcesses) {
+    if (seen.has(proc)) continue;
+    seen.add(proc);
     if (proc.pid && !proc.killed) {
       pids.push(proc.pid);
       terminateProcessTree(proc);
       count++;
     }
   }
+  bgProcesses.clear();
   activeProcesses.clear();
   return { count, pids };
 }
@@ -68,8 +96,20 @@ function adoptBackgroundProcess(proc: ChildProcess, command: string, stdout: str
     bg.stderr = (bg.stderr + s).slice(-PROCESS_OUTPUT_LIMIT);
     onChunk?.("stderr", s);
   });
-  proc.on("exit", (code) => { bg.exited = true; bg.exitCode = code ?? undefined; activeProcesses.delete(proc); setTimeout(() => { bgProcesses.delete(id); }, 60_000); });
-  proc.on("error", (err) => { bg.exited = true; bg.stderr += `\n[spawn error] ${err.message}`; activeProcesses.delete(proc); setTimeout(() => { bgProcesses.delete(id); }, 60_000); });
+  proc.on("exit", (code) => {
+    bg.exited = true;
+    bg.exitCode = code ?? undefined;
+    activeProcesses.delete(proc);
+    const t = setTimeout(() => { bgProcesses.delete(id); }, 60_000);
+    if (typeof (t as unknown as { unref?: () => void }).unref === "function") (t as unknown as { unref: () => void }).unref();
+  });
+  proc.on("error", (err) => {
+    bg.exited = true;
+    bg.stderr += `\n[spawn error] ${err.message}`;
+    activeProcesses.delete(proc);
+    const t = setTimeout(() => { bgProcesses.delete(id); }, 60_000);
+    if (typeof (t as unknown as { unref?: () => void }).unref === "function") (t as unknown as { unref: () => void }).unref();
+  });
   return id;
 }
 const HOOK_EVENTS = ["session.start", "user.submit", "pre.tool", "post.tool", "pre.compact", "post.compact", "pre.handoff", "notification", "stop", "subagent.spawn", "instructions.loaded"];
@@ -209,7 +249,7 @@ export interface ToolContext {
   proxyWeb?: string;
   proxyShell?: string;
   semanticSearch?: (query: string, k?: number) => Promise<{ file: string; start: number; end: number; score: number; snippet: string }[]>;
-  describeImage?: (dataUrl: string) => Promise<string>;
+  describeImage?: (dataUrl: string) => Promise<string | undefined>;
   fileContextTracker?: FileContextTracker;
   executeNotebookCell?: (path: string, cellIndex: number) => Promise<{ ok: boolean; output: string; images?: string[] }>;
   allowExternalPath?: boolean;
@@ -228,23 +268,19 @@ export interface ToolResult {
   images?: { type: string; image_url: { url: string } }[];
 }
 export type ToolFn = (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
-export function checkWriteGlob(filePath: string, glob: string): { allowed: boolean } {
+export function checkWriteGlob(filePath: string, glob: string, root?: string): { allowed: boolean } {
   try {
     if (!glob.trim() || glob.includes("\0")) return { allowed: false };
-    let pattern = "^";
-    for (let i = 0; i < glob.length; i++) {
-      const char = glob[i];
-      if (char === "*") {
-        if (glob[i + 1] === "*" && glob[i + 2] === "/") { pattern += "(?:.*/)?"; i += 2; }
-        else if (glob[i + 1] === "*") { pattern += ".*"; i++; }
-        else pattern += "[^/]*";
-      } else if (char === "?") pattern += "[^/]";
-      else if (char === "\\") pattern += "/";
-      else if ("\\^$.|+()[]{}".includes(char)) pattern += `\\${char}`;
-      else pattern += char;
+    let normalized = filePath.replace(/\\/g, "/");
+    if (root) {
+      const abs = path.resolve(root, filePath);
+      const rel = path.relative(path.resolve(root), abs);
+      if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return { allowed: false };
+      normalized = rel.replace(/\\/g, "/");
     }
-    const re = new RegExp(pattern + "$", "i");
-    return { allowed: re.test(filePath.replace(/\\/g, "/")) };
+    const portable = glob.replace(/\\(?![*?[\]{}!\\])/g, "/");
+    const re = new RegExp(`^${globToRegExpSource(portable)}$`, "i");
+    return { allowed: re.test(normalized) };
   } catch {
     return { allowed: false };
   }
@@ -269,8 +305,12 @@ async function startBackgroundProcess(cmd: string, cwd: string, ctx: ToolContext
       bg.stderr = (bg.stderr + s).slice(-PROCESS_OUTPUT_LIMIT);
       onChunk?.("stderr", s);
     });
-    proc.on("exit", (code) => { bg.exited = true; bg.exitCode = code ?? undefined; activeProcesses.delete(proc); setTimeout(() => { bgProcesses.delete(id); }, 60_000); });
-    proc.on("error", (err) => { bg.exited = true; bg.stderr += `\n[spawn error] ${err.message}`; activeProcesses.delete(proc); setTimeout(() => { bgProcesses.delete(id); }, 60_000); });
+    const expire = () => {
+      const t = setTimeout(() => { bgProcesses.delete(id); }, 60_000);
+      if (typeof (t as unknown as { unref?: () => void }).unref === "function") (t as unknown as { unref: () => void }).unref();
+    };
+    proc.on("exit", (code) => { bg.exited = true; bg.exitCode = code ?? undefined; activeProcesses.delete(proc); expire(); });
+    proc.on("error", (err) => { bg.exited = true; bg.stderr += `\n[spawn error] ${err.message}`; activeProcesses.delete(proc); expire(); });
     return { ok: true, output: `Background process started (id: ${id}). Use shell.check to poll output.` };
   } catch (e: unknown) {
     return { ok: false, output: `Failed to start background process: ${(e as Error).message}` };
@@ -289,7 +329,8 @@ async function defaultGitRemote(cwd: string): Promise<string> {
 async function findCustomRun(dir: string, idOrName: string): Promise<{ id: string; name: string; commands: string[] } | undefined> {
   if (/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(idOrName)) {
     try {
-      return JSON.parse(await fs.readFile(path.join(dir, `${idOrName}.json`), "utf-8"));
+      const parsed = JSON.parse(await fs.readFile(path.join(dir, `${idOrName}.json`), "utf-8"));
+      if (parsed && typeof parsed.name === "string" && Array.isArray(parsed.commands)) return parsed;
     } catch {}
   }
   try {
@@ -312,10 +353,18 @@ async function listCustomRunIds(dir: string): Promise<string[]> {
     return [];
   }
 }
-export const tools: Record<string, { description: string; fn: ToolFn }> = {
+function waitTimeoutMs(raw: unknown, fallbackMs: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallbackMs;
+  return Math.min(n * 1000, MAX_WAIT_MS);
+}
+export const tools: Record<string, { description?: string; fn: ToolFn }> = {
   "file.read": {
-    description: "Read a file. Images are included inline for vision. Args: { path, offset?, limit? }",
     fn: async (args, ctx) => {
+      if (typeof args.path !== "string") return { ok: false, output: "file.read requires a string `path` argument." };
+      if (await isArcIgnored(ctx.root, String(args.path))) {
+        return { ok: false, output: `Refused: '${args.path}' is ignored by .arcignore.` };
+      }
       const ed = new FileEditor(ctx.root, !!ctx.allowExternalPath);
       const filePath = String(args.path);
       const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
@@ -327,14 +376,20 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
       if (IMAGE_EXTS.has(ext)) {
         try {
           const full = ed.resolve(filePath);
+          const stat = await fs.stat(full).catch(() => undefined);
+          if (stat && stat.size > 8 * 1024 * 1024) {
+            return { ok: false, output: `Refused: image '${filePath}' is ${(stat.size / 1048576).toFixed(1)}MB (>8MB).` };
+          }
           const buf = await fs.readFile(full);
           const base64 = buf.toString("base64");
           const mime = MIME[ext] ?? "image/png";
           const dataUrl = `data:${mime};base64,${base64}`;
           const sizeLabel = buf.length < 1024 ? `${buf.length}B` : `${(buf.length / 1024).toFixed(1)}KB`;
           if (ctx.describeImage) {
-            const description = await ctx.describeImage(base64);
-            return { ok: true, output: `Read image: ${filePath.split(/[/\\]/).pop()} (${mime}, ${sizeLabel})\n${description}`, filePath, touchedFiles: [filePath] };
+            const description = await ctx.describeImage(base64).catch(() => undefined);
+            if (description) {
+              return { ok: true, output: `Read image: ${filePath.split(/[/\\]/).pop()} (${mime}, ${sizeLabel})\n${description}`, filePath, touchedFiles: [filePath] };
+            }
           }
           return {
             ok: true,
@@ -355,9 +410,11 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "file.edit": {
-    description: "Apply an edit. PREFER passing a SEARCH/REPLACE block in `search`:\n<<<<<<< SEARCH\nexact text\n=======\nreplacement\n>>>>>>> REPLACE\nFallback args: { path, search, replace, replaceAll?, runAfter? }",
     fn: async (args, ctx) => {
       if (typeof args.path !== "string") return { ok: false, output: "file.edit requires a string `path` argument." };
+      if (await isArcIgnored(ctx.root, String(args.path))) {
+        return { ok: false, output: `Refused: '${args.path}' is ignored by .arcignore.` };
+      }
       if (typeof args.search !== "string") return { ok: false, output: "file.edit requires a string `search` argument." };
       if ((args.replace === undefined || args.replace === "") && !/<<<<<<< SEARCH\s*(?:\r\n|\r|\n)/.test(args.search)) {
         return { ok: false, output: "file.edit requires a non-empty `replace` argument for plain-text search. To delete a block, pass an explicit SEARCH/REPLACE block with an empty REPLACE section." };
@@ -375,8 +432,8 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
       if (r.ok) {
         runPostEditHooks(filePath, ctx.root, ctx.sandboxProfile).catch(() => {});
       }
-      const hunks = r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value }));
-      if (hunks.length && ctx.onDiff) {
+      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}) })) : [];
+      if (r.ok && hunks.length && ctx.onDiff) {
         await streamDiffHunks(hunks, filePath, ctx.onDiff);
       }
       return {
@@ -390,10 +447,12 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "file.write": {
-    description: "Write a new file (or overwrite). Args: { path, content, runAfter? }",
     fn: async (args, ctx) => {
       if (typeof args.path !== "string") return { ok: false, output: "file.write requires a string `path` argument." };
       if (typeof args.content !== "string") return { ok: false, output: "file.write requires a string `content` argument." };
+      if (await isArcIgnored(ctx.root, String(args.path))) {
+        return { ok: false, output: `Refused: '${args.path}' is ignored by .arcignore.` };
+      }
       const ed = new FileEditor(ctx.root, !!ctx.allowExternalPath);
       const filePath = args.path;
       const content = args.content;
@@ -406,8 +465,8 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
       if (r.ok) {
         runPostEditHooks(filePath, ctx.root, ctx.sandboxProfile).catch(() => {});
       }
-      const hunks = r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value }));
-      if (hunks.length && ctx.onDiff) {
+      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}) })) : [];
+      if (r.ok && hunks.length && ctx.onDiff) {
         await streamDiffHunks(hunks, filePath, ctx.onDiff);
       }
       return {
@@ -421,7 +480,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "file.grep": {
-    description: "Search the workspace for a regex pattern. Args: { pattern, include? }",
     fn: async (args, ctx) => {
       if (!ctx.grep) return { ok: false, output: "Grep not available in this environment." };
       const pattern = String(args.pattern ?? "");
@@ -431,24 +489,26 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
         return { ok: false, output: "Regex rejected because it is too large or contains unsafe nested repetition/backreferences." };
       }
       const results = await ctx.grep(pattern, include);
-      if (results.length === 0) return { ok: true, output: `No matches for /${pattern}/` };
-      const out = results.map((r) => `${r.file}:${r.line}:${r.column}: ${r.text}`).join("\n");
+      const ignore = await loadArcIgnore(ctx.root).catch(() => null);
+      const filtered = ignore ? results.filter((r) => !ignore.isIgnored(r.file)) : results;
+      if (filtered.length === 0) return { ok: true, output: `No matches for /${pattern}/` };
+      const out = filtered.map((r) => `${r.file}:${r.line}:${r.column}: ${r.text}`).join("\n");
       return { ok: true, output: out };
     },
   },
   "file.glob": {
-    description: "Find files matching a glob pattern. Args: { pattern }",
     fn: async (args, ctx) => {
       if (!ctx.glob) return { ok: false, output: "Glob not available in this environment." };
       const pattern = String(args.pattern ?? "");
       if (!pattern) return { ok: false, output: "No pattern provided." };
       const files = await ctx.glob(pattern);
-      if (files.length === 0) return { ok: true, output: `No files matching ${pattern}` };
-      return { ok: true, output: files.join("\n") };
+      const ignore = await loadArcIgnore(ctx.root).catch(() => null);
+      const filtered = ignore ? files.filter((f) => !ignore.isIgnored(f)) : files;
+      if (filtered.length === 0) return { ok: true, output: `No files matching ${pattern}` };
+      return { ok: true, output: filtered.join("\n") };
     },
   },
   "shell.run": {
-    description: "Run a shell command in the workspace (subject to approval).",
     fn: async (args, ctx) => {
       const cmd = String(args.command);
       const cwd = (args.cwd ? String(args.cwd) : ctx.root) || ctx.root;
@@ -488,7 +548,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.backgroundRun": {
-    description: "Launch a long-running shell process in the background.",
     fn: async (args, ctx) => {
       const cmd = String(args.command);
       const cwd = (args.cwd ? String(args.cwd) : ctx.root) || ctx.root;
@@ -496,7 +555,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.check": {
-    description: "Poll a background process for output and status. Args: { id }",
     fn: async (args) => {
       const id = String(args.id ?? "");
       const bg = bgProcesses.get(id);
@@ -507,7 +565,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.write": {
-    description: "Send input to a running background process. Args: { id, input }",
     fn: async (args) => {
       const id = String(args.id ?? "");
       const input = String(args.input ?? "");
@@ -525,7 +582,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.customRun": {
-    description: "Define a named series of shell commands and persist them as a skill. Args: { name, commands, overwrite? }",
     fn: async (args) => {
       const name = String(args.name ?? "").trim();
       if (!name) return { ok: false, output: "customRun requires a name." };
@@ -541,7 +597,10 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
         const raw = await fs.readFile(filePath, "utf-8");
         existing = JSON.parse(raw);
       } catch {}
-      if (existing && !args.overwrite) return { ok: false, output: `Skill '${name}' already exists. Use overwrite:true to replace it, or use shell.editCustomRun to update it.` };
+      if (existing && !args.overwrite) {
+        const kind = Array.isArray((existing as { commands?: unknown }).commands) ? "Custom run" : "Skill";
+        return { ok: false, output: `${kind} '${name}' already exists (id: ${safeId}). Use overwrite:true to replace it, or use shell.editCustomRun to update it.` };
+      }
       const skill = { id: safeId, name, commands, createdAt: existing?.createdAt ?? Date.now(), updatedAt: Date.now() };
       await fs.writeFile(filePath, JSON.stringify(skill, null, 2), "utf-8");
       const cmdList = commands.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
@@ -549,7 +608,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.editCustomRun": {
-    description: "Update a previously-defined custom run by ID. Args: { id, commands?, name? }",
     fn: async (args) => {
       const id = String(args.id ?? "").trim();
       if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(id)) return { ok: false, output: "editCustomRun requires a safe id." };
@@ -558,7 +616,11 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
       let skill: { id: string; name: string; commands: string[]; createdAt: number; updatedAt: number };
       try {
         const raw = await fs.readFile(filePath, "utf-8");
-        skill = JSON.parse(raw);
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed.name !== "string" || !Array.isArray(parsed.commands)) {
+          return { ok: false, output: `No custom run found with id '${id}'.` };
+        }
+        skill = parsed;
       } catch {
         return { ok: false, output: `No custom run found with id '${id}'.` };
       }
@@ -594,7 +656,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "shell.runCustomRun": {
-    description: "Execute a previously-defined custom run by id or name. Executes each command sequentially in the workspace. Args: { id, cwd? }",
     fn: async (args, ctx) => {
       const id = String(args.id ?? "").trim();
       if (!id) return { ok: false, output: "runCustomRun requires an id or name." };
@@ -625,19 +686,20 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "test.run": {
-    description: "Run tests in the workspace. Auto-detects vitest, jest, mocha, pytest, or go test. Args: { scope?, path? } where scope is 'file'|'nearest'|'workspace'|'failed'.",
     fn: async (args, ctx) => {
       const scope = String(args.scope ?? "workspace");
       const testPath = args.path ? String(args.path) : "";
       let executable = "";
       let commandArgs: string[] = [];
+      let runner = "";
       try {
         const pkgRaw = await fs.readFile(path.join(ctx.workspacePath, "package.json"), "utf-8");
         const pkg = JSON.parse(pkgRaw);
-        if (pkg.scripts?.test) { executable = "pnpm"; commandArgs = ["test"]; }
-        else if (pkg.devDependencies?.vitest || pkg.dependencies?.vitest) { executable = "npx"; commandArgs = ["vitest", "run"]; }
-        else if (pkg.devDependencies?.jest || pkg.dependencies?.jest) { executable = "npx"; commandArgs = ["jest"]; }
-        else if (pkg.devDependencies?.mocha || pkg.dependencies?.mocha) { executable = "npx"; commandArgs = ["mocha"]; }
+        if (pkg.scripts?.test) {
+          executable = "pnpm"; commandArgs = ["test"];
+          const script = String(pkg.scripts.test);
+          runner = script.includes("vitest") ? "vitest" : script.includes("jest") ? "jest" : script.includes("mocha") ? "mocha" : "";
+        } else if (pkg.devDependencies?.vitest || pkg.dependencies?.vitest) { executable = "npx"; commandArgs = ["vitest", "run"]; runner = "vitest"; } else if (pkg.devDependencies?.jest || pkg.dependencies?.jest) { executable = "npx"; commandArgs = ["jest"]; runner = "jest"; } else if (pkg.devDependencies?.mocha || pkg.dependencies?.mocha) { executable = "npx"; commandArgs = ["mocha"]; runner = "mocha"; }
       } catch {}
       if (!executable) {
         try { await fs.access(path.join(ctx.workspacePath, "go.mod")); executable = "go"; commandArgs = ["test", "./..."]; } catch {}
@@ -649,8 +711,16 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
         } catch {}
       }
       if (!executable) return { ok: false, output: "No test runner detected. Add a test script to package.json." };
-      if (scope === "file" && testPath) commandArgs.push("--", testPath);
-      else if (scope === "failed" && (commandArgs.includes("vitest") || commandArgs.includes("jest"))) commandArgs.push("--last-failed");
+      const scopePath = (scope === "file" || scope === "nearest") && testPath ? testPath : "";
+      if (scope === "nearest" && !testPath) return { ok: false, output: "test.run scope 'nearest' requires a `path` to the test file." };
+      if (scopePath) {
+        if (executable === "go") {
+          const dir = path.posix.dirname(scopePath.replace(/\\/g, "/"));
+          commandArgs = ["test", dir === "" || dir === "." ? "." : `./${dir}`];
+        } else if (executable === "python") commandArgs.push(scopePath);
+        else commandArgs.push("--", scopePath);
+      }
+      if (scope === "failed" && (runner === "vitest" || runner === "jest")) commandArgs.push("--last-failed");
       const displayCommand = [executable, ...commandArgs.map((arg) => JSON.stringify(arg))].join(" ");
       const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run detected test command?\n\n${displayCommand}`, { command: displayCommand });
       if (!approved) return { ok: false, output: "Test command denied by user." };
@@ -668,7 +738,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "lsp.problems": {
-    description: "Get ALL current LSP problems in the workspace (snapshot of the Problems tab). Args: {}",
     fn: async (_args, ctx) => {
       if (!ctx.problems) return { ok: false, output: "LSP problems not available in this environment." };
       const list = await ctx.problems();
@@ -677,7 +746,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "lsp.problemsFor": {
-    description: "Get LSP problems for one file. Args: { path }",
     fn: async (args, ctx) => {
       if (!ctx.problemsFor) return { ok: false, output: "LSP problems not available." };
       const list = await ctx.problemsFor(String(args.path));
@@ -686,7 +754,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "todo.write": {
-    description: "Set the live todo list. Args: { items: [{ id, text, state }] }",
     fn: async (args) => {
       const items = Array.isArray(args.items) ? (args.items as { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" }[]) : [];
       return { ok: true, output: `Todo list updated (${items.length} items).`, todoState: { items } };
@@ -706,7 +773,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
   "browser.intercept": { description: "Intercept requests matching a URL glob pattern. Args: { pattern, status?, body?, contentType?, block? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); if (!b) return { ok: false, output: "Browser not available." }; const pattern = String(a.pattern ?? ""); if (!pattern) return { ok: false, output: "No pattern provided." }; return b.intercept(pattern, { status: a.status ? Number(a.status) : undefined, body: a.body ? String(a.body) : undefined, contentType: a.contentType ? String(a.contentType) : undefined, block: !!a.block }); } },
   "browser.unintercept": { description: "Stop intercepting a previously registered pattern. Args: { pattern }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); if (!b) return { ok: false, output: "Browser not available." }; return b.unintercept(String(a.pattern ?? "")); } },
   "web.fetch": {
-    description: "Fetch raw text content from a web URL. Args: { url }",
     fn: async (args, ctx) => {
       try {
         const url = String(args.url);
@@ -724,16 +790,17 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "web.search": {
-    description: "Search the web via DuckDuckGo. Args: { query, count? }",
     fn: async (args, ctx) => {
       try {
-        const rawQuery = String(args.query ?? "");
-        const count = Math.min(args.count ? Number(args.count) : 10, 20);
+        const rawQuery = String(args.query ?? "").trim();
+        if (!rawQuery) return { ok: false, output: "No query provided." };
+        const n = Number(args.count);
+        const count = Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 20) : 10;
         const dispatcher = ctx.proxyWeb || ctx.proxyUrl ? makeProxyDispatcher(ctx.proxyWeb || ctx.proxyUrl!) : undefined;
-        const results = await ddgSearch(rawQuery, count, dispatcher);
+        const results = await searchWeb(rawQuery, count, dispatcher, ctx.signal);
         const out = results.length > 0
           ? results.map((r, i) => `${i + 1}. **${r.title}**\n   ${r.snippet}\n   ${r.url}`).join("\n\n")
-          : "No results found (CAPTCHA or rate limit may have been triggered). Try a more specific query.";
+          : "No results found (search backends may be rate-limiting). Try a more specific query or retry shortly.";
         return { ok: true, output: out };
       } catch (e: unknown) {
         return { ok: false, output: `Search failed: ${(e as Error).message}` };
@@ -741,7 +808,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "file.semanticSearch": {
-    description: "Semantic search across the workspace via the local embedding index. Args: { query, k? }",
     fn: async (args, ctx) => {
       if (!ctx.semanticSearch) return { ok: false, output: "Semantic search index is not available in this environment." };
       const query = String(args.query ?? "");
@@ -757,8 +823,59 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
       }
     },
   },
+  "syms.context": {
+    fn: async (args, ctx) => {
+      const query = String(args.query ?? "").trim().slice(0, 2000);
+      if (!query) return { ok: false, output: "No query provided." };
+      const n = Number(args.maxNodes);
+      const maxNodes = Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 60) : 20;
+      const includeCode = args.includeCode === undefined ? true : !!args.includeCode;
+      try {
+        const { scanWorkspaceSymbols } = await import("../syms/scan.js");
+        const { buildCodeContext, formatCodeContext } = await import("../syms/context.js");
+        const { resolveAuthorizedPath } = await import("../security/path-policy.js");
+        const { readFile } = await import("node:fs/promises");
+        const { symbols, filesScanned } = await scanWorkspaceSymbols(ctx.root, { maxFiles: Math.max(500, maxNodes * 25) });
+        if (symbols.length === 0) return { ok: true, output: `No code symbols indexed (${filesScanned} files scanned).` };
+        const shape = buildCodeContext(query, symbols, () => undefined, { maxNodes, includeCode: false });
+        const texts = new Map<string, string>();
+        let budgeted = 0;
+        const queue = shape.filesTouched.slice(0, 60);
+        const readOne = async (rel: string): Promise<void> => {
+          if (budgeted >= 2 * 1024 * 1024) return;
+          let full: string;
+          try {
+            full = resolveAuthorizedPath(ctx.root, rel, !!ctx.allowExternalPath);
+          } catch {
+            return;
+          }
+          try {
+            const buf = await readFile(full);
+            if (buf.length > 1024 * 1024 || buf.includes(0)) return;
+            budgeted += buf.length;
+            texts.set(rel, buf.toString("utf-8"));
+          } catch {}
+        };
+        for (let i = 0; i < queue.length; i += 32) {
+          await Promise.all(queue.slice(i, i + 32).map(readOne));
+        }
+        const cctx = includeCode
+          ? buildCodeContext(query, symbols, (f) => texts.get(f), { maxNodes, includeCode: true })
+          : shape;
+        let output = `${formatCodeContext(cctx)}\n\n(${filesScanned} files scanned, ${symbols.length} symbols)`;
+        if (output.length > 24_000) {
+          output = output.slice(0, 24_000);
+          if ((output.match(/```/g) ?? []).length % 2 === 1) output += "\n```";
+          output += `\n...(truncated, ${filesScanned} files scanned, ${symbols.length} symbols)`;
+        }
+        const touched = [...new Set([...cctx.blocks.map((b) => b.file), ...cctx.entryPoints.map((e) => e.file)])].slice(0, 20);
+        return { ok: true, output, touchedFiles: touched };
+      } catch (e: unknown) {
+        return { ok: false, output: `Code context failed: ${(e as Error).message}` };
+      }
+    },
+  },
   "mcp.call": {
-    description: "Call a tool exposed by an MCP server. Args: { server, tool, args }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const r = await ctx.mcp.call(String(a.server), String(a.tool), (a.args as Record<string, unknown>) ?? {});
@@ -766,7 +883,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.create": {
-    description: "Define and register a new MCP server at runtime. Args: { name, transport: { type, command|url, ... }, enabled? }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const name = String(a.name ?? "").trim();
@@ -800,7 +916,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.remove": {
-    description: "Remove a registered MCP server. Args: { name }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const name = String(a.name ?? "");
@@ -809,7 +924,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.toggle": {
-    description: "Enable or disable an MCP server. Args: { name, enabled }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const name = String(a.name ?? "");
@@ -819,7 +933,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.resources/list": {
-    description: "List resources on an MCP server. Args: { server }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const server = String(a.server ?? "");
@@ -829,7 +942,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.resources/read": {
-    description: "Read a resource URI. Args: { server, uri }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const r = await ctx.mcp.readResource(String(a.server), String(a.uri));
@@ -837,7 +949,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.prompts/list": {
-    description: "List prompt templates on an MCP server. Args: { server }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const server = String(a.server ?? "");
@@ -847,7 +958,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "mcp.prompts/get": {
-    description: "Fetch a prompt template. Args: { server, name, args? }",
     fn: async (a, ctx) => {
       if (!ctx.mcp) return { ok: false, output: "MCP not available." };
       const r = await ctx.mcp.getPrompt(String(a.server), String(a.name), (a.args as Record<string, unknown>) ?? undefined);
@@ -855,7 +965,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "skill.read": {
-    description: "Read a skill's full SKILL.md body by name. Args: { name }",
     fn: async (args, ctx) => {
       if (!ctx.skillRegistry) return { ok: false, output: "Skill registry not available." };
       const name = String(args.name ?? "");
@@ -867,7 +976,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "memory.list": {
-    description: "List stored memories. Args: { limit? }",
     fn: async (args, ctx) => {
       const { loadMemory } = await import("../memory/store.js");
       const entries = await loadMemory(ctx.root, undefined, ctx.teamMemoryStores);
@@ -878,7 +986,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "memory.edit": {
-    description: "Edit a memory by index. Args: { index, content }",
     fn: async (args, ctx) => {
       const { editMemory } = await import("../memory/store.js");
       const idx = Number(args.index ?? -1);
@@ -888,7 +995,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "memory.delete": {
-    description: "Delete a memory by index. Args: { index }",
     fn: async (args, ctx) => {
       const { deleteMemory } = await import("../memory/store.js");
       const idx = Number(args.index ?? -1);
@@ -897,7 +1003,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "rule.list": {
-    description: "List available rules. Args: {}",
     fn: async (_args, ctx) => {
       if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
       const rules = ctx.ruleRegistry.list();
@@ -906,7 +1011,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "rule.read": {
-    description: "Read a rule's full body by name. Args: { name }",
     fn: async (args, ctx) => {
       if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
       const rule = ctx.ruleRegistry.get(String(args.name ?? ""));
@@ -915,7 +1019,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "rule.create": {
-    description: "Create a new rule. Args: { name, glob, description, body }",
     fn: async (args, ctx) => {
       if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
       const name = String(args.name ?? "").trim();
@@ -925,7 +1028,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.diffStaged": {
-    description: "Show the staged diff (git diff --cached). Args: { path? } to scope to a single file.",
     fn: async (args, ctx) => {
       try {
         const gitArgs = ["diff", "--cached", ...(args.path ? ["--", String(args.path)] : [])];
@@ -938,7 +1040,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.diffUnstaged": {
-    description: "Show the unstaged diff (git diff). Args: { path? } to scope to a single file.",
     fn: async (args, ctx) => {
       try {
         const gitArgs = ["diff", ...(args.path ? ["--", String(args.path)] : [])];
@@ -951,7 +1052,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.changedFiles": {
-    description: "List all changed files (staged and unstaged) with status. Args: {}",
     fn: async (_args, ctx) => {
       try {
         const result = await runGit(["status", "--porcelain"], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
@@ -961,10 +1061,13 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
         const lines = out.trim().split("\n").map((l) => {
           const m = l.match(/^(..) (.+)$/);
           if (!m) return l;
-          const status = m[1].trim();
+          const x = m[1][0];
+          const y = m[1][1];
           const file = m[2].trim();
-          const staged = status.length > 0 && status !== "??";
-          return `${status || " "} ${file} ${staged ? "(staged)" : "(unstaged)"}`;
+          const staged = x !== " " && x !== "?";
+          const unstaged = y !== " ";
+          const tag = staged && unstaged ? "(staged+unstaged)" : staged ? "(staged)" : "(unstaged)";
+          return `${m[1]} ${file} ${tag}`;
         });
         return { ok: true, output: lines.join("\n") };
       } catch (e: unknown) {
@@ -973,7 +1076,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.branchDiff": {
-    description: "Show the diff between the current branch and its merge base with a target branch (defaults to main/master). Args: { base? }",
     fn: async (args, ctx) => {
       try {
         const base = String(args.base ?? "main");
@@ -990,7 +1092,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.commitMessage": {
-    description: "Generate a well-formed commit message from a diff. Pass the diff as `diff` input, or omit to use the current staged diff. Args: { diff? }",
     fn: async (args, ctx) => {
       const diff = args.diff ? String(args.diff) : "";
       if (!diff) {
@@ -1008,7 +1109,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.stage": {
-    description: "Stage changes for commit. Args: { paths?: string[] | string, all?: boolean, update?: boolean }. all stages every change including untracked files; update stages tracked modifications only. For hunk-level staging use shell.run.",
     fn: async (args, ctx) => {
       try {
         const gitArgs = ["add"];
@@ -1031,7 +1131,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.commit": {
-    description: "Commit the staged changes. Args: { message, all?: boolean } also stages tracked modifications first when all is true. For rebases, merges, or fixup workflows use shell.run.",
     fn: async (args, ctx) => {
       try {
         const message = String(args.message ?? "").trim();
@@ -1047,7 +1146,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.push": {
-    description: "Push commits to a remote. Args: { remote?, branch?, setUpstream?: boolean, force?: boolean } uses --force-with-lease when force is true. When branch is given without remote, the default remote (origin, else first) is used. For tags, mirrors, or remote deletion use shell.run.",
     fn: async (args, ctx) => {
       try {
         const refRe = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -1075,7 +1173,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.branch": {
-    description: "Branch operations. Args: { action: 'list' | 'create' | 'switch' | 'delete', name?, force? }. create makes a branch without checking it out; switch checks it out (force reuses an existing branch); delete refuses safe checks unless force. For rebases and merges use shell.run.",
     fn: async (args, ctx) => {
       try {
         const action = String(args.action ?? "list");
@@ -1103,7 +1200,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "hooks.list": {
-    description: "List the workspace lifecycle hooks (shell commands Arc runs automatically on agent events, from the workspace Arc hooks.json). Args: {}",
     fn: async (_args, ctx) => {
       const f = await readHooksFile(ctx.workspacePath);
       if (!f.hooks.length) return { ok: true, output: "No hooks configured in the workspace hooks file." };
@@ -1111,7 +1207,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "hooks.create": {
-    description: "Create a lifecycle hook that runs a shell command when the event fires. Args: { event, command, command_windows?, tool?, mode?, tier?, timeout? }. Persists to the workspace hooks file; applies to new sessions. For complex logic prefer a short command that calls a script.",
     fn: async (args, ctx) => {
       const check = normalizeHook(args);
       if (check.error) return { ok: false, output: check.error };
@@ -1122,7 +1217,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "hooks.update": {
-    description: "Update a lifecycle hook by index (from hooks.list). Args: { index, event?, command?, command_windows?, tool?, mode?, tier?, timeout? }. Omitted fields keep their current values.",
     fn: async (args, ctx) => {
       const f = await readHooksFile(ctx.workspacePath);
       const index = Number(args.index);
@@ -1135,7 +1229,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "hooks.delete": {
-    description: "Delete a lifecycle hook by index (from hooks.list). Args: { index }",
     fn: async (args, ctx) => {
       const f = await readHooksFile(ctx.workspacePath);
       const index = Number(args.index);
@@ -1146,7 +1239,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "git.pr": {
-    description: "GitHub pull request operations via the gh CLI. Args: { action?: 'create' | 'view' | 'list', title?, body?, base?, draft? }. create requires the branch to be pushed first; for review threads and complex flows use shell.run with gh.",
     fn: async (args, ctx) => {
       const gh = findOnPath(process.platform === "win32" ? "gh.exe" : "gh");
       if (!gh) return { ok: false, output: "gh CLI not found on PATH. Install the GitHub CLI (https://cli.github.com) or run gh via shell.run." };
@@ -1180,7 +1272,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.hover": {
-    description: "Hover over an element matching a CSS selector. Args: { selector, tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1188,7 +1279,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.scroll": {
-    description: "Scroll the page by pixel offset or to a selector. Args: { pixels?, selector?, tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1196,7 +1286,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.waitFor": {
-    description: "Wait for a selector, URL change, or network idle. Args: { selector?, url?, state?, tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1209,7 +1298,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.console": {
-    description: "Read the browser's console log (last 50 entries). Args: { tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1218,7 +1306,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.network": {
-    description: "Read the browser's network request log (last 50 entries). Args: { tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1227,7 +1314,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.domSnapshot": {
-    description: "Get a combined snapshot of the browser's DOM state, console log, and network log. Args: { tabId? }",
     fn: async (args, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       if (!b) return { ok: false, output: "Browser not available." };
@@ -1235,35 +1321,30 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "browser.drag": {
-    description: "Drag an element onto another element. Args: { from, to, tabId? }",
     fn: async (a, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       return b ? b.drag(String(a.from), String(a.to), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
     },
   },
   "browser.dialog": {
-    description: "Set how the next browser dialog (alert/confirm/prompt) is handled. Args: { accept, promptText? }",
     fn: async (a, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       return b ? b.dialog(a.accept !== false, a.promptText ? String(a.promptText) : undefined) : { ok: false, output: "Browser not available." };
     },
   },
   "browser.runCode": {
-    description: "Run a Playwright code snippet against the page. The code receives the `page` object. Args: { code, tabId? }",
     fn: async (a, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       return b ? b.runCode(String(a.code), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
     },
   },
   "browser.readPage": {
-    description: "Read the plain text content of the current page. Args: { tabId? }",
     fn: async (a, ctx) => {
       const b = await resolveBrowser(ctx.browser);
       return b ? b.readPage(a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
     },
   },
   "notebook.read": {
-    description: "Read a Jupyter notebook (.ipynb). Without cellIndex, lists every cell (index, type, source preview, whether it has output). With cellIndex, returns that cell's full source and (for code cells) its text/image output.",
     fn: async (args, ctx) => {
       const filePath = String(args.path);
       const ed = new FileEditor(ctx.root, !!ctx.allowExternalPath);
@@ -1298,7 +1379,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "notebook.editCell": {
-    description: "Replace the source of a cell in a Jupyter notebook by index. Args: { path, cellIndex, source }",
     fn: async (args, ctx) => {
       const filePath = String(args.path);
       const cellIndex = Number(args.cellIndex);
@@ -1331,7 +1411,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "notebook.addCell": {
-    description: "Insert a new cell into a Jupyter notebook at the given index (existing cells shift down). Args: { path, index, cellType, source }",
     fn: async (args, ctx) => {
       const filePath = String(args.path);
       const index = Number(args.index);
@@ -1360,7 +1439,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "notebook.deleteCell": {
-    description: "Delete a cell from a Jupyter notebook by index. Args: { path, cellIndex }",
     fn: async (args, ctx) => {
       const filePath = String(args.path);
       const cellIndex = Number(args.cellIndex);
@@ -1392,7 +1470,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "notebook.execute": {
-    description: "Execute a code cell using the workspace's active Jupyter kernel and return its text/image output. Args: { path, cellIndex }",
     fn: async (args, ctx) => {
       if (!ctx.executeNotebookCell) return { ok: false, output: "Notebook execution is not available in this environment." };
       const filePath = String(args.path);
@@ -1402,7 +1479,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "wait.for": {
-    description: "Sleep for a fixed number of seconds. Prefer this over polling loops. Args: { seconds }",
     fn: async (args, ctx) => {
       const seconds = Number(args.seconds);
       if (!Number.isFinite(seconds) || seconds <= 0) return { ok: false, output: "wait.for requires a positive `seconds` number." };
@@ -1413,7 +1489,6 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "wait.until": {
-    description: "Sleep until a wall-clock time. Accepts an ISO timestamp, 'HH:MM' / 'HH:MM:SS' (next occurrence today or tomorrow), or epoch milliseconds. Args: { time }",
     fn: async (args, ctx) => {
       const target = parseTimeSpec(String(args.time ?? ""));
       if (target === undefined) return { ok: false, output: "wait.until requires a valid `time` (ISO timestamp, HH:MM, HH:MM:SS, or epoch ms)." };
@@ -1425,12 +1500,11 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "wait.forProcess": {
-    description: "Wait for a background process to exit instead of polling shell.check. Args: { id, timeout? }",
     fn: async (args, ctx) => {
       const id = String(args.id ?? "");
       const bg = bgProcesses.get(id);
       if (!bg) return { ok: false, output: `No background process with id '${id}'.` };
-      const timeoutMs = args.timeout !== undefined ? Math.min(Math.max(Number(args.timeout) * 1000, 0), MAX_WAIT_MS) : MAX_WAIT_MS;
+      const timeoutMs = args.timeout !== undefined ? waitTimeoutMs(args.timeout, MAX_WAIT_MS) : MAX_WAIT_MS;
       const deadline = Date.now() + timeoutMs;
       while (!bg.exited) {
         if (ctx.signal?.aborted) return { ok: false, output: "wait.forProcess interrupted." };
@@ -1446,14 +1520,14 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "wait.forCommand": {
-    description: "Run a shell command repeatedly until it exits 0 (success) or the timeout elapses. Use to wait for a condition (e.g. a build artifact, a server, a lock file). Args: { command, interval?, timeout?, cwd? }",
     fn: async (args, ctx) => {
       const cmd = String(args.command ?? "");
       if (!cmd) return { ok: false, output: "wait.forCommand requires a `command`." };
       const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run condition-wait command (repeats until success or timeout)?\n\n${cmd}`, { command: cmd });
-      if (approved === false) return { ok: false, output: "wait.forCommand denied by user." };
-      const intervalMs = Math.max(250, Math.round(Number(args.interval ?? 1) * 1000) || 1000);
-      const timeoutMs = args.timeout !== undefined ? Math.min(Math.max(Number(args.timeout) * 1000, intervalMs), MAX_WAIT_MS) : 600_000;
+      if (!approved) return { ok: false, output: "wait.forCommand denied by user." };
+      const intervalRaw = Number(args.interval ?? 1);
+      const intervalMs = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.max(250, Math.round(intervalRaw * 1000)) : 1000;
+      const timeoutMs = args.timeout !== undefined ? Math.max(waitTimeoutMs(args.timeout, 600_000), intervalMs) : 600_000;
       const cwd = (args.cwd ? String(args.cwd) : ctx.root) || ctx.root;
       const proxyEnv = proxyEnvironment(ctx.proxyShell || ctx.proxyUrl);
       const deadline = Date.now() + timeoutMs;
@@ -1482,17 +1556,31 @@ export const tools: Record<string, { description: string; fn: ToolFn }> = {
     },
   },
   "context.retrieve": {
-    description: "Restore the full original content of a compressed tool output. Args: { id } - the id shown in the compressed output marker.",
     fn: async (args, ctx) => {
       const { loadBlob } = await import("../compress/store.js");
       const id = String(args.id ?? "").trim();
       if (!id) return { ok: false, output: "context.retrieve requires an `id`." };
-      const content = await loadBlob(ctx.root, id);
-      if (content === undefined) return { ok: false, output: `No stored context found for id '${id}'.` };
-      return { ok: true, output: content.slice(0, 512 * 1024) };
+      const now = Date.now();
+      const budget = retrieveBudgets.get(ctx.root);
+      if (!budget || now - budget.since > 3_600_000) {
+        retrieveBudgets.set(ctx.root, { count: 0, bytes: 0, since: now });
+        if (retrieveBudgets.size > 200) retrieveBudgets.delete(retrieveBudgets.keys().next().value as string);
+      }
+      const b = retrieveBudgets.get(ctx.root)!;
+      if (b.count >= 20 || b.bytes >= 4 * 1024 * 1024) {
+        return { ok: false, output: "context.retrieve budget exhausted for this workspace (20 retrieves or 4MB per hour). Re-read the files directly instead." };
+      }
+      const blob = await loadBlob(ctx.root, id);
+      if (blob === undefined) return { ok: false, output: `No stored context found for id '${id}'.` };
+      b.count++;
+      b.bytes += blob.totalBytes;
+      const capped = blob.content.length > 128 * 1024 ? `${blob.content.slice(0, 128 * 1024)}\n...(truncated ${blob.content.length - 128 * 1024} chars; re-read the file for the rest)` : blob.content;
+      const suffix = blob.truncated ? `\n...(stored output truncated: showing first ${blob.content.length} of ${blob.totalBytes} bytes)` : "";
+      return { ok: true, output: `${capped}${suffix}` };
     },
   },
 };
+const retrieveBudgets = new Map<string, { count: number; bytes: number; since: number }>();
 const MAX_WAIT_MS = 6 * 60 * 60 * 1000;
 function sleepAbortable(ms: number, signal?: AbortSignal): Promise<"timeout" | "abort"> {
   return new Promise((resolve) => {
@@ -1521,51 +1609,137 @@ function parseTimeSpec(spec: string): number | undefined {
 }
 interface SearchResult { title: string; snippet: string; url: string; }
 const STEALTH_HEADERS: Record<string, string> = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate, br",
-  "DNT": "1",
-  "Upgrade-Insecure-Requests": "1",
+  "Priority": "u=0, i",
   "Sec-Fetch-Dest": "document",
   "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-Site": "none",
   "Sec-Fetch-User": "?1",
+  "Sec-GPC": "1",
+  "Upgrade-Insecure-Requests": "1",
 };
-const CAPTCHA_MARKERS = ["anomaly-modal", "not a robot", "g-recaptcha", "challenge-form", "not a bot"];
-async function ddgSearch(query: string, max: number, proxyDispatcher: unknown): Promise<SearchResult[]> {
-  const results = await ddgSearchLite(query, max, proxyDispatcher);
-  if (results.length > 0) return results;
-  return await ddgSearchHtml(query, max, proxyDispatcher);
+const CAPTCHA_MARKERS = ["anomaly-modal", "not a robot", "g-recaptcha", "challenge-form", "not a bot", "cf-challenge", "turnstile"];
+const SEARCH_SOURCE_TIMEOUT_MS = 10_000;
+function searchSleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
-async function ddgSearchLite(query: string, max: number, proxyDispatcher: unknown): Promise<SearchResult[]> {
-  try {
-    const formData = new URLSearchParams({ q: query, kl: "us-en" });
-    const opts: Record<string, unknown> = {
-      method: "POST",
-      headers: { ...STEALTH_HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
-      body: formData.toString(),
-      signal: AbortSignal.timeout(15000),
-    };
-    if (proxyDispatcher) opts.dispatcher = proxyDispatcher;
-    const res = await fetch("https://lite.duckduckgo.com/lite/", opts as RequestInit);
-    if (!res.ok) return [];
-    const html = await readBodyLimited(res);
-    return parseLiteResults(html, max);
-  } catch {
-    return [];
+function searchRetryDelayMs(attempt: number, retryAfter: string | null): number {
+  if (retryAfter) {
+    const secs = Number(retryAfter.trim());
+    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, 5000);
   }
+  return Math.min(800 * 2 ** attempt, 5000) + Math.floor(Math.random() * 300);
 }
-async function ddgSearchHtml(query: string, max: number, proxyDispatcher: unknown): Promise<SearchResult[]> {
+function searchSignal(outer?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(SEARCH_SOURCE_TIMEOUT_MS);
+  return outer ? AbortSignal.any([outer, timeout]) : timeout;
+}
+async function fetchSearchSource(url: string, init: RequestInit, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<Response> {
+  let lastErr: unknown;
+  let retryAfter: string | null = null;
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    if (attempt > 0) await searchSleep(searchRetryDelayMs(attempt - 1, retryAfter));
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: searchSignal(outerSignal),
+        ...(proxyDispatcher ? { dispatcher: proxyDispatcher } : {}),
+      } as RequestInit);
+      if (res.ok) return res;
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        retryAfter = res.headers?.get?.("retry-after") ?? null;
+        await res.body?.cancel().catch(() => undefined);
+        lastErr = new Error(`HTTP ${res.status}`);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      if ((e as Error)?.name === "AbortError" && outerSignal?.aborted) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("search request failed");
+}
+type SearchSource = (query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal) => Promise<SearchResult[]>;
+async function searchWeb(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
+  const sources: SearchSource[] = [ddgSearchHtml, ddgMainSearch, yahooSearch, hnSearch, wikiSearch];
+  for (const src of sources) {
+    let results: SearchResult[] = [];
+    try {
+      results = await src(query, max, proxyDispatcher, outerSignal);
+    } catch {
+      results = [];
+    }
+    if (results.length > 0) return dedupeSearchResults(results).slice(0, max);
+  }
+  return [];
+}
+async function ddgSearchHtml(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
   try {
     const params = new URLSearchParams({ q: query });
-    const opts: Record<string, unknown> = { headers: STEALTH_HEADERS, signal: AbortSignal.timeout(15000) };
-    if (proxyDispatcher) opts.dispatcher = proxyDispatcher;
-    const res = await fetch(`https://html.duckduckgo.com/html/?${params.toString()}`, opts as RequestInit);
+    const res = await fetchSearchSource(`https://html.duckduckgo.com/html/?${params.toString()}`, {
+      headers: STEALTH_HEADERS,
+    }, proxyDispatcher, outerSignal);
     if (!res.ok) return [];
     const html = await readBodyLimited(res);
     if (hasCaptcha(html)) return [];
     return parseHtmlResults(html, max);
+  } catch {
+    return [];
+  }
+}
+async function ddgMainSearch(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
+  try {
+    const params = new URLSearchParams({ q: query });
+    const res = await fetchSearchSource(`https://duckduckgo.com/html/?${params.toString()}`, {
+      headers: STEALTH_HEADERS,
+    }, proxyDispatcher, outerSignal);
+    if (!res.ok) return [];
+    const html = await readBodyLimited(res);
+    if (hasCaptcha(html)) return [];
+    return parseHtmlResults(html, max);
+  } catch {
+    return [];
+  }
+}
+async function yahooSearch(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
+  try {
+    const params = new URLSearchParams({ p: query, n: String(Math.min(Math.max(max, 1), 20)) });
+    const res = await fetchSearchSource(`https://search.yahoo.com/search?${params.toString()}`, {
+      headers: STEALTH_HEADERS,
+    }, proxyDispatcher, outerSignal);
+    if (!res.ok) return [];
+    const html = await readBodyLimited(res);
+    return parseYahooResults(html, max);
+  } catch {
+    return [];
+  }
+}
+async function hnSearch(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
+  try {
+    const params = new URLSearchParams({ query, tags: "story" });
+    const res = await fetchSearchSource(`https://hn.algolia.com/api/v1/search?${params.toString()}`, {
+      headers: { ...STEALTH_HEADERS, Accept: "application/json" },
+    }, proxyDispatcher, outerSignal);
+    if (!res.ok) return [];
+    const text = await readBodyLimited(res);
+    return parseHnResults(JSON.parse(text), max);
+  } catch {
+    return [];
+  }
+}
+async function wikiSearch(query: string, max: number, proxyDispatcher: unknown, outerSignal?: AbortSignal): Promise<SearchResult[]> {
+  try {
+    const params = new URLSearchParams({ action: "opensearch", search: query, limit: String(max), namespace: "0", format: "json" });
+    const res = await fetchSearchSource(`https://en.wikipedia.org/w/api.php?${params.toString()}`, {
+      headers: { ...STEALTH_HEADERS, Accept: "application/json" },
+    }, proxyDispatcher, outerSignal);
+    if (!res.ok) return [];
+    const text = await readBodyLimited(res);
+    return parseWikiResults(JSON.parse(text), max);
   } catch {
     return [];
   }
@@ -1577,37 +1751,148 @@ function extractUddgUrl(raw: string): string {
   const m = /uddg=([^"&]+)/.exec(raw);
   return m ? decodeURIComponent(m[1]) : raw;
 }
-function decodeHtml(s: string): string {
-  return s.replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#\d+;/g, "").trim();
+export function decodeHtml(s: string): string {
+  return s
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#0*39;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_m, h: string) => {
+      try {
+        return String.fromCodePoint(parseInt(h, 16));
+      } catch {
+        return "";
+      }
+    })
+    .replace(/&#(\d+);/g, (_m, d: string) => {
+      try {
+        return String.fromCodePoint(parseInt(d, 10));
+      } catch {
+        return "";
+      }
+    })
+    .replace(/\s+/g, " ")
+    .trim();
 }
-function parseLiteResults(html: string, max: number): SearchResult[] {
+function searchHref(attrs: string): string | undefined {
+  const m = /href\s*=\s*["']([^"']+)["']/i.exec(attrs);
+  return m ? m[1] : undefined;
+}
+function isUsableResultUrl(url: string): boolean {
+  return /^https?:\/\/[^/]+\.[^/]+/i.test(url);
+}
+export function parseHtmlResults(html: string, max: number): SearchResult[] {
   if (hasCaptcha(html)) return [];
-  const results: SearchResult[] = [];
-  const linkRe = /<a[^>]*href="(https?:\/\/[^"]+)"[^>]*class='?result-link'?[^>]*>([\s\S]*?)<\/a>/gi;
-  const snippetRe = /<td[^>]*class='?result-snippet'?[^>]*>([\s\S]*?)<\/td>/gi;
-  const links = [...html.matchAll(linkRe)];
-  const snippets = [...html.matchAll(snippetRe)];
-  for (let i = 0; i < Math.min(links.length, max); i++) {
-    const href = links[i][1] ?? "";
-    const title = decodeHtml(links[i][2] ?? "");
-    const snippet = i < snippets.length ? decodeHtml(snippets[i][1] ?? "") : "";
-    if (title && href) results.push({ title, snippet, url: href });
-  }
-  return results;
-}
-function parseHtmlResults(html: string, max: number): SearchResult[] {
-  if (hasCaptcha(html) || !html.includes("result__body")) return [];
-  const results: SearchResult[] = [];
-  const re = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+  const links: { href: string; title: string }[] = [];
+  const anchorRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null && results.length < max) {
-    const rawHref = m[1] ?? "";
-    const title = decodeHtml(m[2] ?? "");
-    const snippet = decodeHtml(m[3] ?? "");
+  while ((m = anchorRe.exec(html)) !== null && links.length < max) {
+    const attrs = m[1] ?? "";
+    if (!/result__a/i.test(attrs)) continue;
+    const rawHref = searchHref(attrs);
+    if (!rawHref) continue;
     const url = extractUddgUrl(rawHref);
-    if (title && url && !url.startsWith("//duckduckgo.com") && !url.startsWith("/")) {
-      results.push({ title, snippet, url });
-    }
+    if (!isUsableResultUrl(url)) continue;
+    const title = decodeHtml(m[2] ?? "");
+    if (title) links.push({ href: url, title });
   }
-  return results;
+  if (links.length === 0) return [];
+  const snippets: string[] = [];
+  const snippetRe = /<a\b[^>]*class\s*=\s*["']?result__snippet["']?[^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = snippetRe.exec(html)) !== null) snippets.push(decodeHtml(m[1] ?? ""));
+  return dedupeSearchResults(links.map((l, i) => ({ title: l.title, snippet: i < snippets.length ? snippets[i] : "", url: l.href })));
+}
+function extractYahooTarget(href: string): string | undefined {
+  const m = /\/RU=([^/]+)\//.exec(href);
+  if (!m) return undefined;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return undefined;
+  }
+}
+export function parseYahooResults(html: string, max: number): SearchResult[] {
+  const links: { href: string; title: string }[] = [];
+  const anchorRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = anchorRe.exec(html)) !== null && links.length < max) {
+    const rawHref = searchHref(m[1] ?? "");
+    if (!rawHref || !rawHref.includes("/RU=")) continue;
+    const url = extractYahooTarget(rawHref);
+    if (!url || !isUsableResultUrl(url)) continue;
+    const inner = m[2] ?? "";
+    const h3 = /<h3\b[^>]*>([\s\S]*?)<\/h3>/i.exec(inner);
+    const title = decodeHtml(h3 ? h3[1] ?? "" : inner);
+    if (title) links.push({ href: url, title });
+  }
+  if (links.length === 0) return [];
+  const snippets: string[] = [];
+  const snippetRe = /<div\b[^>]*class="compText[^"]*"[^>]*>\s*<p\b[^>]*>([\s\S]*?)<\/p>/gi;
+  while ((m = snippetRe.exec(html)) !== null) snippets.push(decodeHtml(m[1] ?? ""));
+  return dedupeSearchResults(links.map((l, i) => ({ title: l.title, snippet: i < snippets.length ? snippets[i] : "", url: l.href })));
+}
+export function parseHnResults(json: unknown, max: number): SearchResult[] {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return [];
+  const hits = (json as Record<string, unknown>).hits;
+  if (!Array.isArray(hits)) return [];
+  const results: SearchResult[] = [];
+  for (const item of hits) {
+    if (results.length >= max) break;
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const hit = item as Record<string, unknown>;
+    const title = typeof hit.title === "string" && hit.title.trim()
+      ? hit.title.trim()
+      : typeof hit.story_title === "string" && hit.story_title.trim()
+        ? (hit.story_title as string).trim()
+        : "";
+    const url = typeof hit.url === "string" && isUsableResultUrl(hit.url)
+      ? hit.url
+      : typeof hit.objectID === "string" || typeof hit.objectID === "number"
+        ? `https://news.ycombinator.com/item?id=${hit.objectID}`
+        : "";
+    if (!title || !url) continue;
+    const storyText = typeof hit.story_text === "string" ? hit.story_text.trim().replace(/\s+/g, " ") : "";
+    const byline = typeof hit.author === "string" && hit.author
+      ? `${typeof hit.points === "number" ? `${hit.points} points by ` : "by "}${hit.author}`
+      : "";
+    const snippet = storyText ? storyText.slice(0, 300) : byline;
+    results.push({ title, snippet, url });
+  }
+  return dedupeSearchResults(results);
+}
+export function parseWikiResults(json: unknown, max: number): SearchResult[] {
+  if (!Array.isArray(json) || json.length < 4) return [];
+  const titles = Array.isArray(json[1]) ? (json[1] as unknown[]) : [];
+  const descs = Array.isArray(json[2]) ? (json[2] as unknown[]) : [];
+  const urls = Array.isArray(json[3]) ? (json[3] as unknown[]) : [];
+  const results: SearchResult[] = [];
+  for (let i = 0; i < Math.min(titles.length, urls.length, max); i++) {
+    const title = typeof titles[i] === "string" ? (titles[i] as string) : "";
+    const url = typeof urls[i] === "string" ? (urls[i] as string) : "";
+    const snippet = typeof descs[i] === "string" ? (descs[i] as string) : "";
+    if (title && isUsableResultUrl(url)) results.push({ title, snippet, url });
+  }
+  return dedupeSearchResults(results);
+}
+export function dedupeSearchResults(results: SearchResult[]): SearchResult[] {
+  const seen = new Set<string>();
+  const out: SearchResult[] = [];
+  for (const r of results) {
+    const key = normalizeSearchUrl(r.url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+function normalizeSearchUrl(u: string): string {
+  try {
+    const p = new URL(u);
+    return `${p.protocol}//${p.host.toLowerCase()}${p.pathname.replace(/\/+$/, "")}${p.search}`.toLowerCase();
+  } catch {
+    return u.trim().toLowerCase();
+  }
 }

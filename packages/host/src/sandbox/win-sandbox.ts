@@ -243,7 +243,7 @@ function resolveWindowsExe(executable: string, root: string): string {
   const hasExt = /\.[a-zA-Z0-9]+$/.test(executable);
   const exts = hasExt ? [""] : PATHEXT;
   const pathEnv = (process.env.PATH ?? process.env.Path ?? "").split(";").filter(Boolean);
-  const dirs = hasSep ? [root, process.cwd()] : [root, process.cwd(), ...pathEnv];
+  const dirs = hasSep ? [root, process.cwd()] : [...pathEnv];
   for (const d of dirs) {
     for (const e of exts) {
       const p = path.join(d, executable + e);

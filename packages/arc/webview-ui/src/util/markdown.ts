@@ -22,7 +22,8 @@ function renderInline(s: string): string {  const mathBlocks: string[] = [];
     return `\u0001C${codes.length - 1}\u0001`;
   });
   const refs: { path: string; line: string; endLine?: string }[] = [];
-  s = s.replace(FILE_REF_RE, (_m, path: string, line: string, endLine?: string) => {
+  s = s.replace(FILE_REF_RE, (m, path: string, line: string, endLine: string | undefined, offset: number, full: string) => {
+    if (/https?:\/\/[^\s]*$/.test(full.slice(0, offset))) return m;
     refs.push({ path, line, ...(endLine ? { endLine } : {}) });
     return `\u0001R${refs.length - 1}\u0001`;
   });
@@ -263,13 +264,12 @@ function renderBlock(s: string): string {
   return html.join("");
 }
 function renderBlockDispatch0(lines: string[], i: number): string {
-  return renderBlockDispatch(lines.join("\n"), i)[0];
+  return renderBlockLines(lines, i)[0];
 }
 function renderBlockDispatch1(lines: string[], i: number): number {
-  return renderBlockDispatch(lines.join("\n"), i)[1];
+  return renderBlockLines(lines, i)[1];
 }
-function renderBlockDispatch(s: string, start: number): [string, number] {
-  const lines = s.split("\n");
+function renderBlockLines(lines: string[], start: number): [string, number] {
   let i = start;
   const line = lines[i];
   if (line === undefined) return ["", i];
@@ -278,11 +278,18 @@ function renderBlockDispatch(s: string, start: number): [string, number] {
   }
   const h = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
   if (h) return [`<h${h[1].length}>${renderInline(h[2])}</h${h[1].length}>`, i + 1];
-  if (i + 1 < lines.length && /\|/.test(line) && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) {
+  if (i + 1 < lines.length && /\|/.test(line)) {
     const splitRow = (r: string): string[] =>
       r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
     const head = splitRow(line);
-    i += 2;
+    const delimCells = splitRow(lines[i + 1]);
+    const delimOk =
+      head.length > 0 &&
+      delimCells.length === head.length &&
+      delimCells.every((c) => /^:?-+:?$/.test(c)) &&
+      delimCells.join("").replace(/[^ -]/g, "").length >= 3;
+    if (delimOk) {
+      i += 2;
     const aligns = splitRow(lines[i - 1]).map((c) => {
       const l = c.startsWith(":");
       const r = c.endsWith(":");
@@ -297,6 +304,7 @@ function renderBlockDispatch(s: string, start: number): [string, number] {
       i++;
     }
     return [`<table class="arc-md-table"><thead>${headHtml}</thead><tbody>${bodyRows.join("")}</tbody></table>`, i];
+    }
   }
 
   if (isListLine(line)) {
@@ -311,7 +319,6 @@ function renderBlockDispatch(s: string, start: number): [string, number] {
     lines[i].trim() !== "" &&
     !/^(#{1,6})\s+/.test(lines[i]) &&
     !/^ {0,3}(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i]) &&
-    !/\|/.test(lines[i]) &&
     !isListLine(lines[i]) &&
     !/^ {0,3}>/.test(lines[i]) &&
     !/^ {0,3}```/.test(lines[i])

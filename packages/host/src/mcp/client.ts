@@ -3,6 +3,7 @@ import { Readable, Writable } from "node:stream";
 import { EventEmitter } from "node:events";
 import * as net from "node:net";
 import { assertSafeUrl, isPrivateAddress, readBodyLimited, safeFetch } from "../security/network.js";
+import { redactSecrets } from "../security/redact.js";
 import { spawnBounded, terminateProcessTree } from "../util/process.js";
 import type { SandboxProfile } from "../sandbox/sandbox.js";
 export type McpTransport =
@@ -60,6 +61,7 @@ export class McpClient extends EventEmitter {
   private id = 0;
   private pending = new Map<number | string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private proc?: ChildProcessByStdio<Writable, Readable, Readable>;
+  private lastStderr = "";
   private httpAbort?: AbortController;
   private httpEndpoint?: string;
   private httpSessionId?: string;
@@ -138,8 +140,10 @@ export class McpClient extends EventEmitter {
     this.clearReconnect();
     this.clearHealth();
     if (this.healthInflight !== undefined) {
+      const p = this.pending.get(this.healthInflight);
       this.pending.delete(this.healthInflight);
       this.healthInflight = undefined;
+      p?.reject(new Error("MCP client stopped"));
     }
     if (this.proc) terminateProcessTree(this.proc);
     this.httpAbort?.abort();
@@ -183,28 +187,42 @@ export class McpClient extends EventEmitter {
   private async send(req: Omit<JsonRpcRequest, "jsonrpc" | "id"> & { id?: number | string }): Promise<unknown> {
     const id = req.id ?? ++this.id;
     const full: JsonRpcRequest = { jsonrpc: "2.0", id, method: req.method, params: req.params };
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const promise = new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`MCP request '${req.method}' timed out`));
         }
       }, 60_000);
+      if (typeof (timer as unknown as { unref?: () => void }).unref === "function") (timer as unknown as { unref: () => void }).unref();
       this.pending.set(id, {
-        resolve: (v) => { clearTimeout(timer); resolve(v); },
-        reject: (e) => { clearTimeout(timer); reject(e); },
+        resolve: (v) => { if (timer) clearTimeout(timer); resolve(v); },
+        reject: (e) => { if (timer) clearTimeout(timer); reject(e); },
       });
     });
     if (this.config.transport.type === "stdio") {
       if (!this.proc) {
         this.pending.delete(id);
+        if (timer) clearTimeout(timer);
         throw new Error("MCP stdio process is not running");
       }
       this.traffic("out", describeJsonRpc(full));
-      this.proc.stdin.write(JSON.stringify(full) + "\n");
+      try {
+        this.proc.stdin.write(JSON.stringify(full) + "\n");
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        const p = this.pending.get(id);
+        if (p) {
+          this.pending.delete(id);
+          p.reject(err);
+        }
+        throw err;
+      }
     } else {
       if (!this.httpReady || !this.httpEndpoint) {
         this.pending.delete(id);
+        if (timer) clearTimeout(timer);
         throw new Error("MCP HTTP transport is not connected");
       }
       this.sendHttp(full).catch((e) => {
@@ -246,7 +264,7 @@ export class McpClient extends EventEmitter {
       return undefined;
     }
   }
-  private async sendHttp(req: JsonRpcRequest): Promise<void> {
+  private async sendHttp(req: JsonRpcRequest, retried = false): Promise<void> {
     if (!this.httpEndpoint) throw new Error("MCP HTTP endpoint not set");
     const t = this.config.transport;
     if (t.type !== "http" && t.type !== "sse") throw new Error("MCP transport is not HTTP-based");
@@ -261,10 +279,11 @@ export class McpClient extends EventEmitter {
       signal: this.httpAbort?.signal,
     }, { allowPrivate: this.httpAllowPrivate, allowHttpLoopback: true, sameOrigin: t.url });
     if (res.status === 401) {
-      res.body?.cancel();
+      await res.body?.cancel().catch(() => undefined);
+      if (retried) throw new Error("MCP server rejected the refreshed credentials (401). Use Tools > MCP > Authenticate.");
       const token = await this.challengeAuth(res.headers.get("www-authenticate") ?? undefined);
       if (!token) throw new Error("MCP server requires authorization and no token is available. Use Tools > MCP > Authenticate.");
-      return this.sendHttp(req);
+      return this.sendHttp(req, true);
     }
     if (!res.ok) {
       throw new Error(`MCP HTTP error ${res.status}: ${await readBodyLimited(res)}`);
@@ -301,7 +320,7 @@ export class McpClient extends EventEmitter {
         buffer = buffer.slice(idx + 2);
         const parsed = parseSseBlock(block);
         if (!parsed) continue;
-        for (const data of parsed) {
+        for (const { data } of parsed) {
           const msg = safeJsonParse(data);
           if (!msg) continue;
           this.traffic("in", describeJsonRpc(msg));
@@ -426,13 +445,19 @@ export class McpClient extends EventEmitter {
         } catch {}
       }
     });
-    this.proc.stderr.on("data", (_d: Buffer) => {});
+    this.proc.stderr.on("data", (d: Buffer) => {
+      try {
+        const cur = (this.lastStderr ?? "") + d.toString("utf-8");
+        this.lastStderr = cur.slice(-4000);
+      } catch {}
+    });
     this.proc.on("error", (err) => {
       failAll(`MCP process error: ${err.message}`);
       if (this.shouldRun) this.scheduleReconnect();
     });
     this.proc.on("exit", (code) => {
-      const reason = code !== 0 ? `MCP process exited with code ${code}` : "MCP process exited";
+      const detail = this.lastStderr ? `: ${redactSecrets(this.lastStderr.slice(-500))}` : "";
+      const reason = code !== 0 ? `MCP process exited with code ${code}${detail}` : "MCP process exited";
       failAll(reason);
       if (this.shouldRun) this.scheduleReconnect();
     });
@@ -449,10 +474,13 @@ export class McpClient extends EventEmitter {
     let res: Response;
     try {
       const timeoutId = setTimeout(() => this.httpAbort?.abort(), 10_000);
-      res = await safeFetch(url, { method: "GET", headers, signal: this.httpAbort!.signal }, { allowPrivate: this.httpAllowPrivate, allowHttpLoopback: true, sameOrigin: t.url });
-      clearTimeout(timeoutId);
+      try {
+        res = await safeFetch(url, { method: "GET", headers, signal: this.httpAbort!.signal }, { allowPrivate: this.httpAllowPrivate, allowHttpLoopback: true, sameOrigin: t.url });
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch (e) {
-      if (this.shouldRun) this.scheduleReconnect();
+      this.clearReconnect();
       throw new Error(`Failed to open MCP SSE stream: ${(e as Error).message}`);
     }
     if (res.status === 401) {
@@ -488,11 +516,19 @@ export class McpClient extends EventEmitter {
           buffer = buffer.slice(idx + 2);
           const parsed = parseSseBlock(block);
           if (!parsed) continue;
-        for (const data of parsed) {
+        for (const { event, data } of parsed) {
           const text = data;
-          if (text.startsWith("http")) {
-            const endpoint = await assertSafeUrl(text.trim(), { allowPrivate: this.httpAllowPrivate, allowHttpLoopback: true, sameOrigin: t.url });
-            this.httpEndpoint = endpoint.toString();
+          if (event === "endpoint" && text.trim()) {
+            let endpoint: URL;
+            try {
+              endpoint = new URL(text.trim(), t.url);
+            } catch {
+              continue;
+            }
+            if (!/^https?:$/.test(endpoint.protocol)) continue;
+            if (t.url && endpoint.origin !== new URL(t.url).origin) continue;
+            const safe = await assertSafeUrl(endpoint.toString(), { allowPrivate: this.httpAllowPrivate, allowHttpLoopback: true, sameOrigin: t.url });
+            this.httpEndpoint = safe.toString();
             this.httpReady = true;
             this.traffic("in", `endpoint ${this.httpEndpoint}`);
             continue;
@@ -505,21 +541,28 @@ export class McpClient extends EventEmitter {
         }
       }
     };
-    consume().catch((e) => {
+    const consumeTask = consume().catch((e) => {
       this.httpReady = false;
       this.httpEndpoint = undefined;
       this.emit("exit", { code: -1, reason: (e as Error).message });
       if (this.shouldRun) this.scheduleReconnect();
     });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Timed out waiting for MCP endpoint event")), 15_000);
-      const check = () => {
-        if (this.httpReady) { clearTimeout(timer); resolve(); }
-        else if (!this.shouldRun) { clearTimeout(timer); reject(new Error("stopped")); }
-        else setTimeout(check, 25);
-      };
-      check();
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for MCP endpoint event")), 15_000);
+        const check = () => {
+          if (this.httpReady) { clearTimeout(timer); resolve(); }
+          else if (!this.shouldRun) { clearTimeout(timer); reject(new Error("stopped")); }
+          else setTimeout(check, 25);
+        };
+        check();
+      });
+    } catch (e) {
+      try { this.httpAbort?.abort(); } catch {}
+      try { await reader.cancel(); } catch {}
+      await consumeTask.catch(() => undefined);
+      throw e;
+    }
   }
   private scheduleReconnect() {
     if (!this.shouldRun) return;
@@ -555,6 +598,8 @@ export class McpClient extends EventEmitter {
     this.healthTimer = setInterval(() => {
       void this.ping();
     }, this.opts.healthIntervalMs);
+    const t = this.healthTimer as unknown as { unref?: () => void };
+    if (typeof t.unref === "function") t.unref();
   }
   private clearHealth() {
     if (this.healthTimer) {
@@ -567,12 +612,17 @@ export class McpClient extends EventEmitter {
     if (this.healthInflight !== undefined) return false;
     const id = ++this.id;
     this.healthInflight = id;
-    const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), this.opts.healthTimeoutMs));
+    let pingTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      pingTimer = setTimeout(() => resolve("timeout"), this.opts.healthTimeoutMs);
+      if (typeof (pingTimer as unknown as { unref?: () => void }).unref === "function") (pingTimer as unknown as { unref: () => void }).unref();
+    });
     try {
       const result = await Promise.race([
         this.send({ id, method: "ping" }),
         timeout,
       ]);
+      if (pingTimer) clearTimeout(pingTimer);
       this.healthInflight = undefined;
       if (result === "timeout") {
         this.emit("unhealthy", { reason: "timeout" });
@@ -580,6 +630,7 @@ export class McpClient extends EventEmitter {
       }
       return true;
     } catch {
+      if (pingTimer) clearTimeout(pingTimer);
       this.healthInflight = undefined;
       this.emit("unhealthy", { reason: "error" });
       return false;
@@ -592,7 +643,7 @@ function mcpEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   for (const key of allowedBase) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  const blocked = /^(?:PATH|NODE_OPTIONS|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_|PYTHONPATH|RUBYOPT|PERL5OPT|JAVA_TOOL_OPTIONS|GIT_SSH_COMMAND)/i;
+  const blocked = /^(?:PATH|NODE_OPTIONS|NODE_PATH|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_|PYTHONPATH|PYTHONHOME|RUBYOPT|RUBYLIB|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|GIT_SSH_COMMAND|BASH_ENV|ENV|ZDOTDIR|PS1)/i;
   for (const [key, value] of Object.entries(extra ?? {})) {
     if (!blocked.test(key)) env[key] = value;
   }
@@ -633,12 +684,21 @@ function safeJsonParse(s: string): JsonRpcResponse | JsonRpcNotification | null 
     return null;
   }
 }
-function parseSseBlock(block: string): string[] | null {
-  const out: string[] = [];
+function parseSseBlock(block: string): { event: string; data: string }[] | null {
+  const out: { event: string; data: string }[] = [];
   const lines = block.split("\n");
   let cur = "";
+  let evt = "";
+  const flush = (): void => {
+    if (cur) out.push({ event: evt, data: cur });
+    cur = "";
+    evt = "";
+  };
   for (const line of lines) {
-    if (!line) continue;
+    if (!line) {
+      flush();
+      continue;
+    }
     if (line.startsWith(":")) continue;
     const colon = line.indexOf(":");
     if (colon === -1) continue;
@@ -648,8 +708,10 @@ function parseSseBlock(block: string): string[] | null {
     if (field === "data") {
       cur = cur ? cur + "\n" + value : value;
     } else if (field === "event") {
+      if (cur) flush();
+      evt = value;
     }
   }
-  if (cur) out.push(cur);
+  flush();
   return out.length ? out : null;
 }

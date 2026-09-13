@@ -45,9 +45,30 @@ export async function readAuditLog(filePath: string): Promise<AuditEntry[]> {
   }
 }
 const appendChains = new Map<string, Promise<unknown>>();
-const LOCK_STALE_MS = 30_000;
+const LOCK_STALE_MS = 5_000;
 const LOCK_ACQUIRE_ATTEMPTS = 600;
 const LOCK_ACQUIRE_WAIT_MS = 25;
+const MAX_ENTRY_DATA_BYTES = 64 * 1024;
+async function readLastAuditEntry(filePath: string): Promise<AuditEntry | undefined> {
+  let fh: fs.FileHandle | undefined;
+  try {
+    fh = await fs.open(filePath, "r");
+    const { size } = await fh.stat();
+    if (size === 0) return undefined;
+    const tailLen = Math.min(size, 8192);
+    const buf = Buffer.alloc(tailLen);
+    await fh.read(buf, 0, tailLen, size - tailLen);
+    const lines = buf.toString("utf-8").split("\n").filter((l) => l.trim().length > 0);
+    if (!lines.length) return undefined;
+    if (tailLen < size && !buf.toString("utf-8").includes("\n")) return (await readAuditLog(filePath)).at(-1);
+    return JSON.parse(lines[lines.length - 1]) as AuditEntry;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
 async function acquireFileLock(filePath: string): Promise<fs.FileHandle> {
   const lockPath = `${filePath}.lock`;
   for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
@@ -69,26 +90,37 @@ export async function appendAuditEntry(workspaceRoot: string, type: string, data
     await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
     const lock = await acquireFileLock(filePath);
     try {
-      const entries = await readAuditLog(filePath);
-      const last = entries[entries.length - 1];
+      const last = await readLastAuditEntry(filePath);
       const anchoredHead = await security.getHead?.(workspaceRoot);
       if (anchoredHead && last?.hash !== anchoredHead) throw new Error("Audit log is missing, truncated, or rolled back relative to its protected anchor.");
       const seq = last ? last.seq + 1 : 0;
       const ts = new Date().toISOString();
       const prevHash = last?.hash ?? GENESIS_HASH;
       const key = await security.getKey?.(workspaceRoot);
-      const hash = computeAuthenticatedHash(key, prevHash, seq, ts, type, data);
-      const entry: AuditEntry = { seq, ts, type, data, prevHash, hash, algorithm: key ? "hmac-sha256" : "sha256" };
+      const entry: AuditEntry = { seq, ts, type, data: truncateEntryData(data), prevHash, hash: "", algorithm: key ? "hmac-sha256" : "sha256" };
+      entry.hash = computeAuthenticatedHash(key, prevHash, seq, ts, type, entry.data);
       await fs.appendFile(filePath, JSON.stringify(entry) + "\n", { encoding: "utf-8", mode: 0o600 });
-      await security.setHead?.(workspaceRoot, hash);
+      await security.setHead?.(workspaceRoot, entry.hash);
       return entry;
     } finally {
       await lock.close();
       await fs.rm(`${filePath}.lock`, { force: true });
     }
   });
-  appendChains.set(filePath, task.catch(() => undefined));
+  const tracked = task.catch(() => undefined).finally(() => {
+    if (appendChains.get(filePath) === tracked) appendChains.delete(filePath);
+  });
+  appendChains.set(filePath, tracked);
   return task;
+}
+function truncateEntryData(data: unknown): unknown {
+  try {
+    const json = JSON.stringify(data);
+    if (json.length <= MAX_ENTRY_DATA_BYTES) return data;
+    return { truncated: true, preview: json.slice(0, MAX_ENTRY_DATA_BYTES) };
+  } catch {
+    return { truncated: true, preview: String(data).slice(0, 1024) };
+  }
 }
 export function verifyAuditChain(entries: AuditEntry[], key?: string): AuditVerifyResult {
   let prevHash = GENESIS_HASH;

@@ -18,14 +18,22 @@ function escapePsXml(s: string): string {
 }
 function showNative(title: string, body: string, logoPath?: string): void {
   const { platform } = process;
-  if (platform === "darwin") {
-    spawn("osascript", ["-e", `display notification "${escapeAppleScript(body)}" with title "${escapeAppleScript(title)}"`], { stdio: "ignore", shell: false });
-  } else if (platform === "linux") {
-    spawn("notify-send", [title, body, "--icon=dialog-information", "--urgency=normal"], { stdio: "ignore", shell: false });
-  } else if (platform === "win32") {
-    const xml = buildWinToast(title, body, logoPath);
-    const encoded = Buffer.from(xml, "utf-16le").toString("base64");
-    spawn("powershell", ["-NoProfile", "-EncodedCommand", encoded], { stdio: "ignore", shell: false });
+  try {
+    let child;
+    if (platform === "darwin") {
+      child = spawn("osascript", ["-e", `display notification "${escapeAppleScript(body)}" with title "${escapeAppleScript(title)}"`], { stdio: "ignore", shell: false });
+    } else if (platform === "linux") {
+      child = spawn("notify-send", [title, body, "--icon=dialog-information", "--urgency=normal"], { stdio: "ignore", shell: false });
+    } else if (platform === "win32") {
+      const xml = buildWinToast(title, body, logoPath);
+      const encoded = Buffer.from(xml, "utf-16le").toString("base64");
+      child = spawn("powershell", ["-NoProfile", "-EncodedCommand", encoded], { stdio: "ignore", shell: false });
+    } else {
+      return;
+    }
+    child.on("error", () => undefined);
+    if (typeof child.unref === "function") child.unref();
+  } catch {
   }
 }
 function buildWinToast(title: string, body: string, logoPath?: string): string {

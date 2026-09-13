@@ -6,6 +6,8 @@
   <a href="https://marketplace.visualstudio.com/items?itemName=khrotu.arc-code"><img src="https://raster.shields.io/badge/VS_Code_Marketplace-007ACC?style=flat&logo=visualstudiocode&logoColor=white" alt="VS Code Marketplace" height="20"></a>
   <a href="https://khrotu.org/blogs"><img src="https://raster.shields.io/badge/Update_Log-2C7A7B?style=flat&logo=readme&logoColor=white" alt="Update Log" height="20"></a>
   <a href="https://github.com/khrotu/arc/actions/workflows/release.yml"><img src="https://github.com/khrotu/arc/actions/workflows/release.yml/badge.svg?branch=main" alt="Release" height="20"></a>
+  <br>
+  <a href="https://deepwiki.com/khrotu/arc"><img alt="Ask DeepWiki" src="https://raw.githubusercontent.com/KHROTU/arc/main/assets/deepwiki-badge.png" height="20" /></a>
 </p>
 
 > **Limited Time Offer:** For a limited time, Arc is offering free access to the [GLM 5.3 Flash](#faq-glm-flash) model for all users with some caveats (responses may be slower and connectivity may be less reliable). See Settings > Providers inside the extension for more details.
@@ -16,15 +18,15 @@
 
 ## Efficiency
 
-| Extension | VSIX Size (as of September 4th, 2026) |
+| Extension | VSIX Size (as of September 13th, 2026) |
 | :--- | :--- |
-| **Arc** | [**0.24 MB***](#faq-vsix-size) |
-| Cline | 19.25 MB |
-| Roo Code | 30.11 MB |
-| Claude Code | 98.62 MB |
-| Continue | 111.48 MB |
-| Kilo Code | 119.18 MB |
-| Codex | 373.29 MB |
+| **Arc** | [**0.27 MB***](#faq-vsix-size) |
+| Cline | 19.72 MB |
+| Roo Code | 30.84 MB |
+| Kilo Code | 99.83 MB |
+| Claude Code | 101.34 MB |
+| Continue | 114.16 MB |
+| Codex | 385.71 MB |
 
 Here are the sizes visualized:
 
@@ -92,8 +94,7 @@ By optimizing our dependency tree and focusing on native VS Code APIs, Arc stays
 
 - **Prompt Polishing:** Optionally polish prompts before sending, allowing grammar/spelling-only fixes or full rewriting.
 - **Attention sounds:** Optional sounds for task completion, approval requests, and errors.
-- **Interface personalization:** Pick UI and monospace fonts, express yourself with the pride logo, choose how tool-call trees and chain summaries render, and control whether streaming diffs auto-open the diff editor.
-- **Configurable defaults:** Choose how new chat titles are generated (first words or a local model), set the default reasoning effort for new chats, pick the Auto-mode routing quality (balanced / prefer cheaper / prefer stronger), and schedule semantic-search reindexing (hourly or daily) on top of live file watching.
+- **Token-optimization:** Arc detects tools, MCP servers, skills, rules, and memories that haven't been used for a long time, and suggests unloading them to optimize token usage.
 
 </details>
 
@@ -203,7 +204,7 @@ Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/item
 ```bash
 pnpm install
 node scripts/package-ext.mjs
-code --install-extension packages/arc/arc-code-0.7.1.vsix
+code --install-extension packages/arc/arc-code-0.7.2.vsix
 ```
 
 ### Development

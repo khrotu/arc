@@ -103,7 +103,7 @@ describe("Agent context compression", () => {
       const { loadBlob } = await import("../src/compress/store");
       const restored = await loadBlob(tmp, id!);
       expect(restored).toBeDefined();
-      expect(restored!.length).toBeGreaterThan(8000);
+      expect(restored!.content.length).toBeGreaterThan(8000);
     } finally {
       globalThis.fetch = real;
     }

@@ -30,15 +30,34 @@ export function parseVerifyToml(raw: string): VerifyConfig {
       else if (key === "command") current.command = String(value);
       else if (key === "glob") current.glob = String(value);
     } else if (key === "maxRetries") {
-      maxRetries = Number(value);
+      const n = Number(value);
+      maxRetries = Number.isFinite(n) ? Math.max(0, Math.min(10, Math.floor(n))) : 3;
     }
   }
   if (current?.name && current.command) commands.push(current as VerifyCommand);
   return { commands, maxRetries };
 }
 function parseTomlScalar(raw: string): unknown {
-  if (raw.startsWith('"') && raw.endsWith('"')) return raw.slice(1, -1);
-  if (/^-?\d+$/.test(raw)) return Number(raw);
+  const decommented = stripInlineComment(raw).trim();
+  if (decommented.startsWith('"') && decommented.endsWith('"') && decommented.length >= 2) return decommented.slice(1, -1);
+  if (decommented.startsWith("'") && decommented.endsWith("'") && decommented.length >= 2) return decommented.slice(1, -1);
+  if (decommented === "true") return true;
+  if (decommented === "false") return false;
+  if (/^-?\d+$/.test(decommented)) return Number(decommented);
+  return decommented;
+}
+function stripInlineComment(raw: string): string {
+  let inStr: string | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      if (c === "\\") { i++; continue; }
+      if (c === inStr) inStr = undefined;
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === "#") return raw.slice(0, i);
+  }
   return raw;
 }
 export async function loadVerifyConfig(workspaceRoot: string): Promise<VerifyConfig | undefined> {
@@ -54,7 +73,9 @@ export function matchesVerifyGlob(rel: string, glob: string): boolean {
   let re = "^";
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i];
-    if (c === "*") {
+    if (c === "?") {
+      re += "[^/]";
+    } else if (c === "*") {
       if (glob[i + 1] === "*") {
         re += ".*";
         i++;

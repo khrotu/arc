@@ -329,6 +329,7 @@ export interface ChatMessage {
   toolCalls?: ToolCall[];
   ts: number;
   meta?: { modelId: string; providerId: string; tier: ModelTier };
+  editedOriginal?: string;
   images?: { type: string; image_url: { url: string } }[];
   noCompact?: boolean;
   hidden?: boolean;
@@ -413,7 +414,8 @@ export type HostMsg =
   | { type: "chat/routeFailed"; original: string; reason?: "no-model" | "model-unavailable" | "error" }
   | { type: "import/scanResult"; agents: ImportAgentSummaryPreview[] }
   | { type: "import/chatProgress"; agent: string; done: number; total: number }
-  | { type: "import/chatDone"; agent: string; chats: number; messages: number; error?: string };
+  | { type: "import/chatDone"; agent: string; chats: number; messages: number; error?: string }
+  | { type: "suggestions/list"; items: { kind: string; id: string; label: string; detail?: string; tokens: number; idleMs?: number }[] };
 export type WebviewMsg =
   | { type: "chat/send"; text: string; attachments?: { uri: string; preview?: string }[]; images?: string[]; modelId?: string; autoRouted?: boolean }
   | { type: "chat/route"; text: string; attachments?: { uri: string; preview?: string }[]; images?: string[] }
@@ -492,4 +494,7 @@ export type WebviewMsg =
   | { type: "provider/stopServer"; providerId: string }
   | { type: "import/scan" }
   | { type: "import/credentials"; agent: string; keys: string[] }
-  | { type: "import/chats"; agent: string };
+  | { type: "import/chats"; agent: string }
+  | { type: "suggestions/list" }
+  | { type: "suggestions/unload"; kind: string; id: string }
+  | { type: "suggestions/dismiss"; kind: string; id: string };

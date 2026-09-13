@@ -44,7 +44,7 @@ describe("toResponsesInput", () => {
     ]);
     expect(out).toEqual([
       { role: "assistant", content: "running" },
-      { type: "function_call", call_id: "call_1", name: "shell__run", arguments: "{\"command\":\"ls\"}" },
+      { type: "function_call", call_id: "call_1", name: "shell_drun", arguments: "{\"command\":\"ls\"}" },
       { type: "function_call_output", call_id: "call_1", output: "file list" },
     ]);
   });

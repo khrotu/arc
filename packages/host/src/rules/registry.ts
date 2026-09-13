@@ -59,6 +59,9 @@ export class RuleRegistry {
   list(): RuleEntry[] { return [...this.rules.values()]; }
   async create(name: string, glob: string, description: string, body: string, scope: "workspace" | "global" = "workspace"): Promise<void> {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(name)) throw new Error("Rule name must be a safe 1-64 character slug.");
+    for (const [label, value] of [["glob", glob], ["description", description]] as const) {
+      if (/[\r\n]/.test(value) || value.includes("---")) throw new Error(`Rule ${label} must be a single line without frontmatter delimiters.`);
+    }
     const dir = path.join(scope === "global" ? getArcDir() : getWorkspaceArcDir(this.workspaceRoot), "rules");
     await fs.mkdir(dir, { recursive: true });
     const content = `---\nname: ${name}\nglob: ${glob}\ndescription: ${description}\n---\n\n${body}`;

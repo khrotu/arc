@@ -14,6 +14,7 @@ interface ArcTerminalState {
 }
 let state: ArcTerminalState | undefined;
 let queue: Promise<unknown> = Promise.resolve();
+let termGen = 0;
 function stripTerminalAnsi(s: string): string {
   return s
     .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
@@ -27,9 +28,10 @@ function shellKindFor(executable: string | undefined): ShellKind {
   return "bash";
 }
 function quoteFor(kind: ShellKind, p: string): string {
-  if (kind === "powershell") return `'${p.replace(/'/g, "''")}'`;
-  if (kind === "cmd") return `"${p}"`;
-  return `'${p.replace(/'/g, "'\\''")}'`;
+  const sanitized = p.replace(/[\r\n\0]/g, "");
+  if (kind === "powershell") return `'${sanitized.replace(/'/g, "''")}'`;
+  if (kind === "cmd") return `"${sanitized.replace(/"/g, '""').replace(/[%^&|<>]/g, "")}"`;
+  return `'${sanitized.replace(/'/g, "'\\''")}'`;
 }
 function wslPath(cwd: string): string {
   const m = /^([A-Za-z]):[\\/](.*)$/.exec(cwd);
@@ -58,6 +60,7 @@ async function acquireTerminal(context: vscode.ExtensionContext, cwd: string): P
     try { state.terminal.dispose(); } catch { }
     state = undefined;
   }
+  termGen++;
   const options: vscode.TerminalOptions = {
     name: "Arc",
     iconPath: vscode.Uri.joinPath(context.extensionUri, "assets", "arc-logo-mono.png"),
@@ -95,9 +98,15 @@ function waitForIntegration(terminal: vscode.Terminal): Promise<vscode.TerminalS
   });
 }
 async function runOnce(context: vscode.ExtensionContext, command: string, cwd: string): Promise<{ ok: boolean; output: string }> {
-  const st = await acquireTerminal(context, cwd);
+  let st = await acquireTerminal(context, cwd);
+  const gen = termGen;
   st.terminal.show(true);
-  const integration = await waitForIntegration(st.terminal);
+  let integration = await waitForIntegration(st.terminal);
+  if (gen !== termGen || st !== state) {
+    st = await acquireTerminal(context, cwd);
+    st.terminal.show(true);
+    integration = await waitForIntegration(st.terminal);
+  }
   if (!integration) {
     st.terminal.sendText(command, true);
     return { ok: true, output: "(command sent to the Arc terminal; shell integration is unavailable so output and exit status were not captured)" };
@@ -113,6 +122,7 @@ async function runOnce(context: vscode.ExtensionContext, command: string, cwd: s
       }
     } catch { }
   })();
+  const endListener: { current?: { dispose(): void } } = {};
   const ended = new Promise<number | undefined>((resolve) => {
     const dEnd = vscode.window.onDidEndTerminalShellExecution((e) => {
       if (e.execution === execution) {
@@ -120,9 +130,13 @@ async function runOnce(context: vscode.ExtensionContext, command: string, cwd: s
         resolve(e.exitCode);
       }
     });
+    endListener.current = dEnd;
   });
   const exit = await Promise.race([ended, delay(EXECUTION_TIMEOUT_MS).then(() => "timeout" as const)]);
   if (exit === "timeout") {
+    try {
+      endListener.current?.dispose();
+    } catch {}
     st.terminal.sendText("\u0003", false);
     await Promise.race([drained, delay(500)]);
     return { ok: false, output: `${stripTerminalAnsi(out).trimEnd()}\n[timed out after ${EXECUTION_TIMEOUT_MS / 1000}s] sent Ctrl+C; the command may still be running in the Arc terminal` };
@@ -137,4 +151,12 @@ export async function runInArcTerminal(context: vscode.ExtensionContext, command
   const job = queue.then(() => runOnce(context, command, cwd));
   queue = job.catch(() => { });
   return job;
+}
+export function disposeArcTerminal(): void {
+  queue = Promise.resolve();
+  termGen++;
+  if (state) {
+    try { state.terminal.dispose(); } catch { }
+    state = undefined;
+  }
 }

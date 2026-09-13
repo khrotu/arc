@@ -61,17 +61,25 @@ describe("VectorIndex", () => {
 });
 describe("chunkText", () => {
   it("returns single chunk for short text", () => {
-    const c = chunkText("hello world");
+    const { chunks: c, truncated } = chunkText("hello world");
+    expect(truncated).toBe(false);
     expect(c.length).toBe(1);
     expect(c[0].start).toBe(0);
     expect(c[0].end).toBe("hello world".length);
   });
   it("splits long text into overlapping chunks", () => {
     const long = "x".repeat(4000);
-    const c = chunkText(long, { maxChunkChars: 1500, overlapChars: 200 });
+    const { chunks: c, truncated } = chunkText(long, { maxChunkChars: 1500, overlapChars: 200 });
+    expect(truncated).toBe(false);
     expect(c.length).toBeGreaterThan(1);
     expect(c[0].text.length).toBeLessThanOrEqual(1500);
     expect(c[c.length - 1].end).toBe(long.length);
+  });
+  it("flags truncation when the chunk cap is hit", () => {
+    const long = "x".repeat(100_000);
+    const { chunks: c, truncated } = chunkText(long, { maxChunkChars: 64, overlapChars: 0 });
+    expect(truncated).toBe(true);
+    expect(c.length).toBe(512);
   });
 });
 describe("OllamaEmbeddingBackend", () => {
@@ -86,7 +94,7 @@ describe("OllamaEmbeddingBackend", () => {
       });
     }) as unknown as typeof fetch;
     try {
-      const be = new OllamaEmbeddingBackend("nomic-embed-text:v1.5", { baseUrl: "http://x.invalid" });
+      const be = new OllamaEmbeddingBackend("nomic-embed-text:v1.5", { baseUrl: "http://127.0.0.1:11434" });
       const [v] = await be.embed({ model: "nomic-embed-text:v1.5", input: "hello" });
       expect(v.dim).toBe(4);
       expect(v.values).toEqual([0.1, 0.2, 0.3, 0.4]);
@@ -98,7 +106,7 @@ describe("OllamaEmbeddingBackend", () => {
     const real = globalThis.fetch;
     globalThis.fetch = (async () => new Response("model not found", { status: 404 })) as unknown as typeof fetch;
     try {
-      const be = new OllamaEmbeddingBackend("missing-model", { baseUrl: "http://x.invalid" });
+      const be = new OllamaEmbeddingBackend("missing-model", { baseUrl: "http://127.0.0.1:11434" });
       await expect(be.embed({ model: "missing-model", input: "hello" })).rejects.toThrow(/404/);
     } finally {
       globalThis.fetch = real;

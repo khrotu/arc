@@ -4,7 +4,18 @@ import type { ChatMeta, ChatSnapshot, ChatMessage, Role, ModelTier } from "@arc/
 export const CHATS_FILE_NAME = "arc.chats.arcx";
 export const LEGACY_CHATS_FILE_NAME = "arc.chats.json";
 const MAGIC = Buffer.from("ARCX1", "ascii");
-const FORMAT_VERSION = 3;
+const FORMAT_VERSION = 4;
+const MAX_INFLATED_BYTES = 32 * 1024 * 1024;
+function safeInflate(compressed: Buffer): Buffer {
+  if (compressed.length > 16 * 1024 * 1024) throw new Error("compressed block too large");
+  const out = inflateSync(compressed, { maxOutputLength: MAX_INFLATED_BYTES } as unknown as object);
+  if (out.length > MAX_INFLATED_BYTES) throw new Error("decompressed block too large");
+  return out as Buffer;
+}
+const decodeWarnings: string[] = [];
+export function getLastDecodeWarnings(): string[] {
+  return [...decodeWarnings];
+}
 const ROLE_INDEX: Record<Role, number> = { system: 0, user: 1, assistant: 2, tool: 3, developer: 4 };
 const ROLE_NAMES: Role[] = ["system", "user", "assistant", "tool", "developer"];
 const TIER_INDEX: Record<ModelTier, number> = { heavy: 0, default: 1, light: 2, free: 3 };
@@ -55,15 +66,16 @@ class Reader {
   done(): void { if (this.off.o !== this.buf.length) throw new Error("ARCX: trailing bytes"); }
 }
 function encodeMessage(w: Writer, m: ChatMessage): void {
+  const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
   w.str(m.id);
   w.u8(ROLE_INDEX[m.role] ?? 1);
   w.varint(m.ts);
-  w.str(m.content);
+  w.str(content);
   let flags = 0;
   if (m.thinking !== undefined) flags |= 1;
   if (m.toolCallId !== undefined) flags |= 2;
   if (m.toolCalls?.length) flags |= 4;
-  if (m.meta) flags |= 8;
+  if (m.meta && typeof m.meta.modelId === "string" && typeof m.meta.providerId === "string") flags |= 8;
   if (m.images?.length) flags |= 16;
   if (m.noCompact) flags |= 32;
   w.u8(flags);
@@ -117,7 +129,7 @@ function decodeMessage(r: Reader): ChatMessage {
   if (flags & 32) m.noCompact = true;
   return m;
 }
-function encodeSnapshot(snap: ChatSnapshot): Buffer {
+export function encodeSnapshot(snap: ChatSnapshot): Buffer {
   const w = new Writer();
   w.u8(FORMAT_VERSION);
   w.u8(snap.currentId ? 1 : 0);
@@ -143,7 +155,13 @@ function encodeSnapshot(snap: ChatSnapshot): Buffer {
   for (const [chatId, msgs] of msgEntries) {
     w.str(chatId);
     w.varint(msgs.length);
-    for (const m of msgs as ChatMessage[]) encodeMessage(w, m);
+    for (const m of msgs as ChatMessage[]) {
+      const mw = new Writer();
+      encodeMessage(mw, m);
+      const framed = mw.build();
+      w.varint(framed.length);
+      w.raw(framed);
+    }
   }
   const stepEntries = Object.entries(snap.steps ?? {});
   w.varint(stepEntries.length);
@@ -155,10 +173,14 @@ function encodeSnapshot(snap: ChatSnapshot): Buffer {
   }
   return w.build();
 }
-function decodeSnapshot(buf: Buffer): ChatSnapshot {
+export function decodeSnapshot(buf: Buffer): ChatSnapshot {
   const r = new Reader(buf, { o: 0 });
   const version = r.u8();
-  if (version !== 1 && version !== FORMAT_VERSION) throw new Error(`ARCX: unsupported format version ${version}`);
+  if (version < 1 || version > FORMAT_VERSION) throw new Error(`ARCX: unsupported format version ${version}`);
+  decodeWarnings.length = 0;
+  const warn = (msg: string): void => {
+    if (decodeWarnings.length < 20) decodeWarnings.push(msg);
+  };
   const snap: ChatSnapshot = { chats: [], messages: {}, steps: {} };
   if (r.u8()) snap.currentId = r.str();
   const chatCount = r.varint();
@@ -191,7 +213,19 @@ function decodeSnapshot(buf: Buffer): ChatSnapshot {
     const chatId = r.str();
     const n = r.varint();
     const msgs: ChatMessage[] = [];
-    for (let j = 0; j < n; j++) msgs.push(decodeMessage(r));
+    for (let j = 0; j < n; j++) {
+      if (version >= 4) {
+        const len = r.varint();
+        const frame = r.bytes(len);
+        try {
+          msgs.push(decodeMessage(new Reader(frame, { o: 0 })));
+        } catch (e) {
+          warn(`chat ${chatId}: dropped corrupt message ${j} (${(e as Error)?.message ?? e})`);
+        }
+      } else {
+        msgs.push(decodeMessage(r));
+      }
+    }
     snap.messages[chatId] = msgs;
   }
   const stepChatCount = r.varint();
@@ -199,9 +233,18 @@ function decodeSnapshot(buf: Buffer): ChatSnapshot {
     const chatId = r.str();
     const len = r.varint();
     const compressed = r.bytes(len);
-    snap.steps[chatId] = JSON.parse(inflateSync(compressed).toString("utf8")) as unknown[];
+    try {
+      snap.steps[chatId] = JSON.parse(safeInflate(compressed).toString("utf8")) as unknown[];
+    } catch (e) {
+      warn(`chat ${chatId}: dropped corrupt steps (${(e as Error)?.message ?? e})`);
+      snap.steps[chatId] = [];
+    }
   }
-  r.done();
+  try {
+    r.done();
+  } catch (e) {
+    warn(`trailing bytes ignored (${(e as Error)?.message ?? e})`);
+  }
   return snap;
 }
 export function encryptChatSnapshot(snap: ChatSnapshot, key: Buffer): Buffer {
@@ -224,5 +267,9 @@ export function decryptChatSnapshot(fileBuf: Buffer, key: Buffer): ChatSnapshot 
     tag: payload.subarray(12, 28),
     data: payload.subarray(28),
   });
-  return decodeSnapshot(plaintext);
+  const snap = decodeSnapshot(plaintext);
+  if (10 + payloadLen < fileBuf.length) {
+    decodeWarnings.push(`ignored ${fileBuf.length - 10 - payloadLen} unauthenticated trailing bytes`);
+  }
+  return snap;
 }

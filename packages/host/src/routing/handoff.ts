@@ -25,22 +25,36 @@ export function nextModelForHandoff(
   registry: ModelRegistry,
   current: ModelDescriptor,
   direction: HandoffDirection,
-  _policy: HandoffPolicy = defaultPolicy,
+  policy: HandoffPolicy = defaultPolicy,
+  history: HandoffRecord[] = [],
 ): ModelDescriptor | undefined {
+  const escalations = history.filter((h) => h.direction === "escalate").length;
+  if (direction === "escalate" && escalations >= Math.max(0, policy.maxEscalations)) return undefined;
+  const spent = history.reduce((s, h) => s + (Number.isFinite(h.costIncurred) ? h.costIncurred : 0), 0);
+  if (spent >= policy.costCeiling) return undefined;
+  const prevFrom = history.length > 0 ? history[history.length - 1].fromModelId : undefined;
   const targetTier: ModelTier | undefined =
     direction === "escalate"
-      ? current.tier === "heavy"
-        ? undefined
-        : current.tier === "default"
-          ? "heavy"
-          : "default"
-      : current.tier === "default"
+      ? current.tier === "free"
         ? "light"
-        : current.tier === "heavy"
+        : current.tier === "light"
           ? "default"
-          : undefined;
+          : current.tier === "default"
+            ? "heavy"
+            : undefined
+      : current.tier === "heavy"
+        ? "default"
+        : current.tier === "default"
+          ? "light"
+          : current.tier === "light"
+            ? "free"
+            : undefined;
   if (!targetTier) return undefined;
-  return pickForTier(registry, targetTier);
+  const candidate = pickForTier(registry, targetTier);
+  if (!candidate) return undefined;
+  const lastTs = history.length > 0 ? history[history.length - 1].ts : 0;
+  if (candidate.id === prevFrom && Date.now() - lastTs < 60_000) return undefined;
+  return candidate;
 }
 export function subagentTierFor(current: ModelDescriptor, hint?: ModelTier): ModelTier {
   if (hint) return hint;

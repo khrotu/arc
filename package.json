@@ -1,7 +1,7 @@
 {
   "name": "arc-workspace",
   "private": true,
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Arc monorepo root",
   "packageManager": "pnpm@11.22.0",
   "engines": {
@@ -30,7 +30,7 @@
     "esbuild": "0.28.1",
     "glob": "^13.0.6",
     "playwright": "1.62.0",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.4",
     "typescript": "5.5.4",
     "vite": "8.0.16",
     "vitest": "4.1.10"

@@ -1,8 +1,8 @@
 {
   "name": "arc-code",
   "displayName": "Arc",
-  "description": "0.24 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
-  "version": "0.7.1",
+  "description": "0.27 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
+  "version": "0.7.2",
   "publisher": "khrotu",
   "license": "Apache-2.0",
   "repository": {
@@ -11,7 +11,7 @@
   },
   "engines": {
     "vscode": "^1.95.0",
-    "node": ">=18.18.0"
+    "node": ">=20.0.0"
   },
   "main": "dist/extension.js",
   "extensionKind": [
@@ -173,11 +173,6 @@
         "category": "Arc"
       },
       {
-        "command": "arc.openPlayground",
-        "title": "Open Component Playground",
-        "category": "Arc"
-      },
-      {
         "command": "arc.explainSelection",
         "title": "Explain with Arc",
         "category": "Arc"
@@ -209,6 +204,17 @@
         "title": "Switch Model",
         "category": "Arc",
         "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "arc.generateCommitMessage",
+        "title": "Generate Commit Message",
+        "category": "Arc",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "arc.security.scanDiff",
+        "title": "Scan Diff for Secrets",
+        "category": "Arc"
       }
     ],
     "menus": {
@@ -222,6 +228,13 @@
           "command": "arc.openSettings",
           "when": "view == arc-sidebar || view == arc-sidebar-pride",
           "group": "navigation@2"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "arc.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation@1"
         }
       ],
       "editor/context": [
@@ -688,6 +701,11 @@
           "default": true,
           "description": "Automatically open a diff editor in the main window while the agent edits a file."
         },
+        "arc.showProblems": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the Problems panel with LSP diagnostics for files the agent edits."
+        },
         "arc.tools.disabled": {
           "type": "array",
           "items": {
@@ -703,6 +721,7 @@
             "browser.domSnapshot",
             "browser.readPage",
             "browser.newTab",
+            "browser.closeTab",
             "browser.switchTab",
             "browser.listTabs",
             "git.stage",

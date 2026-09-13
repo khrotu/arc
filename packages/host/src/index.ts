@@ -48,6 +48,8 @@ export * from "./search/vector-index.js";
 export * from "./search/indexer.js";
 export * from "./hooks/hooks.js";
 export * from "./search/watcher.js";
+export * from "./util/arcignore.js";
+export * from "./util/suggestions.js";
 export * from "./util/dep-graph.js";
 export * from "./util/process.js";
 export * from "./util/terminals.js";

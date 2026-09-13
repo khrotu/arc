@@ -29,6 +29,7 @@ export class OllamaEmbeddingBackend implements EmbeddingBackend {
       if (!j.embedding) throw new Error(`Ollama embedding response missing 'embedding' field.`);
       out.push({ values: j.embedding, dim: j.embedding.length });
     }
+    if (out.length > 0) (this as { dim: number }).dim = out[0].dim;
     return out;
   }
 }

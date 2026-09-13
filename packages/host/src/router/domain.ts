@@ -23,12 +23,29 @@ function decodeF32(b64: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 export function loadDomainModel(json: DomainModelJson): DomainModel {
+  if (!json || typeof json !== "object") throw new Error("Invalid domain model: not an object.");
+  if (!json.vocab || typeof json.vocab !== "object") throw new Error("Invalid domain model: bad vocab.");
+  if (!Array.isArray(json.classes) || json.classes.length === 0) throw new Error("Invalid domain model: bad classes.");
+  if (!Array.isArray(json.coefs) || json.coefs.length !== json.classes.length) throw new Error("Invalid domain model: bad coefs.");
+  if (!Array.isArray(json.intercepts) || json.intercepts.length !== json.classes.length || !json.intercepts.every(Number.isFinite)) {
+    throw new Error("Invalid domain model: bad intercepts.");
+  }
   const idf = decodeF32(json.idf);
+  if (idf.length === 0) throw new Error("Invalid domain model: empty idf.");
+  const vocabSize = Object.keys(json.vocab).length;
+  if (vocabSize !== idf.length) throw new Error("Invalid domain model: vocab/idf size mismatch.");
+  for (const idx of Object.values(json.vocab)) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= idf.length) throw new Error("Invalid domain model: vocab index out of range.");
+  }
+  const coefs = json.coefs.map((c) => decodeF32(c));
+  for (const coef of coefs) {
+    if (coef.length !== idf.length) throw new Error("Invalid domain model: coef length mismatch.");
+  }
   return {
     vocab: json.vocab,
     idf,
     classes: json.classes,
-    coefs: json.coefs.map(decodeF32),
+    coefs,
     intercepts: json.intercepts,
     tokenRe: /\b\w\w+\b/g,
   };

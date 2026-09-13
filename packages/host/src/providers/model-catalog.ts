@@ -1,6 +1,10 @@
 import { getProviderSpec } from "./catalog.js";
+import { createHash } from "node:crypto";
+import type { ProviderKind } from "../protocol/protocol.js";
+import { attributionHeaders } from "./attribution.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { getOrBackEntries, type OrBackEntry } from "./or-back.js";
+import { readBodyLimited } from "../security/network.js";
 export interface ProviderModelEntry {
   slug: string;
   providerId: string;
@@ -75,18 +79,9 @@ export function stripVariantCandidates(id: string): string[] {
       const candidateBase = slashBase.slice(0, bestIdx);
       const suffix = slashBase.slice(bestIdx + 1);
       if (isNumericVersionSuffix(suffix, candidateBase)) {
-        const withoutSuffix = slashBase.slice(0, bestIdx);
-        let nextIdx = -1;
-        for (const sep of ["-", ":", ".", "_"]) {
-          const idx = withoutSuffix.lastIndexOf(sep);
-          if (idx > nextIdx) nextIdx = idx;
-        }
-        if (nextIdx > 0) {
-          const nextBase = slashBase.slice(0, nextIdx);
-          const prefix = current.includes("/") ? current.slice(0, current.lastIndexOf("/") + 1) : "";
-          const candidate = prefix + nextBase;
-          if (candidate !== current) stripped = candidate;
-        }
+        const prefix = current.includes("/") ? current.slice(0, current.lastIndexOf("/") + 1) : "";
+        const candidate = prefix + candidateBase;
+        if (candidate !== current) stripped = candidate;
       } else {
         const prefix = current.includes("/") ? current.slice(0, current.lastIndexOf("/") + 1) : "";
         const candidate = prefix + candidateBase;
@@ -179,9 +174,6 @@ export function matchModelInfo(map: Map<string, OpenRouterModelInfo>, modelId: s
     const lowerKeyBare = lowerKey.split("/").pop() ?? lowerKey;
     if (
       lowerId === lowerKey ||
-      lowerId.startsWith(lowerKey + "-") ||
-      lowerId.startsWith(lowerKey + ":") ||
-      lowerId.startsWith(lowerKey + ".") ||
       lowerId.endsWith(`/${lowerKeyBare}`) ||
       lowerId.endsWith(`/${lowerKey}`)
     ) {
@@ -191,16 +183,7 @@ export function matchModelInfo(map: Map<string, OpenRouterModelInfo>, modelId: s
       }
     }
     const lastSeg = lowerId.split("/").pop() ?? lowerId;
-    if (
-      lastSeg === lowerKey ||
-      lastSeg === lowerKeyBare ||
-      lastSeg.startsWith(lowerKey + "-") ||
-      lastSeg.startsWith(lowerKey + ":") ||
-      lastSeg.startsWith(lowerKey + ".") ||
-      lastSeg.startsWith(lowerKeyBare + "-") ||
-      lastSeg.startsWith(lowerKeyBare + ":") ||
-      lastSeg.startsWith(lowerKeyBare + ".")
-    ) {
+    if (lastSeg === lowerKey || lastSeg === lowerKeyBare) {
       if (lowerKey.length > bestLen) {
         bestLen = lowerKey.length;
         best = value;
@@ -271,7 +254,7 @@ export async function getModelCatalogue(opts: { force?: boolean; proxyUrl?: stri
   const force = opts.force === true;
   if (force) {
     infoIndex = undefined;
-    slugCache.clear();
+    infoIndexPromise = undefined;
   }
   if (infoIndex) return infoIndex;
   if (!infoIndexPromise) {
@@ -314,8 +297,16 @@ export function aliasKeyForSlug(slug: string): string {
   const normalized = normalizeForMatch(slug);
   const base = normalized.split("/").pop() ?? normalized;
   let out = base;
-  for (const field of ALIAS_FIELDS) {
-    out = out.replace(new RegExp(`[-_:.]${field}$`), "");
+  for (let pass = 0; pass < ALIAS_FIELDS.length + 1; pass++) {
+    let changed = false;
+    for (const field of ALIAS_FIELDS) {
+      const next = out.replace(new RegExp(`[-_:.]${field}$`), "");
+      if (next !== out) {
+        out = next;
+        changed = true;
+      }
+    }
+    if (!changed) break;
   }
   return out.replace(/[-_]+$/, "");
 }
@@ -326,7 +317,7 @@ export async function listOpenAICompatibleModels(baseUrl: string | undefined, ki
   if (!base) return undefined;
   const isAnthropic = kind === "anthropic";
   const isOllama = kind === "ollama";
-  const headers: Record<string, string> = { accept: "application/json" };
+  const headers: Record<string, string> = { accept: "application/json", ...attributionHeaders(kind as ProviderKind) };
   if (isAnthropic) {
     headers["x-api-key"] = apiKey ?? "";
     headers["anthropic-version"] = "2023-06-01";
@@ -342,8 +333,7 @@ export async function listOpenAICompatibleModels(baseUrl: string | undefined, ki
       await res.body?.cancel().catch(() => undefined);
       return undefined;
     }
-    const text = await res.text();
-    if (text.length > SLUG_LIST_MAX_BYTES) return undefined;
+    const text = await readBodyLimited(res, SLUG_LIST_MAX_BYTES);
     const body = JSON.parse(text) as unknown;
     const data = Array.isArray((body as { data?: unknown[] }).data)
       ? (body as { data: unknown[] }).data
@@ -378,14 +368,54 @@ export interface SlugSource {
   apiKey?: string;
 }
 const slugCache = new Map<string, { at: number; slugs: string[] }>();
-const SLUG_CACHE_TTL_MS = 5 * 60 * 1000;
-export async function listProviderModelSlugs(source: SlugSource, proxyUrl?: string): Promise<string[]> {
-  const key = `${source.providerId}|${source.baseUrl ?? ""}`;
-  const hit = slugCache.get(key);
-  if (hit && Date.now() - hit.at < SLUG_CACHE_TTL_MS) return hit.slugs;
-  const slugs = (await listOpenAICompatibleModels(source.baseUrl, source.kind, source.apiKey, proxyUrl)) ?? [];
+const slugInflight = new Map<string, Promise<string[]>>();
+export const SLUG_CACHE_TTL_MS = 5 * 60 * 1000;
+function slugCacheKey(source: SlugSource): string {
+  const keyFp = source.apiKey ? `|k:${fingerprintKey(source.apiKey)}` : "";
+  return `${source.providerId}|${source.kind}|${source.baseUrl ?? ""}${keyFp}`;
+}
+function fingerprintKey(apiKey: string): string {
+  try {
+    return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+  } catch {
+    return `len${apiKey.length}`;
+  }
+}
+function cacheSlugs(key: string, slugs: string[]): void {
   slugCache.set(key, { at: Date.now(), slugs });
-  return slugs;
+  while (slugCache.size > 50) {
+    const oldest = slugCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    slugCache.delete(oldest);
+  }
+}
+export function clearProviderSlugCache(): void {
+  slugCache.clear();
+  slugInflight.clear();
+}
+export async function listProviderModelSlugs(source: SlugSource, proxyUrl?: string, opts: { force?: boolean } = {}): Promise<string[]> {
+  const force = opts.force === true;
+  const key = slugCacheKey(source);
+  if (!force) {
+    const hit = slugCache.get(key);
+    if (hit && Date.now() - hit.at < SLUG_CACHE_TTL_MS) return hit.slugs;
+  }
+  const pending = slugInflight.get(key);
+  if (pending && !force) return pending;
+  let taskRef: Promise<string[]> | undefined;
+  const task = (async () => {
+    try {
+      const fetched = await listOpenAICompatibleModels(source.baseUrl, source.kind, source.apiKey, proxyUrl);
+      if (fetched === undefined) return [];
+      cacheSlugs(key, fetched);
+      return fetched;
+    } finally {
+      if (slugInflight.get(key) === taskRef) slugInflight.delete(key);
+    }
+  })();
+  taskRef = task;
+  slugInflight.set(key, task);
+  return task;
 }
 export async function groupProviderModels(entries: ProviderModelEntry[], info?: Map<string, OpenRouterModelInfo>, opts?: { force?: boolean; proxyUrl?: string }): Promise<GroupedModel[]> {
   const catalogue = info ?? (await getModelCatalogue(opts));

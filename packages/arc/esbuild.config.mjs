@@ -20,7 +20,7 @@ const host = {
   target: "node20",
   outfile: resolve(__dirname, "dist/extension.js"),
   external: ["vscode", "playwright", "playwright-core", "playwright-firefox", "undici", "@img/*", "canvas"],
-  define: { "process.env.ARC_VERSION": JSON.stringify(ARC_VERSION) },
+  define: { "process.env.ARC_VERSION": JSON.stringify(ARC_VERSION), "process.env.NODE_ENV": JSON.stringify(isProd ? "production" : "development") },
   charset: "utf8",
   sourcemap: !isProd,
   minify: isProd,
@@ -33,9 +33,11 @@ const host = {
   ...(isProd ? { drop: ["console", "debugger"] } : {}),
   plugins: [
     {
-      name: "skip-playwright",
+      name: "keep-native-requires-external",
       setup(b) {
         b.onResolve({ filter: /^playwright/ }, (args) => ({ path: args.path, external: true }));
+        b.onResolve({ filter: /^node:/ }, (args) => ({ path: args.path, external: true }));
+        b.onResolve({ filter: /^undici$/ }, (args) => ({ path: args.path, external: true }));
       },
     },
     {
@@ -132,6 +134,17 @@ if (watch) {
 } else {
   const r1 = await ctx1.rebuild();
   const r2 = await ctx2.rebuild();
+  try {
+    const cssSrc = resolve(__dirname, "webview-ui/src/styles.css");
+    if (existsSync(cssSrc)) {
+      const raw = await readFile(cssSrc, "utf-8");
+      const code = isProd ? (await esbuild.transform(raw, { loader: "css", minify: true })).code : raw;
+      await cssWrite(code);
+    }
+  } catch (e) {
+    process.stderr.write(`[arc] css write failed: ${e.message}\n`);
+    throw e;
+  }
   if (wantMetafile) {
     await writeFile(resolve(__dirname, "dist/meta.json"), JSON.stringify(r1.metafile));
     await writeFile(resolve(__dirname, "dist/meta-webview.json"), JSON.stringify(r2.metafile));
@@ -143,19 +156,23 @@ if (watch) {
         const out = resolve(__dirname, "dist", name);
         const res = await minify(await readFile(out, "utf-8"), {
           compress: { passes: 3, ecma: 2022 },
-          mangle: { toplevel: true },
+          mangle: { toplevel: true, reserved: ["activate", "deactivate"] },
           format: { ecma: 2022 },
         });
         if (res.code) await writeFile(out, res.code);
       }
       console.log("[arc] terser post-pass done");
     } catch (e) {
-      console.warn(`[arc] terser post-pass skipped: ${e.message}`);
+      process.stderr.write(`[arc] terser post-pass skipped: ${e.message}\n`);
     }
   }
   await rename(`${hostOutfile}.tmp`, hostOutfile);
   await rename(`${webviewOutfile}.tmp`, webviewOutfile);
-  try { await rename(`${cssOutfile}.tmp`, cssOutfile); } catch {  }
+  try {
+    await rename(`${cssOutfile}.tmp`, cssOutfile);
+  } catch (e) {
+    throw new Error(`missing dist/styles.css after build: ${e.message}`);
+  }
   await ctx1.dispose();
   await ctx2.dispose();
 }

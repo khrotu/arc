@@ -64,7 +64,7 @@ describe("Agent tool calling", () => {
       reqNum++;
       const body = init?.body ? String(init.body) : "";
       if (reqNum === 1) {
-        return new Response(toolCallSse("todo__write", ["{\"items\":[{\"id\":\"a\",\"text\":\"alpha\",\"state\":\"in_progress\"}]}"]), {
+        return new Response(toolCallSse("todo_dwrite", ["{\"items\":[{\"id\":\"a\",\"text\":\"alpha\",\"state\":\"in_progress\"}]}"]), {
           status: 200, headers: { "content-type": "text/event-stream" },
         });
       }

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getArcDir } from "../arc-dir.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
-import { readBodyLimited } from "../security/network.js";
+import { readBodyLimited, safeFetch } from "../security/network.js";
 import { hostWarn } from "../log/logger.js";
 export interface OrBackEntry {
   id?: string;
@@ -48,7 +48,8 @@ export async function getOrBackEntries(opts: OrBackOptions = {}): Promise<OrBack
     if (hit && Date.now() - hit.at < ttl) return hit.entries;
   }
   const existing = inflight.get(cachePath);
-  if (existing) return existing;
+  if (existing && !opts.force) return existing;
+  let taskRef: Promise<OrBackEntry[] | undefined> | undefined;
   const task = (async () => {
     let fallback: OrBackEntry[] | undefined = caches.get(cachePath)?.entries;
     try {
@@ -62,10 +63,11 @@ export async function getOrBackEntries(opts: OrBackOptions = {}): Promise<OrBack
       }
     } catch {  }
     try {
-      const fetchImpl = opts.fetchImpl ?? fetch;
       const init: RequestInit = { headers: { accept: "application/json" }, signal: AbortSignal.timeout(30_000) };
       if (opts.proxyUrl) (init as Record<string, unknown>).dispatcher = makeProxyDispatcher(opts.proxyUrl);
-      const res = await fetchImpl(OR_BACK_URL, init);
+      const res = opts.fetchImpl
+        ? await opts.fetchImpl(OR_BACK_URL, init)
+        : await safeFetch(OR_BACK_URL, init);
       if (!res.ok) throw new Error(`or-back download failed (${res.status})`);
       const entries = parseOrBack(JSON.parse(await readBodyLimited(res, OR_BACK_MAX_BYTES)));
       if (!entries.length) throw new Error("empty or-back payload");
@@ -81,9 +83,10 @@ export async function getOrBackEntries(opts: OrBackOptions = {}): Promise<OrBack
       if (opts.force) hostWarn(`[arc] or-back reload failed, serving cached data from ${cachePath}: ${lastFetchError}`);
       return fallback;
     } finally {
-      inflight.delete(cachePath);
+      if (inflight.get(cachePath) === taskRef) inflight.delete(cachePath);
     }
   })();
+  taskRef = task;
   inflight.set(cachePath, task);
   return task;
 }

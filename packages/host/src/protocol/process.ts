@@ -27,6 +27,8 @@ export interface DiffHunk {
   added: boolean;
   removed: boolean;
   value: string;
+  oldStart?: number;
+  newStart?: number;
 }
 export interface ProcessStep {
   id: string;

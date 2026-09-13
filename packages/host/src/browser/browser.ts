@@ -66,6 +66,17 @@ interface PlaywrightPage {
   close(): Promise<void>;
 }
 const MAX_LOG_ENTRIES = 50;
+function assertSafeNavigationUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`Refusing to navigate to invalid URL '${url}'.`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Refusing to navigate to non-http(s) URL '${parsed.protocol}//...'.`);
+  }
+}
 interface TabState { id: string; page: PlaywrightPage; consoleLog: ConsoleEntry[]; networkLog: NetworkEntry[] }
 export async function createBrowser(kind: BrowserKind = "chromium", headless = true, workspaceRoot = process.cwd()): Promise<BrowserAdapter> {
   let pw: MinimalPlaywright;
@@ -146,6 +157,7 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
       const tab = resolveTab(tabId);
       if (!tab) return { ok: false, output: `Unknown tab '${tabId}'.` };
       try {
+        assertSafeNavigationUrl(url);
         await tab.page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 });
         const cap = captureSummary(tab);
         return { ok: true, output: `Navigated to ${url}${cap ? "\n\n" + cap : ""}` };
@@ -279,7 +291,7 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
         `);
         bootstrap.runInContext(context, { timeout: 1000 });
         const synchronousCode = code.replace(/\bawait\s+(?=page\.)/g, "");
-        if (/\b(?:await|async|import|require|process|globalThis|__ops|__queue)\b/.test(synchronousCode)) {
+        if (/\b(?:await|async|import|require|process|globalThis|constructor|prototype|__proto__|__ops|__queue)\b/.test(synchronousCode)) {
           throw new Error("Only synchronous page.* Playwright operations are allowed in browser.runCode.");
         }
         const script = new vm.Script(`(() => { ${synchronousCode}\n})()`);
@@ -288,7 +300,12 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
         const results: unknown[] = [];
         for (const op of queued) {
           switch (op.method) {
-            case "goto": results.push(await tab.page.goto(String(op.args[0]), { waitUntil: "domcontentloaded", timeout: 15_000 })); break;
+            case "goto": {
+              const target = String(op.args[0]);
+              assertSafeNavigationUrl(target);
+              results.push(await tab.page.goto(target, { waitUntil: "domcontentloaded", timeout: 15_000 }));
+              break;
+            }
             case "click": results.push(await tab.page.click(String(op.args[0]), { timeout: 5_000 })); break;
             case "fill": results.push(await tab.page.fill(String(op.args[0]), String(op.args[1] ?? ""), { timeout: 5_000 })); break;
             case "hover": results.push(await tab.page.hover(String(op.args[0]), { timeout: 5_000 })); break;
@@ -297,17 +314,7 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
             case "waitForURL": results.push(await tab.page.waitForURL(String(op.args[0]), { timeout: 10_000 })); break;
             case "waitForLoadState": results.push(await tab.page.waitForLoadState(String(op.args[0] ?? "networkidle"))); break;
             case "evaluate": {
-              const raw = op.args[0];
-              const rest = op.args.slice(1);
-              let expr = typeof raw === "string" ? raw : String(raw ?? "");
-              if (/^\s*(async\s+)?(function\b|(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/.test(expr)) {
-                const fwd = rest.map((a) => {
-                  try { return JSON.stringify(a) ?? "undefined"; } catch { return "undefined"; }
-                }).join(",");
-                expr = `(${expr})(${fwd})`;
-              }
-              results.push(await tab.page.evaluate(expr));
-              break;
+              throw new Error("page.evaluate is not allowed in browser.runCode. Enable and use the browser.evaluate tool instead.");
             }
             case "screenshot": {
               const options = (op.args[0] && typeof op.args[0] === "object" ? op.args[0] : {}) as { path?: string; fullPage?: boolean; type?: string };
@@ -338,6 +345,7 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
     domSnapshot(tabId) { const tab = resolveTab(tabId); return tab ? captureSummary(tab) : ""; },
     async newTab(url) {
       try {
+        if (url) assertSafeNavigationUrl(url);
         const page = await ctx.newPage();
         const tab = attachTab(page);
         activeTabId = tab.id;

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ModelRegistry } from "../routing/registry.js";
 import { pickProvider } from "../routing/router.js";
 import { transportFor } from "../providers/transport.js";
+import { wrapUntrusted } from "../security/injection.js";
 import type { ChatMessage } from "../protocol/protocol.js";
 export interface SamplingContentBlock {
   type: string;
@@ -32,22 +33,33 @@ export async function completeSamplingRequest(
   if (!decision) throw new Error(`No provider available for model '${model.id}'.`);
   const transport = transportFor(decision.provider);
   const messages: ChatMessage[] = [];
-  if (params.systemPrompt) {
-    messages.push({ id: randomUUID(), role: "system", content: params.systemPrompt, ts: Date.now() });
+  if (params.systemPrompt !== undefined && params.systemPrompt !== null) {
+    const sysText = String(params.systemPrompt).slice(0, 8000);
+    if (sysText) {
+      messages.push({
+        id: randomUUID(),
+        role: "system",
+        content: wrapUntrusted(sysText, "mcp-sampling-system"),
+        ts: Date.now(),
+      });
+    }
   }
-  for (const m of params.messages ?? []) {
+  for (const m of (Array.isArray(params.messages) ? params.messages : []).slice(0, 20)) {
+    const rawText = m?.content?.text;
+    const text = (typeof rawText === "string" ? rawText : String(rawText ?? "")).slice(0, 8000);
     messages.push({
       id: randomUUID(),
       role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content?.text ?? "",
+      content: m.role === "assistant" ? wrapUntrusted(text, "mcp-sampling-assistant") : wrapUntrusted(text, "mcp-sampling"),
       ts: Date.now(),
     });
   }
+  const maxTokens = Number.isFinite(params.maxTokens) ? Math.max(1, Math.min(4096, Math.floor(params.maxTokens as number))) : 1024;
   const handle = await transport.stream({
     model,
     provider: decision.provider,
     messages,
-    maxTokens: params.maxTokens,
+    maxTokens,
     proxyUrl: opts?.proxyUrl,
   });
   let text = "";

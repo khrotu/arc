@@ -20,9 +20,35 @@ export interface CapabilityModel {
   bars: Record<string, DomainBars>;
 }
 export function loadCalibrationModel(json: CalibrationModel): CalibrationModel {
+  if (!json || typeof json !== "object") throw new Error("Invalid calibration model.");
+  if (!Array.isArray(json.edges) || json.edges.length === 0 || !json.edges.every(Number.isFinite)) {
+    throw new Error("Invalid calibration model: bad edges.");
+  }
+  if (!json.bars_by_q || typeof json.bars_by_q !== "object") throw new Error("Invalid calibration model: bad bars.");
+  for (const bars of Object.values(json.bars_by_q)) {
+    if (!Array.isArray(bars) || bars.length !== json.edges.length || !bars.every(Number.isFinite)) {
+      throw new Error("Invalid calibration model: bad bars entry.");
+    }
+  }
+  for (const k of ["default_q", "ling_score", "weak_score", "strong_score"] as const) {
+    if (!Number.isFinite(json[k])) throw new Error(`Invalid calibration model: bad ${k}.`);
+  }
   return json;
 }
 export function loadCapabilityModel(json: CapabilityModel): CapabilityModel {
+  if (!json || typeof json !== "object") throw new Error("Invalid capability model.");
+  if (!Array.isArray(json.domains)) throw new Error("Invalid capability model: bad domains.");
+  if (!Array.isArray(json.anchor_scores) || !json.anchor_scores.every(Number.isFinite)) {
+    throw new Error("Invalid capability model: bad anchor scores.");
+  }
+  if (!json.bars || typeof json.bars !== "object") throw new Error("Invalid capability model: bad bars.");
+  for (const [name, dom] of Object.entries(json.bars)) {
+    if (!dom || !Array.isArray(dom.edges) || dom.edges.length === 0 || !dom.edges.every(Number.isFinite)) {
+      throw new Error(`Invalid capability model: bad edges for '${name}'.`);
+    }
+    if (!dom.bars_by_q || typeof dom.bars_by_q !== "object") throw new Error(`Invalid capability model: bad bars for '${name}'.`);
+  }
+  if (!Number.isFinite(json.default_q)) throw new Error("Invalid capability model: bad default_q.");
   return json;
 }
 function interp(x: number, xs: number[], ys: number[]): number {

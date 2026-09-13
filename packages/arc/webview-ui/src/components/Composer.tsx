@@ -56,6 +56,21 @@ type Props = {
   routePending?: { modelLabel: string; domain?: string; confidence?: number } | null;
   onAcceptRouted?: () => void;
   onRejectRouted?: () => void;
+  // Task 8: approvals + clarifications live in the composer extension
+  approval?: { description: string; queueCount: number } | null;
+  approvalMenuOpen?: boolean;
+  onToggleApprovalMenu?: () => void;
+  onRespondApproval?: (allowed: boolean, rememberCommand?: string, rememberPrefix?: string) => void;
+  approvalCommand?: string;
+  approvalPrefix?: string;
+  clarification?: { question: string; options: string[] } | null;
+  onAnswerClarification?: (answer: string) => void;
+  onDismissClarification?: () => void;
+  suggestions?: { kind: string; id: string; label: string; detail?: string; tokens: number }[] | null;
+  suggestionsOpen?: boolean;
+  onToggleSuggestions?: () => void;
+  onUnloadSuggestion?: (kind: string, id: string) => void;
+  onDismissSuggestion?: (kind: string, id: string) => void;
   variant: "sidebar" | "fullscreen";
   models: ModelDescriptor[];
   currentModelId: string;
@@ -70,6 +85,9 @@ export default function Composer({
   onSend, onStop, onGuidance, streaming, disabled, pendingAttachment, onAttach, placeholder, autoFocus = true, queuedText, onCancelQueue, prefillText, prefillSeq,
   todos, todosOpen, onToggleTodos, polishing, polishPending, onRejectPolished, polishLevel, onPolish,
   autoMode, routing, routePending, onAcceptRouted, onRejectRouted,
+  approval, approvalMenuOpen, onToggleApprovalMenu, onRespondApproval, approvalCommand, approvalPrefix,
+  clarification, onAnswerClarification, onDismissClarification,
+  suggestions, suggestionsOpen, onToggleSuggestions, onUnloadSuggestion, onDismissSuggestion,
   variant, models, currentModelId, onSelectModel, modes, currentMode, onSelectMode, effort, onSelectEffort,
 }: Props) {
   const [text, setText] = useState("");
@@ -113,9 +131,11 @@ export default function Composer({
       ]);
     }
   }, [pendingAttachment]);
+  const routeActive = !!routing || !!routePending;
   const submit = useCallback(() => {
     const t = text.trim();
     if (!t || disabled) return;
+    if (routeActive) return;
     if (polishLevel && polishLevel !== "off" && !polishing && !polishPending && onPolish) {
       onPolish(t);
       return;
@@ -126,7 +146,7 @@ export default function Composer({
       setAttachments([]);
       setImages([]);
     }
-  }, [text, disabled, streaming, attachments, onSend, polishLevel, polishing, polishPending, onPolish, autoMode]);
+  }, [text, disabled, streaming, attachments, images, onSend, polishLevel, polishing, polishPending, onPolish, autoMode, routeActive]);
   const acceptRoute = () => {
     onAcceptRouted?.();
     setText("");
@@ -136,7 +156,6 @@ export default function Composer({
   const rejectRoute = () => {
     onRejectRouted?.();
   };
-  const routeActive = !!routing || !!routePending;
   const attach = () => {
     if (onAttach) return onAttach();
     (window as unknown as { __ARC_ATTACH?: () => void }).__ARC_ATTACH?.();
@@ -272,6 +291,95 @@ export default function Composer({
           </div>
         </div>
       )}
+      {clarification && (
+        <div className="arc-composer-clar">
+          <div className="arc-composer-clar-head">
+            <span className="arc-composer-clar-title">Clarification needed</span>
+            <span className="arc-spacer" />
+            <button className="arc-iconbtn" title="Dismiss" aria-label="Dismiss clarification" onClick={() => onDismissClarification?.()}>
+              <X size={13} />
+            </button>
+          </div>
+          <div className="arc-composer-clar-q">{clarification.question}</div>
+          {clarification.options.length > 0 && (
+            <div className="arc-composer-clar-options">
+              {clarification.options.map((opt, i) => (
+                <button key={opt} className="arc-chip" onClick={() => onAnswerClarification?.(opt)}>
+                  {opt}<kbd>{i + 1}</kbd>
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="arc-composer-clar-input">
+            <input
+              type="text"
+              placeholder="Type your answer..."
+              aria-label="Clarification answer"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const val = (e.target as HTMLInputElement).value.trim();
+                  if (val) {
+                    onAnswerClarification?.(val);
+                    (e.target as HTMLInputElement).value = "";
+                  }
+                }
+              }}
+            />
+            <button
+              aria-label="Submit answer"
+              onClick={(e) => {
+                const input = (e.currentTarget.parentElement?.querySelector("input") as HTMLInputElement | null);
+                const val = input?.value.trim();
+                if (val) {
+                  onAnswerClarification?.(val);
+                  if (input) input.value = "";
+                }
+              }}
+            >↩</button>
+          </div>
+        </div>
+      )}
+      {approval && (
+        <div className="arc-composer-approval">
+          <div className="arc-composer-approval-head">
+            <span className="arc-approval-dot" />
+            <span className="arc-composer-approval-q">{(approval.description ?? "Approval required").split("\n\n")[0]}</span>
+            {approval.queueCount > 1 && <span className="arc-composer-approval-meta">+{approval.queueCount - 1}</span>}
+          </div>
+          {(approval.description ?? "").includes("\n\n") && (
+            <div className="arc-composer-approval-body">{(approval.description ?? "").split("\n\n").slice(1).join("\n\n")}</div>
+          )}
+          <div className="arc-composer-approval-actions">
+            <div className="arc-approval-allow-group">
+              <button className="arc-approval-allow" onClick={() => onRespondApproval?.(true)} autoFocus>
+                Allow once
+              </button>
+              <button
+                className="arc-approval-allow-caret"
+                onClick={() => onToggleApprovalMenu?.()}
+                aria-expanded={approvalMenuOpen}
+                aria-haspopup="menu"
+                title="More approval options"
+              >
+                <ChevronDown size={13} />
+              </button>
+              {approvalMenuOpen && (
+                <div className="arc-approval-menu" role="menu">
+                  <button role="menuitem" onClick={() => { if (approvalCommand) onRespondApproval?.(true, approvalCommand); onToggleApprovalMenu?.(); }}>
+                    Allow session
+                  </button>
+                  <button role="menuitem" onClick={() => { if (approvalPrefix) onRespondApproval?.(true, undefined, approvalPrefix); onToggleApprovalMenu?.(); }}>
+                    Allow prefix
+                  </button>
+                </div>
+              )}
+            </div>
+            <button className="arc-approval-deny" onClick={() => { onRespondApproval?.(false); }}>
+              Deny <kbd>Esc</kbd>
+            </button>
+          </div>
+        </div>
+      )}
       {todos && todos.length > 0 && (
         <div className={`arc-composer-plan ${todosOpen ? "is-open" : ""}`}>
           <button className="arc-composer-plan-head" onClick={onToggleTodos}>
@@ -285,6 +393,41 @@ export default function Composer({
           {todosOpen && (
             <div className="arc-composer-plan-body" ref={planBodyRef}>
               <TodoList items={todos} level={0} />
+            </div>
+          )}
+        </div>
+      )}
+      {suggestions && suggestions.length > 0 && (
+        <div className={`arc-composer-suggestions ${suggestionsOpen ? "is-open" : ""}`}>
+          <button className="arc-composer-plan-head" onClick={onToggleSuggestions} title="Unused context you can unload to save tokens">
+            <span className="arc-composer-plan-title">Suggestions</span>
+            <span className="arc-composer-suggest-save">
+              save ~{(suggestions.reduce((s, x) => s + x.tokens, 0) / 1000).toFixed(1)}k
+            </span>
+            <span className="arc-composer-plan-count">{suggestions.length}</span>
+            <ChevronDown size={11} className={`arc-composer-plan-chevron ${suggestionsOpen ? "is-open" : ""}`} />
+          </button>
+          {suggestionsOpen && (
+            <div className="arc-composer-suggest-body">
+              {suggestions.map((s) => (
+                <div key={`${s.kind}:${s.id}`} className="arc-composer-suggest-row">
+                  <div className="arc-composer-suggest-main">
+                    <span className="arc-composer-suggest-label">{s.label}</span>
+                    {s.detail && <span className="arc-composer-suggest-detail">{s.detail}</span>}
+                  </div>
+                  <span className="arc-composer-suggest-tokens">~{s.tokens >= 1000 ? `${(s.tokens / 1000).toFixed(1)}k` : s.tokens}</span>
+                  <button
+                    className="arc-btn-ghost arc-composer-suggest-unload"
+                    title={s.kind === "mcp" || s.kind === "tool" ? `Unload ${s.label}` : `Dismiss suggestion`}
+                    onClick={() => onUnloadSuggestion?.(s.kind, s.id)}
+                  >
+                    {s.kind === "mcp" || s.kind === "tool" ? "Unload" : "Dismiss"}
+                  </button>
+                  <button className="arc-iconbtn" title="Dismiss" aria-label={`Dismiss ${s.label}`} onClick={() => onDismissSuggestion?.(s.kind, s.id)}>
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
             </div>
           )}
         </div>

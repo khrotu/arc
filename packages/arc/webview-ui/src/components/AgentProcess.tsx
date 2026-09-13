@@ -40,9 +40,107 @@ const Code = memo(({ text, isOutput }: { text: string; isOutput?: boolean }) => 
   return <span className="arc-code-text" dangerouslySetInnerHTML={{ __html: highlight(text, isOutput) }} />;
 });
 Code.displayName = "Code";
-const DiffView = memo(({ hunks, filePath, onOpenFile, onOpenFullscreenDiff, resolution, onResolve }: { hunks: DiffHunk[]; filePath?: string; onOpenFile?: (path: string) => void; onOpenFullscreenDiff?: (payload: { filePath?: string; hunks: DiffHunk[] }) => void; resolution?: "accepted" | "rejected"; onResolve?: (action: "accept" | "reject") => void }) => {
-  let oldLine = 1;
-  let newLine = 1;
+const ExpandableCode = memo(({ text, isOutput, isErr }: { text: string; isOutput?: boolean; isErr?: boolean }) => {
+  const [expanded, setExpanded] = useState(false);
+  if (!text) return null;
+  const long = text.length > 600 || text.split("\n").length > 12;
+  return (
+    <div className={`arc-code arc-code-output is-expandable ${isErr ? "is-err" : ""} ${expanded ? "is-expanded" : ""}`}>
+      <Code text={text} isOutput={isOutput} />
+      {long && (
+        <button className="arc-code-expand" onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }} aria-expanded={expanded}>
+          {expanded ? "Show less" : "Expand"}
+        </button>
+      )}
+    </div>
+  );
+});
+ExpandableCode.displayName = "ExpandableCode";
+const DIFF_CONTEXT_LINES = 3;
+const DiffView = memo(({ hunks, filePath, onOpenFile, onOpenFullscreenDiff }: { hunks: DiffHunk[]; filePath?: string; onOpenFile?: (path: string) => void; onOpenFullscreenDiff?: (payload: { filePath?: string; hunks: DiffHunk[] }) => void }) => {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  type Row = { kind: "add" | "rem" | "ctx"; text: string; oldNo?: number; newNo?: number; key: string };
+  const rows: Row[] = useMemo(() => {
+    const out: Row[] = [];
+    let oldLine = 1;
+    let newLine = 1;
+    hunks.forEach((h, hi) => {
+      const hasStart = typeof h.oldStart === "number" || typeof h.newStart === "number";
+      if (typeof h.oldStart === "number") oldLine = h.oldStart;
+      if (typeof h.newStart === "number") newLine = h.newStart;
+      const rawValue = h.value ?? "";
+      const lines = rawValue.split(/\r?\n/);
+      if (lines.length && lines[lines.length - 1] === "") lines.pop();
+      if (lines.length === 1 && lines[0] === "" && rawValue === "") return;
+      lines.forEach((raw, li) => {
+        const text = raw.replace(/\r$/, "");
+        if (h.added) {
+          out.push({ kind: "add", text, newNo: hasStart ? newLine++ : undefined, key: `${hi}-${li}` });
+          if (!hasStart) newLine++;
+        } else if (h.removed) {
+          out.push({ kind: "rem", text, oldNo: hasStart ? oldLine++ : undefined, key: `${hi}-${li}` });
+          if (!hasStart) oldLine++;
+        } else {
+          out.push({ kind: "ctx", text, oldNo: hasStart ? oldLine++ : undefined, newNo: hasStart ? newLine++ : undefined, key: `${hi}-${li}` });
+          if (!hasStart) { oldLine++; newLine++; }
+        }
+      });
+    });
+    return out;
+  }, [hunks]);
+  const rendered: ({ type: "row"; row: Row } | { type: "skip"; count: number; fromOld?: number; toOld?: number; key: string })[] = useMemo(() => {
+    const out: typeof rendered = [];
+    let i = 0;
+    while (i < rows.length) {
+      if (rows[i].kind !== "ctx") {
+        out.push({ type: "row", row: rows[i] });
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < rows.length && rows[j].kind === "ctx") j++;
+      const runLen = j - i;
+      const isStart = i === 0;
+      const isEnd = j === rows.length;
+      const keepHead = isStart ? 0 : DIFF_CONTEXT_LINES;
+      const keepTail = isEnd ? 0 : DIFF_CONTEXT_LINES;
+      if (runLen <= keepHead + keepTail + 1) {
+        for (let k = i; k < j; k++) out.push({ type: "row", row: rows[k] });
+      } else {
+        if (keepHead > 0) {
+          for (let k = i; k < i + keepHead; k++) out.push({ type: "row", row: rows[k] });
+        }
+        const hiddenStart = i + keepHead;
+        const hiddenEnd = j - keepTail;
+        const count = hiddenEnd - hiddenStart;
+        const key = `skip-${hiddenStart}-${hiddenEnd}`;
+        if (expanded.has(key)) {
+          for (let k = hiddenStart; k < hiddenEnd; k++) out.push({ type: "row", row: rows[k] });
+        } else {
+          out.push({
+            type: "skip",
+            count,
+            fromOld: rows[hiddenStart]?.oldNo,
+            toOld: rows[hiddenEnd - 1]?.oldNo,
+            key,
+          });
+        }
+        if (keepTail > 0) {
+          for (let k = hiddenEnd; k < j; k++) out.push({ type: "row", row: rows[k] });
+        }
+      }
+      i = j;
+    }
+    return out;
+  }, [rows, expanded]);
+  const toggleSkip = useCallback((key: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
   return (
     <div className="arc-diff">
       {filePath && (
@@ -62,36 +160,29 @@ const DiffView = memo(({ hunks, filePath, onOpenFile, onOpenFullscreenDiff, reso
           )}
         </div>
       )}
-      {onResolve && (
-        <div className="arc-diff-actions">
-          {resolution ? (
-            <span className={`arc-diff-resolution ${resolution}`}>{resolution === "accepted" ? "Accepted" : "Rejected"}</span>
-          ) : (
-            <>
-              <button className="arc-btn-ghost" onClick={(e) => { e.stopPropagation(); onResolve("reject"); }}>Reject</button>
-              <button className="arc-btn" onClick={(e) => { e.stopPropagation(); onResolve("accept"); }}><Check size={13} /> Accept</button>
-            </>
-          )}
-        </div>
-      )}
       <div className="arc-diff-body">
-        {hunks.map((h, hi) => {
-          const lines = h.value ? h.value.split("\n") : [""];
-          if (lines[lines.length - 1] === "") lines.pop();
-          return lines.map((raw, li) => {
-            const cls = h.added ? "arc-diff-add" : h.removed ? "arc-diff-rem" : "arc-diff-context";
-            const sign = h.added ? "+" : h.removed ? "-" : " ";
-            const curOld = h.removed || (!h.added && !h.removed) ? oldLine++ : undefined;
-            const curNew = h.added || (!h.added && !h.removed) ? newLine++ : undefined;
+        {rendered.map((item) => {
+          if (item.type === "skip") {
+            const label = item.fromOld !== undefined && item.toOld !== undefined && item.fromOld !== item.toOld
+              ? `··· ${item.count} unchanged lines (${item.fromOld}–${item.toOld}) ···`
+              : `··· ${item.count} unchanged lines ···`;
             return (
-              <div key={`${hi}-${li}`} className={cls}>
-                <span className="arc-diff-sign">{sign}</span>
-                <span className="arc-diff-old">{curOld !== undefined ? String(curOld).padStart(3, " ") : "   "}</span>
-                <span className="arc-diff-new">{curNew !== undefined ? String(curNew).padStart(3, " ") : "   "}</span>
-                <span className="arc-diff-text">{raw}</span>
-              </div>
+              <button key={item.key} className="arc-diff-skip" onClick={(e) => { e.stopPropagation(); toggleSkip(item.key); }} title="Click to expand unchanged lines">
+                {expanded.has(item.key) ? "Collapse" : label}
+              </button>
             );
-          });
+          }
+          const r = item.row;
+          const cls = r.kind === "add" ? "arc-diff-add" : r.kind === "rem" ? "arc-diff-rem" : "arc-diff-context";
+          const sign = r.kind === "add" ? "+" : r.kind === "rem" ? "-" : " ";
+          return (
+            <div key={r.key} className={cls}>
+              <span className="arc-diff-sign">{sign}</span>
+              <span className="arc-diff-old">{r.oldNo !== undefined ? String(r.oldNo).padStart(3, " ") : "  ~"}</span>
+              <span className="arc-diff-new">{r.newNo !== undefined ? String(r.newNo).padStart(3, " ") : "  ~"}</span>
+              <span className="arc-diff-text">{r.text}</span>
+            </div>
+          );
         })}
       </div>
     </div>
@@ -185,6 +276,7 @@ const TOOL_PHRASES: Record<string, ToolPhrase> = {
   "file.grep": ["Searched", "files"],
   "file.glob": ["Globbed", "files"],
   "file.semanticSearch": ["Ran", "semantic search"],
+  "syms.context": ["Built", "code context"],
   "shell.run": ["Ran", "commands"],
   "shell.backgroundRun": ["Started", "background process"],
   "shell.check": ["Checked", "processes"],
@@ -271,6 +363,15 @@ function topToolLabel(children: ProcessStep[] | undefined): string {
   return ranked.length === 1 ? joinPair(ranked[0]) : joinPair(ranked[0], ranked[1]);
 }
 const savedGroupTitles = new Set<string>();
+function rememberGroupTitle(id: string): boolean {
+  if (savedGroupTitles.has(id)) return false;
+  savedGroupTitles.add(id);
+  if (savedGroupTitles.size > 500) {
+    const oldest = savedGroupTitles.values().next().value as string | undefined;
+    if (oldest !== undefined) savedGroupTitles.delete(oldest);
+  }
+  return true;
+}
 const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, resolvedDiffs, onResolveDiff, groupSummaryMode = "count", requestAISummary, saveGroupTitle }: { step: ProcessStep; onOpenFile?: (path: string) => void; onOpenFullscreenDiff?: (payload: { filePath?: string; hunks: DiffHunk[] }) => void; toolTreeMode: ToolTreeMode; resolvedDiffs?: Record<string, "accepted" | "rejected">; onResolveDiff?: (step: ProcessStep, action: "accept" | "reject") => void; groupSummaryMode?: GroupSummaryMode; requestAISummary?: (groupId: string, titles: string[]) => Promise<string>; saveGroupTitle?: (stepId: string, title: string, mode: string) => void }) => {
   const [open, setOpen] = useState(step.type === "subagent" || toolTreeMode === "auto");
   const childCount = step.children?.length || 0;
@@ -282,11 +383,10 @@ const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, 
   useEffect(() => {
     if (!ended || !isToolGroup || !lastChildId || !saveGroupTitle) return;
     if (lastChildTitle) return;
-    if (savedGroupTitles.has(lastChildId)) return;
+    if (!rememberGroupTitle(lastChildId)) return;
     if (groupSummaryMode === "tools") {
       const label = topToolLabel(step.children);
       if (label) {
-        savedGroupTitles.add(lastChildId);
         saveGroupTitle(lastChildId, label.slice(0, GROUP_SUMMARY_CAP), "tools");
       }
     }
@@ -297,8 +397,7 @@ const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, 
       setAiTitle(lastChildTitle);
       return;
     }
-    if (savedGroupTitles.has(lastChildId)) return;
-    savedGroupTitles.add(lastChildId);
+    if (!rememberGroupTitle(lastChildId)) return;
     let cancelled = false;
     setAiTitle("");
     const titles = [...new Set((step.children ?? []).flatMap((c) => [c.title, ...(c.children ?? []).map((g) => g.title)]).filter(Boolean) as string[])].slice(0, 60);
@@ -321,9 +420,30 @@ const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, 
       groupTitle = aiTitle;
     }
   }
+  // Toggle .is-stuck only while the header is actually pinned (stuck to the
+  // top of the scroll container), so the divider never shows on expanded /
+  // resting chains. Sentinel sits just above the header: when it scrolls out
+  // of view upward, the header is stuck.
+  const sentinelRef = useRef<HTMLSpanElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    const toggle = toggleRef.current;
+    if (!sentinel || !toggle) return;
+    const scroller = sentinel.closest(".arc-transcript");
+    const obs = new IntersectionObserver(
+      ([entry]) => {
+        toggle.classList.toggle("is-stuck", !entry.isIntersecting && entry.boundingClientRect.top < 0);
+      },
+      { root: scroller instanceof Element ? scroller : null, threshold: 0 },
+    );
+    obs.observe(sentinel);
+    return () => obs.disconnect();
+  }, []);
   return (
     <div className="arc-proc-group">
-      <button className={`arc-proc-group-toggle${open ? " is-open" : ""}`} onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+      <span ref={sentinelRef} className="arc-proc-group-sentinel" aria-hidden="true" />
+      <button ref={toggleRef} className={`arc-proc-group-toggle${open ? " is-open" : ""}`} onClick={() => setOpen((o) => !o)} aria-expanded={open}>
         <span className="arc-proc-group-icon-wrap">
           <ChevronRight size={14} className="arc-proc-group-icon-chevron" style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }} />
           {step.type === "subagent" ? (
@@ -450,15 +570,13 @@ const ProcessNode = memo(({ step, isActive, onToggle, onOpenFile, onOpenFullscre
                     filePath={step.filePath}
                     onOpenFile={onOpenFile}
                     onOpenFullscreenDiff={onOpenFullscreenDiff}
-                    resolution={resolvedDiffs?.[step.id]}
-                    onResolve={onResolveDiff ? (action) => onResolveDiff(step, action) : undefined}
                   />
                 </div>
               )}
               {!hasDiff && step.output && (
                 <div className="arc-proc-block">
                   <span className="arc-proc-block-label">Output</span>
-                  <div className={`arc-code arc-code-output ${step.type === "error" ? "is-err" : ""}`}><Code text={step.output} isOutput /></div>
+                  <ExpandableCode text={step.output} isOutput isErr={step.type === "error"} />
                 </div>
               )}
               {hasDiff && step.output && (
@@ -473,7 +591,7 @@ const ProcessNode = memo(({ step, isActive, onToggle, onOpenFile, onOpenFullscre
               {step.runAfterOutput && (
                 <div className="arc-proc-block">
                   <span className="arc-proc-block-label">Output</span>
-                  <div className="arc-code arc-code-output"><Code text={step.runAfterOutput} isOutput /></div>
+                  <ExpandableCode text={step.runAfterOutput} isOutput />
                 </div>
               )}
               {step.type === "handoff" && <HandoffBlock from={step.fromModel} to={step.toModel} reason={step.reason} />}

@@ -66,4 +66,20 @@ describe("chats codec", () => {
   it("exposes the arcx file name", () => {
     expect(CHATS_FILE_NAME).toBe("arc.chats.arcx");
   });
+  it("recovers surviving messages when one frame is corrupt", async () => {
+    const { decodeSnapshot, encodeSnapshot, getLastDecodeWarnings } = await import("../src/extension/chats-codec.ts");
+    const snap = sampleSnapshot();
+    const plain = encodeSnapshot(snap);
+    const at = plain.indexOf('"path":"src/index.ts"');
+    expect(at).toBeGreaterThan(0);
+    plain[at] ^= 0xff;
+    const out = decodeSnapshot(plain);
+    const ids = (out.messages["chat-1"] ?? []).map((m: { id: string }) => m.id);
+    expect(ids).toContain("m1");
+    expect(ids).toContain("m3");
+    expect(ids).toContain("m4");
+    expect(ids).not.toContain("m2");
+    expect(getLastDecodeWarnings().length).toBeGreaterThan(0);
+    expect(out.messages["chat-2"].length).toBe(1);
+  });
 });

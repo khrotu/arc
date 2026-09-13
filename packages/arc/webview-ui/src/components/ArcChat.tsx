@@ -1,6 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
-import { Settings, Plus, Trash2, Pencil, FoldVertical, HelpCircle, PanelLeftClose, PanelLeft, ShieldCheck, ShieldOff, ShieldHalf, Search, ArrowLeft, Undo2, X, ChevronDown, ListChecks } from "./icons";
+import { Settings, Plus, Trash2, Pencil, FoldVertical, PanelLeftClose, PanelLeft, ShieldCheck, ShieldOff, ShieldHalf, Search, ArrowLeft, Undo2, X, ListChecks } from "./icons";
 import { TodoList, type TodoItemUI } from "./TodoList";
 import { FadeSlideIn } from "./anim";
 import ArcProcessUI, { type ProcessStep } from "./AgentProcess";
@@ -98,6 +98,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const [ctxStats, setCtxStats] = useState<{ usedPct: number; tokens: number; window: number; cost: number; inputTokens?: number; cacheRead?: number; cacheWrite?: number; cacheReadCost?: number; completionTokens?: number; costIn?: number; costOut?: number } | null>(null);
   const [groupSummaryMode, setGroupSummaryMode] = useState<"count" | "tools" | "ai">("count");
   const pendingToolSummaries = useRef(new Map<string, (text: string) => void>());
+  const pendingLocal = useRef<string[]>([]);
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [currentModel, setCurrentModel] = useState<string>("");
   const [modes, setModes] = useState<{ slug: string; description: string; source?: string }[]>([]);
@@ -106,6 +107,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [hasEverSent, setHasEverSent] = useState(false);
   const [lastTurnError, setLastTurnError] = useState<{ message: string; code?: string } | null>(null);
+  const [errorExpanded, setErrorExpanded] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showUpdate, setShowUpdate] = useState<{ version: string; url: string } | null>(null);
@@ -114,7 +116,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const [serverStates, setServerStates] = useState<Record<string, { running: boolean; pid?: number; error?: string; starting?: boolean }>>({});
   const [approvalQueue, setApprovalQueue] = useState<{ id: string; description: string; kind: string; command?: string }[]>([]);
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
-  const [queuedMessage, setQueuedMessage] = useState<string | null>(null);
+  const [queuedMessage, setQueuedMessage] = useState<{ text: string; attachments?: { uri: string; preview?: string }[]; images?: string[]; modelId?: string; autoRouted?: boolean } | null>(null);
   const [prefillText, setPrefillText] = useState<string | null>(null);
   const [prefillSeq, setPrefillSeq] = useState(0);
   const [polishLevel, setPolishLevel] = useState<"off" | "basic" | "polish">("off");
@@ -167,19 +169,28 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     const off = client.on((e: any) => {
       switch (e.type) {
         case "session/init":
+          pendingLocal.current = [];
           if (e.chatId) setActiveId(e.chatId);
-          setModels(e.models);
-          setCurrentModel(e.currentModelId);
-          if (e.modes) setModes(e.modes);
-          if (e.currentMode) setCurrentMode(e.currentMode);
+          if (Array.isArray(e.models)) setModels(e.models);
+          if (e.currentModelId) setCurrentModel(e.currentModelId);
+          if (Array.isArray(e.modes) && e.modes.length) {
+            setModes(e.modes);
+            if (typeof e.currentMode === "string" && e.modes.some((m: { slug: string }) => m?.slug === e.currentMode)) {
+              setCurrentMode(e.currentMode);
+            }
+          }
           if (e.reasoningEffort) setReasoningEffort(e.reasoningEffort);
           break;
         case "mode/list":
-          if (e.modes) setModes(e.modes);
+          if (Array.isArray(e.modes) && e.modes.length) {
+            setModes(e.modes);
+            setCurrentMode((prev) => (prev && e.modes.some((m: { slug: string }) => m?.slug === prev) ? prev : e.modes[0].slug));
+          }
           break;
-        case "chat/list": setChats(e.chats); break;
+        case "chat/list": if (Array.isArray(e.chats)) setChats(e.chats); break;
         case "chat/current":
           cancelStreamFlush();
+          pendingLocal.current = [];
           sessionIdRef.current = e.chatId;
           setActiveId(e.chatId);
           setShowOnboarding(true);
@@ -223,16 +234,14 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               return next;
             }
             if (e.message.role === "user") {
-              const localIdx = prev.findIndex(
-                (m) =>
-                  m.role === "user" &&
-                  m.id.startsWith("local-") &&
-                  (e.message.content === m.content || e.message.content.startsWith(m.content)),
-              );
-              if (localIdx >= 0) {
-                const next = prev.slice();
-                next[localIdx] = e.message;
-                return next;
+              const localId = pendingLocal.current.shift();
+              if (localId) {
+                const localIdx = prev.findIndex((m) => m.id === localId);
+                if (localIdx >= 0) {
+                  const next = prev.slice();
+                  next[localIdx] = e.message;
+                  return next;
+                }
               }
             }
             return [...prev, e.message];
@@ -260,8 +269,11 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
           stopSeqRef.current++;
           if (e.sessionId && sessionIdRef.current !== e.sessionId) sessionIdRef.current = e.sessionId;
           setStreaming({ id: "pending", text: "" }); setShowOnboarding(false); setLastTurnError(null); break;
-        case "session/turnEnd": stopSeqRef.current++; if (attentionRef.current.completion) playAttention("done"); cancelStreamFlush(); setStreaming(null); break;
+        case "session/turnEnd": stopSeqRef.current++; setStopping(false); if (attentionRef.current.completion) playAttention("done"); cancelStreamFlush(); setStreaming(null); break;
         case "session/clarification": setClarification({ id: e.id, question: e.question, options: e.options }); break;
+        case "suggestions/list":
+          setSuggestions((e as { items: { kind: string; id: string; label: string; detail?: string; tokens: number }[] }).items ?? []);
+          break;
         case "session/guidance":
           break;
         case "session/handoff":
@@ -326,10 +338,20 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
           if (e.key === "arc.diffView.autoOpen") setAutoOpenDiff(e.value !== false);
           if (e.key === "arc.router.autoRoute") autoRouteRef.current = e.value === true;
           if (e.key === "arc.appearance.toolGroupSummary") setGroupSummaryMode(e.value === "tools" ? "tools" : e.value === "ai" ? "ai" : "count");
+          if (typeof e.key === "string" && e.key.startsWith("arc.attention.")) {
+            const k = e.key.slice("arc.attention.".length);
+            const a = attentionRef.current;
+            if (k === "enabled") a.enabled = e.value === true;
+            else if (k === "volume" && typeof e.value === "number") a.volume = Math.max(0, Math.min(100, e.value));
+            else if (k === "sound" && (e.value === "beep" || e.value === "system" || e.value === "pop")) a.sound = e.value;
+            else if ((k === "completion" || k === "approval" || k === "error") && e.value !== undefined) attentionRef.current[k as "completion" | "approval" | "error"] = e.value !== false;
+          }
+          if (e.key === "arc.notifications.enabled" && e.value !== undefined) attentionRef.current.enabled = e.value !== false;
           break;
         case "error":
           if (attentionRef.current.error) playAttention("error");
           setLastTurnError({ message: e.message, code: e.code });
+          setErrorExpanded(false);
           break;
       }
     });
@@ -359,10 +381,12 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [steps, streaming, clarification, messages]);
   const send = (text: string, attachments?: { uri: string; preview?: string }[], images?: string[], modelId?: string, autoRouted?: boolean) => {
-    if (streaming) {
-      setQueuedMessage(text);
+    if (streaming || stopping) {
+      setQueuedMessage({ text, attachments, images, modelId, autoRouted });
       return;
     }
+    setPrefillText("");
+    setPrefillSeq((s) => s + 1);
     setRouting(false);
     setRoutePending(null);
     routeRef.current = null;
@@ -372,9 +396,9 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     setHasEverSent(true);
     setLastTurnError(null);
     setPendingAttachment(null);
-    setMessages((prev) => prev.find((m) => m.content === text && m.role === "user")
-      ? prev
-      : [...prev, { id: `local-${Date.now()}`, role: "user", content: text, ts: Date.now() }]);
+    const localId = `local-${Date.now()}-${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+    pendingLocal.current.push(localId);
+    setMessages((prev) => [...prev, { id: localId, role: "user", content: text, ts: Date.now() }]);
     client.send({ type: "chat/send", text, attachments, images, ...(modelId ? { modelId } : {}), ...(autoRouted ? { autoRouted: true } : {}) });
   };
   const route = (text: string, attachments?: { uri: string; preview?: string }[], images?: string[]) => {
@@ -412,22 +436,24 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     setPolishing(true);
     client.send({ type: "chat/polish", text });
   };
+  const [stopping, setStopping] = useState(false);
   const stop = () => {
     const seq = ++stopSeqRef.current;
+    setStopping(true);
     client.send({ type: "chat/stop" });
     window.setTimeout(() => {
-      if (stopSeqRef.current === seq) setStreaming((s) => (s ? null : s));
+      if (stopSeqRef.current === seq) setStopping(false);
     }, 5000);
   };
   const guide = (text: string) => client.send({ type: "chat/guidance", text });
   const cancelQueue = () => setQueuedMessage(null);
   useEffect(() => {
-    if (!streaming && queuedMessage) {
-      const text = queuedMessage;
+    if (!streaming && !stopping && queuedMessage) {
+      const q = queuedMessage;
       setQueuedMessage(null);
-      send(text);
+      send(q.text, q.attachments, q.images, q.modelId, q.autoRouted);
     }
-  }, [streaming]);
+  }, [streaming, stopping, queuedMessage]);
   const newChat = () => { setShowOnboarding(true); client.send({ type: "chat/new" }); };
   const switchChat = (id: string) => client.send({ type: "chat/switch", chatId: id });
   const renameChat = (id: string, title: string) => client.send({ type: "chat/rename", chatId: id, title });
@@ -498,14 +524,39 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     const lines = desc.split("\n\n");
     return lines.length > 1 ? lines[1].trim() : undefined;
   };
+  const unwrapPrefix = (cmd: string): string => {
+    let s = cmd.trim().replace(/^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|[^\s]*)\s+)+/, "");
+    for (let depth = 0; depth < 5; depth++) {
+      const m = s.match(/^(sudo|doas|su|runas|env|nice|timeout|stdbuf|unshare|chroot|npx|sh|bash|zsh|fish|pwsh|powershell|cmd)(?:\s+|$)/i);
+      if (!m) break;
+      s = s.slice(m[0].length).trim().replace(/^[-/]c\s+/i, "").replace(/^((-[a-zA-Z]+\s+[^\s-][^\s]*|--\s+|\d[\d.]*(ms|s|m|h|d)?)\s+)+/, "").trim();
+      if ((s[0] === '"' || s[0] === "'") && s.length > 1) {
+        const close = s.indexOf(s[0], 1);
+        s = (close > 0 ? s.slice(1, close) : s.slice(1)).trim();
+      }
+    }
+    return s;
+  };
   const getApprovalPrefix = (desc: string): string | undefined => {
     const cmd = approval?.command ?? getApprovalCommand(desc);
     if (!cmd) return undefined;
-    return cmd.trim().split(/\s+/)[0] || undefined;
+    const stripped = unwrapPrefix(cmd);
+    const first = stripped.split(/\s+/)[0] || undefined;
+    if (!first) return undefined;
+    const unquoted = first.replace(/^["']|["']$/g, "");
+    return unquoted.split(/[\\/]/).pop() || undefined;
+  };
+  const isEditableTarget = (t: EventTarget | null): boolean => {
+    const el = t as HTMLElement | null;
+    if (!el || typeof (el as HTMLElement).tagName !== "string") return false;
+    const tag = (el as HTMLElement).tagName.toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return true;
+    return (el as HTMLElement).isContentEditable === true;
   };
   useEffect(() => {
     if (!approval) return;
     const onKey = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
       if (e.key === "Escape") { setApprovalMenuOpen(false); respondApproval(false); e.preventDefault(); }
       if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) { respondApproval(true); e.preventDefault(); }
     };
@@ -515,6 +566,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   useEffect(() => {
     if (!clarification) return;
     const onKey = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
       if (e.key >= "1" && e.key <= "9" && !e.ctrlKey && !e.metaKey) {
         const idx = parseInt(e.key) - 1;
         if (idx < clarification.options.length) {
@@ -530,6 +582,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   }, [clarification]);
   useEffect(() => {
     const onFocus = () => {
+      if (document.querySelector(".arc-modal-overlay, [role='dialog']")) return;
       const active = document.activeElement;
       if (!active || active === document.body || active === document.getElementById("root")) {
         (document.querySelector(".arc-composer textarea") as HTMLTextAreaElement)?.focus();
@@ -660,9 +713,11 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
       }
       if (item.kind === "stream") {
         flush();
+        const full = streaming?.text ?? "";
+        const shown = full.length > 12000 ? `${full.slice(0, 4000)}\n\n… (${full.length - 8000} chars elided while streaming) …\n\n${full.slice(-4000)}` : full;
         out.push(
           <div key="stream" className="arc-streaming" aria-live="polite">
-            <span className="arc-streaming-text arc-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(streaming?.text ?? "") }} />
+            <span className="arc-streaming-text arc-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(shown) }} />
           </div>,
         );
         continue;
@@ -709,14 +764,26 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   }, [steps]);
   const [todosOpen, setTodosOpen] = useState(true);
   const [todosVisible, setTodosVisible] = useState(false);
+  // Task 14: suggestions for unused context.
+  const [suggestions, setSuggestions] = useState<{ kind: string; id: string; label: string; detail?: string; tokens: number }[]>([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  useEffect(() => {
+    client.send({ type: "suggestions/list" });
+    const t = setInterval(() => client.send({ type: "suggestions/list" }), 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [client, activeId]);
   const latestTodosSig = useRef<string | null>(null);
   useEffect(() => {
-    if (!latestTodos?.length) return;
+    if (!latestTodos?.length) {
+      latestTodosSig.current = null;
+      return;
+    }
     const sig = JSON.stringify(latestTodos);
     if (latestTodosSig.current !== sig) {
+      const first = latestTodosSig.current === null;
       latestTodosSig.current = sig;
       setTodosVisible(true);
-      setTodosOpen(true);
+      if (first) setTodosOpen(true);
     }
   }, [latestTodos]);
   useEffect(() => {
@@ -736,7 +803,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
       if (step.type !== "tool") continue;
       if (step.toolName !== "file.edit" && step.toolName !== "file.write") continue;
       if (!step.diffHunks || !step.diffHunks.length) continue;
-      return { signature: step.id, filePath: step.filePath, hunks: step.diffHunks };
+      return { signature: `${step.id}:${step.filePath ?? ""}:${step.diffHunks.length}`, filePath: step.filePath, hunks: step.diffHunks };
     }
     return null;
   }, [steps]);
@@ -878,8 +945,15 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
             )}
             {timelineNodes}
             {lastTurnError && !streaming && (
-              <div className="arc-transcript-error" role="status">
-                {lastTurnError.message}
+              <div className={`arc-transcript-error ${errorExpanded ? "is-expanded" : ""}`} role="status">
+                <div className="arc-transcript-error-body">{lastTurnError.message}</div>
+                <button
+                  className="arc-transcript-error-toggle"
+                  onClick={() => setErrorExpanded((v) => !v)}
+                  aria-expanded={errorExpanded}
+                >
+                  {errorExpanded ? "Show less" : "Expand"}
+                </button>
               </div>
             )}
             {(() => {
@@ -896,93 +970,6 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               ) : null;
             })()}
           </div>
-          {clarification && (
-            <FadeSlideIn className="arc-approval">
-              <div className="arc-approval-row">
-                <HelpCircle size={14} className="arc-clar-icon" />
-                <span className="arc-approval-label">Clarification needed</span>
-                <span className="arc-topbar-spacer" />
-                <button className="arc-iconbtn" title="Dismiss" onClick={() => { client.send({ type: "chat/answerClarification", id: clarification.id, answer: "" }); setClarification(null); }}>
-                  <X size={13} />
-                </button>
-              </div>
-              <div className="arc-approval-q">{clarification.question}</div>
-              <div className="arc-clar-options">
-                {clarification.options.map((opt, i) => (
-                  <button
-                    key={opt}
-                    onClick={() => {
-                      client.send({ type: "chat/answerClarification", id: clarification.id, answer: opt });
-                      setClarification(null);
-                    }}
-                  >
-                    {opt}<kbd>{i + 1}</kbd>
-                  </button>
-                ))}
-              </div>
-              <div className="arc-clar-custom">
-                <input
-                  type="text"
-                  placeholder="Type your answer..."
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      client.send({ type: "chat/answerClarification", id: clarification.id, answer: (e.target as HTMLInputElement).value });
-                      setClarification(null);
-                    }
-                  }}
-            />
-                <button onClick={() => {
-                  const val = (document.querySelector(".arc-clar-custom input") as HTMLInputElement)?.value;
-                  if (val) {
-                    client.send({ type: "chat/answerClarification", id: clarification.id, answer: val });
-                    setClarification(null);
-                  }
-                }}>↩</button>
-              </div>
-            </FadeSlideIn>
-          )}
-          {approval && (
-            <FadeSlideIn className="arc-approval">
-              <div className="arc-approval-row">
-                <span className="arc-approval-dot" />
-                <span className="arc-approval-label">Tool call</span>
-                <span className="arc-approval-meta">needs approval{approvalQueue.length > 1 ? ` · ${approvalQueue.length - 1} more queued` : ""}</span>
-              </div>
-              <div className="arc-approval-q">{approval.description.split("\n\n")[0]}</div>
-              {approval.description.includes("\n\n") && (
-                <div className="arc-approval-body">{approval.description.split("\n\n").slice(1).join("\n\n")}</div>
-              )}
-              <div className="arc-approval-actions">
-                <div className="arc-approval-allow-group">
-                  <button className="arc-approval-allow" onClick={() => respondApproval(true)} autoFocus>
-                    Allow once
-                  </button>
-                  <button
-                    className="arc-approval-allow-caret"
-                    onClick={() => setApprovalMenuOpen((o) => !o)}
-                    aria-expanded={approvalMenuOpen}
-                    aria-haspopup="menu"
-                    title="More approval options"
-                  >
-                    <ChevronDown size={13} />
-                  </button>
-                  {approvalMenuOpen && (
-                    <div className="arc-approval-menu" role="menu">
-                      <button role="menuitem" onClick={() => { respondApproval(true, getApprovalCommand(approval.description)); setApprovalMenuOpen(false); }}>
-                        Allow session
-                      </button>
-                      <button role="menuitem" onClick={() => { respondApproval(true, undefined, getApprovalPrefix(approval.description)); setApprovalMenuOpen(false); }}>
-                        Allow prefix
-                      </button>
-                    </div>
-                  )}
-                </div>
-                <button className="arc-approval-deny" onClick={() => { setApprovalMenuOpen(false); respondApproval(false); }}>
-                  Deny <kbd>Esc</kbd>
-                </button>
-              </div>
-            </FadeSlideIn>
-          )}
           <footer className="arc-footer">
             <Composer
               key={activeId}
@@ -991,7 +978,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               onGuidance={guide}
               streaming={!!streaming}
               pendingAttachment={pendingAttachment}
-              queuedText={queuedMessage}
+              queuedText={queuedMessage?.text ?? null}
               onCancelQueue={cancelQueue}
               prefillText={prefillText}
               prefillSeq={prefillSeq}
@@ -1008,6 +995,23 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               routePending={routePending ? { modelLabel: routePending.modelLabel, domain: routePending.domain, confidence: routePending.confidence } : null}
               onAcceptRouted={acceptRouted}
               onRejectRouted={rejectRouted}
+              approval={approval ? { description: approval.description, queueCount: approvalQueue.length } : null}
+              approvalMenuOpen={approvalMenuOpen}
+              onToggleApprovalMenu={() => setApprovalMenuOpen((o) => !o)}
+              onRespondApproval={(allowed, rememberCommand, rememberPrefix) => { setApprovalMenuOpen(false); respondApproval(allowed, rememberCommand, rememberPrefix); }}
+              approvalCommand={approval ? getApprovalCommand(approval.description) : undefined}
+              approvalPrefix={approval ? getApprovalPrefix(approval.description) : undefined}
+              clarification={clarification ? { question: clarification.question, options: clarification.options } : null}
+              onAnswerClarification={(answer) => { if (clarification) client.send({ type: "chat/answerClarification", id: clarification.id, answer }); setClarification(null); }}
+              onDismissClarification={() => { if (clarification) client.send({ type: "chat/answerClarification", id: clarification.id, answer: "" }); setClarification(null); }}
+              suggestions={suggestions.length ? suggestions : null}
+              suggestionsOpen={suggestionsOpen}
+              onToggleSuggestions={() => setSuggestionsOpen((o) => !o)}
+              onUnloadSuggestion={(kind, id) => client.send({ type: "suggestions/unload", kind, id })}
+              onDismissSuggestion={(kind, id) => {
+                setSuggestions((prev) => prev.filter((s) => !(s.kind === kind && s.id === id)));
+                client.send({ type: "suggestions/dismiss", kind, id });
+              }}
               placeholder={currentModel === AUTO_MODEL_ID ? "Ask anything" : (currentModelLabel ? `Ask ${currentModelLabel}` : undefined)}
               variant={variant}
               models={models}
@@ -1085,7 +1089,7 @@ function compactionStepFor(message: ChatMessage): ProcessStep {
     noMark: true,
   };
 }
-function MessageBubble({ message, client }: { message: ChatMessage; client?: RpcClient }) {
+const MessageBubble = memo(function MessageBubble({ message, client }: { message: ChatMessage; client?: RpcClient }) {
   const isUser = message.role === "user";
   const isTool = message.role === "tool";
   const [enlarged, setEnlarged] = useState<string | null>(null);
@@ -1135,7 +1139,9 @@ function MessageBubble({ message, client }: { message: ChatMessage; client?: Rpc
             </div>
           ) : (
             <div style={{ display: "flex", alignItems: "flex-start", gap: 4, flexDirection: "row-reverse" }}>
-              <div className="arc-bubble-text">{message.content}</div>
+              <div className="arc-bubble-text">{message.content}{(message as unknown as { editedOriginal?: string }).editedOriginal !== undefined && (
+                <span className="arc-msg-edited" title="Edited after sending"> (edited)</span>
+              )}</div>
               {client && (
                 <span style={{ display: "flex", gap: 2, opacity: 0, transition: "opacity 0.18s", flexShrink: 0, alignSelf: "flex-start", marginTop: 2 }} className="arc-msg-actions">
                   <button className="arc-iconbtn" style={{ width: 22, height: 22 }} title="Revert to here" onClick={() => { client.send({ type: "chat/revertToMessage", messageId: message.id, content: message.content, restoreFiles: true, loadToComposer: true }); }}>
@@ -1162,7 +1168,7 @@ function MessageBubble({ message, client }: { message: ChatMessage; client?: Rpc
       )}
     </>
   );
-}
+});
 function Onboarding({ logoUri, monoLogo, hasModels, onOpenSettings }: { logoUri: string; monoLogo: string; hasModels: boolean; onOpenSettings: () => void }) {
   return (
     <div className="arc-onboarding">

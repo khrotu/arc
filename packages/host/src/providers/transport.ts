@@ -31,6 +31,7 @@ export function sanitizeToolChains(messages: ChatMessage[]): ChatMessage[] {
     }
     out.push(m);
   }
+  const removeIdx = new Set<number>();
   for (let i = 0; i < out.length; i++) {
     const m = out[i];
     if (m.role !== "assistant" || !m.toolCalls?.length) continue;
@@ -46,16 +47,24 @@ export function sanitizeToolChains(messages: ChatMessage[]): ChatMessage[] {
     }
     const complete = ids.every((id) => answered.has(id));
     if (!complete) {
-      out[i] = { ...m, toolCalls: undefined };
+      const kept = m.toolCalls.filter((t) => answered.has(t.id));
+      if (kept.length > 0) {
+        out[i] = { ...m, toolCalls: kept };
+      } else if (m.content) {
+        out[i] = { ...m, toolCalls: undefined };
+      } else {
+        removeIdx.add(i);
+      }
       dropped++;
     } else if (unique.size !== m.toolCalls.length) {
       out[i] = { ...m, toolCalls: [...unique.values()] };
     }
   }
+  const cleaned = removeIdx.size > 0 ? out.filter((_, i) => !removeIdx.has(i)) : out;
   if (dropped > 0) {
     hostWarn(`[arc] sanitizeToolChains cleaned ${dropped} orphaned/duplicate/incomplete tool message(s) before sending to the provider`);
   }
-  return out;
+  return cleaned;
 }
 export type StreamEvent =
   | { type: "text"; delta: string }
@@ -71,8 +80,21 @@ export interface ToolSpec {
   description: string;
   parameters: Record<string, unknown>;
 }
-export const toApiToolName = (name: string): string => name.replace(/\./g, "__").replace(/\//g, "--");
-export const fromApiToolName = (name: string): string => name.replace(/__/g, ".").replace(/--/g, "/");
+export const toApiToolName = (name: string): string =>
+  name.replace(/_/g, "_u").replace(/\./g, "_d").replace(/\//g, "_s");
+export function fromApiToolName(name: string): string {
+  let out = "";
+  for (let i = 0; i < name.length; i++) {
+    if (name[i] === "_" && i + 1 < name.length) {
+      const c = name[i + 1];
+      if (c === "u") { out += "_"; i++; continue; }
+      if (c === "d") { out += "."; i++; continue; }
+      if (c === "s") { out += "/"; i++; continue; }
+    }
+    out += name[i];
+  }
+  return out;
+}
 export interface StreamRequest {
   model: import("../protocol/protocol.js").ModelDescriptor;
   provider: import("../protocol/protocol.js").ProviderConfig;

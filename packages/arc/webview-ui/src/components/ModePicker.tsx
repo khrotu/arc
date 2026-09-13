@@ -30,6 +30,7 @@ export default function ModePicker({ modes, currentMode, onSelect, compact }: Pr
   const isCustom = (m: ModeDef) => (m.source ?? "builtin") !== "builtin";
   const official = modes.filter((m) => !isCustom(m));
   const custom = modes.filter((m) => isCustom(m));
+  const visible = [...official, ...custom];
   const iconFor = (m: ModeDef) => MODE_ICONS[m.slug] ?? CUSTOM_ICON;
   useEffect(() => {
     if (!open) return;
@@ -43,24 +44,24 @@ export default function ModePicker({ modes, currentMode, onSelect, compact }: Pr
   }, [open]);
   useEffect(() => {
     if (!open || !listRef.current) return;
-    const el = listRef.current.children[activeIdx] as HTMLElement | undefined;
-    el?.scrollIntoView({ block: "nearest" });
+    const items = listRef.current.querySelectorAll(".arc-mode-dropdown-item");
+    (items[activeIdx] as HTMLElement | undefined)?.scrollIntoView({ block: "nearest" });
   }, [activeIdx, open]);
   const handleKey = (e: React.KeyboardEvent) => {
     if (!open) return;
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
-        setActiveIdx((i) => (i + 1) % Math.max(1, modes.length));
+        setActiveIdx((i) => (i + 1) % Math.max(1, visible.length));
         break;
       case "ArrowUp":
         e.preventDefault();
-        setActiveIdx((i) => (i - 1 + modes.length) % Math.max(1, modes.length));
+        setActiveIdx((i) => (i - 1 + visible.length) % Math.max(1, visible.length));
         break;
       case "Enter":
         e.preventDefault();
-        if (modes[activeIdx]) {
-          onSelect(modes[activeIdx].slug);
+        if (visible[activeIdx]) {
+          onSelect(visible[activeIdx].slug);
           setOpen(false);
         }
         break;
@@ -112,7 +113,7 @@ export default function ModePicker({ modes, currentMode, onSelect, compact }: Pr
               <>
                 <div className="arc-mode-dropdown-sep" />
                 {custom.map((m, j) => {
-                  const idx = official.length + 1 + j;
+                  const idx = official.length + j;
                   return (
                     <button
                       key={m.slug}

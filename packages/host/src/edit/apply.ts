@@ -16,19 +16,26 @@ export interface ApplyEditResult {
   error?: string;
 }
 const NL = /\r\n?|\n/;
+function usesCrlf(s: string): boolean {
+  const crlf = (s.match(/\r\n/g) ?? []).length;
+  const lf = (s.match(/(?<!\r)\n/g) ?? []).length;
+  return crlf > lf;
+}
 function normalizeLines(s: string): string {
   return s.split(NL).map((l) => l.replace(/[ \t]+$/, "")).join("\n");
-}
-function collapseBlank(s: string): string {
-  return s.replace(/\n{3,}/g, "\n\n");
 }
 function findIndex(haystack: string, needle: string): number {
   if (!needle) return -1;
   return haystack.indexOf(needle);
 }
 function findRegex(haystack: string, needle: string): { index: number; length: number } | null {
-  if (!needle) return null;
-  const m = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "m").exec(haystack);
+  if (!needle || needle.length > 256 * 1024) return null;
+  let m: RegExpExecArray | null;
+  try {
+    m = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "m").exec(haystack);
+  } catch {
+    return null;
+  }
   return m ? { index: m.index, length: m[0].length } : null;
 }
 function lineStartOffsets(s: string): { start: number; termLen: number }[] {
@@ -46,6 +53,7 @@ function windowedMatch(haystack: string, needle: string): { index: number; lengt
   const nLines = needleLines.length;
   if (nLines === 0) return null;
   const hLines = haystack.split(NL);
+  if (hLines.length > 20_000 || nLines > 2_000 || hLines.length * nLines > 4_000_000) return null;
   const lineStarts = lineStartOffsets(haystack);
   for (let i = 0; i <= hLines.length - nLines; i++) {
     let all = true;
@@ -59,6 +67,36 @@ function windowedMatch(haystack: string, needle: string): { index: number; lengt
       const last = lineStarts[i + nLines - 1];
       const end = (i + nLines < lineStarts.length ? lineStarts[i + nLines].start : haystack.length) - last.termLen;
       return { index: lineStarts[i].start, length: end - lineStarts[i].start };
+    }
+  }
+  return null;
+}
+function windowedMatchLoose(haystack: string, needle: string): { index: number; length: number } | null {
+  const hLines = haystack.split(NL);
+  const nLines = needle.split(NL);
+  if (hLines.length > 20_000 || nLines.length > 2_000 || hLines.length * nLines.length > 4_000_000) return null;
+  const hKept: { line: string; idx: number }[] = [];
+  hLines.forEach((line, idx) => {
+    if (line.trim() !== "") hKept.push({ line, idx });
+  });
+  const nKept = nLines.map((l) => l.trim()).filter((l) => l !== "");
+  if (nKept.length === 0 || hKept.length < nKept.length) return null;
+  const lineStarts = lineStartOffsets(haystack);
+  for (let i = 0; i <= hKept.length - nKept.length; i++) {
+    let all = true;
+    for (let j = 0; j < nKept.length; j++) {
+      if (hKept[i + j].line.trim() !== nKept[j]) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      const first = hKept[i].idx;
+      const last = hKept[i + nKept.length - 1].idx;
+      if (last - first + 1 > nKept.length * 4 + 10) continue;
+      const lastStart = lineStarts[last];
+      const end = (last + 1 < lineStarts.length ? lineStarts[last + 1].start : haystack.length) - lastStart.termLen;
+      return { index: lineStarts[first].start, length: end - lineStarts[first].start };
     }
   }
   return null;
@@ -112,15 +150,22 @@ export function applyEdit(input: ApplyEditInput): ApplyEditResult {
     const norm = normalizeLines(before);
     const normSearch = normalizeLines(search);
     if (norm.includes(normSearch)) {
-      return finalize(norm, normSearch, normalizeLines(replace), replaceAll, "trim");
-    }
-    const col = collapseBlank(norm);
-    const colSearch = collapseBlank(normSearch);
-    if (col.includes(colSearch)) {
-      const w2 = windowedMatch(before, search);
-      if (!w2) {
-        return finalize(col, colSearch, collapseBlank(normalizeLines(replace)), replaceAll, "blank-collapse");
+      const w = windowedMatch(before, search);
+      if (w) {
+        const after = before.slice(0, w.index) + replace + before.slice(w.index + w.length);
+        return { ok: true, after, matches: 1, strategy: "trim", diff: diffLines(before, after) };
       }
+      const normResult = finalize(norm, normSearch, normalizeLines(replace), replaceAll, "trim");
+      if (normResult.ok && usesCrlf(before)) {
+        const after = normResult.after.replace(/\n/g, "\r\n");
+        return { ...normResult, after, diff: diffLines(before, after) };
+      }
+      return normResult;
+    }
+    const wLoose = windowedMatchLoose(before, search);
+    if (wLoose) {
+      const after = before.slice(0, wLoose.index) + replace + before.slice(wLoose.index + wLoose.length);
+      return { ok: true, after, matches: 1, strategy: "fuzzy", diff: diffLines(before, after) };
     }
   }
   {

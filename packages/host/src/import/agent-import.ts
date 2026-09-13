@@ -181,6 +181,13 @@ function openSqlite(dbPath: string): { db: SqliteDb; dispose: () => Promise<void
   try { const db = new DatabaseSync(dbPath, { readOnly: true }); return { db, dispose: async () => { try { db.close(); } catch { } } }; } catch { }
   const tmp = path.join(os.tmpdir(), `arc-import-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   try {
+    let totalBytes = 0;
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const src = dbPath + suffix;
+      if (!fs.existsSync(src)) continue;
+      totalBytes += fs.statSync(src).size;
+      if (totalBytes > 512 * 1024 * 1024) return undefined;
+    }
     fs.mkdirSync(tmp, { recursive: true });
     for (const suffix of ["", "-wal", "-shm"]) {
       const src = dbPath + suffix;
@@ -207,8 +214,13 @@ function homePaths(home: string) {
   };
 }
 function readJson(p: string): unknown {
-  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return undefined; }
+  try {
+    const stat = fs.statSync(p);
+    if (stat.size > 64 * 1024 * 1024) return undefined;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch { return undefined; }
 }
+const MAX_SCAN_ENTRIES = 2000;
 function pushCredential(out: ImportCredential[], agent: string, rec: { provider: string; id?: string; baseUrl?: string; apiKey: unknown }) {
   const key = typeof rec.apiKey === "string" ? rec.apiKey : "";
   if (!key) return;
@@ -275,7 +287,7 @@ function parseContinueYaml(text: string): { provider: string; model: string; bas
   const out: { provider: string; model: string; baseUrl?: string; apiKey: string }[] = [];
   let current: Partial<{ provider: string; model: string; baseUrl: string; apiKey: string }> | null = null;
   const flush = () => { if (current?.apiKey) out.push(current as { provider: string; model: string; baseUrl?: string; apiKey: string }); current = null; };
-  const unquote = (s: string) => s.replace(/^"(.*)"$/, "$1").replace(/^'(.*)"$/, "$1").trim();
+  const unquote = (s: string) => s.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1").trim();
   let inModels = false;
   for (const raw of text.split(/\r?\n/)) {
     if (!raw.trim() || raw.trim().startsWith("#")) continue;
@@ -311,7 +323,7 @@ export async function scanAgentImports(home: string = os.homedir()): Promise<Imp
     let chats = 0, messages = 0;
     for (const tasksDir of p.clineTasks) {
       let dirs: string[] = [];
-      try { dirs = (await fsp.readdir(tasksDir, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name); } catch { continue; }
+      try { dirs = (await fsp.readdir(tasksDir, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).slice(0, MAX_SCAN_ENTRIES); } catch { continue; }
       for (const dir of dirs) {
         const file = path.join(tasksDir, dir, "api_conversation_history.json");
         const v = readJson(file);
@@ -366,8 +378,11 @@ export async function scanAgentImports(home: string = os.homedir()): Promise<Imp
     } catch { }
     let chats = 0, messages = 0;
     try {
-      for (const e of await fsp.readdir(p.continueSessions, { withFileTypes: true })) {
+      const entries = await fsp.readdir(p.continueSessions, { withFileTypes: true });
+      let scanned = 0;
+      for (const e of entries) {
         if (!e.isFile() || !e.name.endsWith(".json") || e.name === "sessions.json") continue;
+        if (++scanned > MAX_SCAN_ENTRIES) break;
         const v = readJson(path.join(p.continueSessions, e.name));
         if (!v || typeof v !== "object" || !Array.isArray((v as Record<string, unknown>).history)) continue;
         chats++;
@@ -415,15 +430,18 @@ function finishChat(pending: PendingChat, agentSlug: string, sink: (chat: Import
 export async function importAgentChats(agent: string, home: string, sink: (chat: ImportedChat) => void, onProgress?: (done: number, total: number) => void): Promise<ImportChatsResult> {
   const p = homePaths(home);
   const agentSlug = slug(agent);
+  const MAX_IMPORT_CHATS = 200;
+  const MAX_IMPORT_BYTES = 256 * 1024 * 1024;
   let chats = 0, messages = 0, bytes = 0;
   if (agent === "Cline") {
     let dirs: string[] = [];
     for (const tasksDir of p.clineTasks) {
       try { dirs = dirs.concat((await fsp.readdir(tasksDir, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).map((n) => path.join(tasksDir, n))); } catch { }
     }
-    const capped = dirs;
+    const capped = dirs.slice(0, MAX_IMPORT_CHATS);
     let done = 0;
     for (const dir of capped) {
+      if (bytes >= MAX_IMPORT_BYTES) break;
       const v = readJson(path.join(dir, "api_conversation_history.json"));
       if (!Array.isArray(v)) { done++; continue; }
       const pending: PendingChat = { sessionId: path.basename(dir), createdAt: 0, updatedAt: 0, messages: [], steps: [], callsById: new Map() };
@@ -492,9 +510,10 @@ export async function importAgentChats(agent: string, home: string, sink: (chat:
     } catch { }
     let files: string[] = [];
     try { files = (await fsp.readdir(p.continueSessions, { withFileTypes: true })).filter((e) => e.isFile() && e.name.endsWith(".json") && e.name !== "sessions.json").map((e) => path.join(p.continueSessions, e.name)); } catch { }
-    const capped = files;
+    const capped = files.slice(0, MAX_IMPORT_CHATS);
     let done = 0;
     for (const file of capped) {
+      if (bytes >= MAX_IMPORT_BYTES) break;
       const v = readJson(file);
       if (!v || typeof v !== "object") { done++; continue; }
       const sess = v as Record<string, unknown>;
@@ -554,7 +573,7 @@ export async function importAgentChats(agent: string, home: string, sink: (chat:
     try {
       let sessions: { session_id: string; t: number }[] = [];
       try { sessions = db.prepare("SELECT session_id, MAX(time_created) t FROM message GROUP BY session_id ORDER BY t DESC").all().map((r) => ({ session_id: String(r.session_id), t: Number(r.t ?? 0) })); } catch { }
-      const capped = sessions;
+      const capped = sessions.slice(0, MAX_IMPORT_CHATS);
       const titles = new Map<string, string>();
       try {
         for (const r of db.prepare("SELECT id, title FROM session").all()) {
@@ -564,6 +583,7 @@ export async function importAgentChats(agent: string, home: string, sink: (chat:
       } catch { }
       let done = 0;
       for (const sess of capped) {
+        if (bytes >= MAX_IMPORT_BYTES) break;
         const texts = new Map<string, string[]>();
         const thoughts = new Map<string, string[]>();
         const toolCalls = new Map<string, { calls: { id: string; name: string; args: Record<string, unknown> }[]; results: Map<string, string>; failed: Set<string> }>();

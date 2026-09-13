@@ -54,7 +54,11 @@ export function splitSource(text: string): string[] {
   }
   return out;
 }
+const MAX_NOTEBOOK_BYTES = 8 * 1024 * 1024;
+const MAX_CELL_TEXT = 24 * 1024;
+const MAX_IMAGES = 8;
 export function parseNotebook(raw: string): NotebookDocument {
+  if (raw.length > MAX_NOTEBOOK_BYTES) throw new Error(`Notebook too large (${(raw.length / 1048576).toFixed(1)}MB > 8MB).`);
   const doc = JSON.parse(raw) as NotebookDocument;
   if (!doc || !Array.isArray(doc.cells)) throw new Error("Invalid notebook: missing 'cells' array.");
   return doc;
@@ -84,7 +88,11 @@ export function summarizeOutputs(outputs: NotebookOutputRaw[] | undefined): Cell
       textParts.push(`${o.ename ?? "Error"}: ${o.evalue ?? ""}\n${(o.traceback ?? []).join("\n")}`.trim());
     }
   }
-  return { text: textParts.join("\n").trim(), images };
+  return { text: truncateCellText(textParts.join("\n").trim()), images: images.slice(0, MAX_IMAGES) };
+}
+function truncateCellText(text: string): string {
+  if (text.length <= MAX_CELL_TEXT) return text;
+  return `${text.slice(0, MAX_CELL_TEXT)}\n...(output truncated, ${text.length - MAX_CELL_TEXT} more chars)`;
 }
 function requireCell(doc: NotebookDocument, index: number): NotebookCellRaw {
   const cell = doc.cells[index];
@@ -94,7 +102,8 @@ function requireCell(doc: NotebookDocument, index: number): NotebookCellRaw {
 export function readCell(doc: NotebookDocument, index: number): CellDetail {
   const cell = requireCell(doc, index);
   const output = cell.cell_type === "code" ? summarizeOutputs(cell.outputs) : undefined;
-  return { index, cellType: cell.cell_type, source: joinSource(cell.source), ...(output ? { output } : {}) };
+  const source = joinSource(cell.source);
+  return { index, cellType: cell.cell_type, source: truncateCellText(source), ...(output ? { output } : {}) };
 }
 export function editCellSource(doc: NotebookDocument, index: number, source: string): NotebookDocument {
   requireCell(doc, index);

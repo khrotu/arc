@@ -14,8 +14,12 @@ export const MONO_FONT_OPTIONS: { value: MonoFontKey; label: string; cssFamily: 
 ];
 const UI_FALLBACK = `var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)`;
 const MONO_FALLBACK = `var(--vscode-editor-fontFamily, ui-monospace, "Cascadia Code", monospace)`;
+function sanitizeFamily(custom: string, fallback: string): string {
+  const clean = custom.replace(/["';\\]/g, "").replace(/,/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+  return clean || fallback;
+}
 function familyFor(key: string, custom: string, options: { value: string; cssFamily: string }[], fallback: string): string {
-  if (key === "custom") return custom.trim() || fallback;
+  if (key === "custom") return sanitizeFamily(custom, fallback);
   return options.find((o) => o.value === key)?.cssFamily || fallback;
 }
 export function resolveUiFont(key: string, custom: string): string {

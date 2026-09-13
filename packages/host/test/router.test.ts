@@ -257,7 +257,7 @@ describe("openrouter consolidation", () => {
     expect(rows.find((r) => r.slug === "intel-only")!.score).toBe(50);
     expect(rows.find((r) => r.slug === "partial")!.score).toBe(47.1);
   });
-  it("skips batch and free variants, unscored models, and malformed rows", () => {
+  it("keeps paid and free variants as separate rows, skips unscored and malformed rows", () => {
     const rows = consolidateOpenRouterModels(payload([
       model("z-ai/glm-5.3:batch", "Z.ai: GLM 5.3 (batch)", FULL),
       model("z-ai/glm-5.3:free", "Z.ai: GLM 5.3 (free)", FULL),
@@ -267,7 +267,7 @@ describe("openrouter consolidation", () => {
       model("nopercent", "No Slash", FULL),
       { id: "x/no-name", benchmarks: { artificial_analysis: { intelligence_index: 50 } } },
     ]));
-    expect(rows.map((r) => r.slug)).toEqual(["glm-5.3", "no-name"]);
+    expect(rows.map((r) => r.slug)).toEqual(["glm-5.3", "glm-5.3:batch", "glm-5.3:free", "no-name"]);
   });
   it("keeps the highest score when names collide", () => {
     const rows = consolidateOpenRouterModels(payload([

@@ -16,13 +16,13 @@ export class ModeRegistry {
     }
   }
   async load(): Promise<void> {
+    await this.loadFromDir(path.join(getArcDir(), "modes"), "global");
     if (this.workspaceRoot) {
       await this.loadFromDir(
         path.join(getWorkspaceArcDir(this.workspaceRoot), "modes"),
         "workspace",
       );
     }
-    await this.loadFromDir(path.join(getArcDir(), "modes"), "global");
   }
   private async loadFromDir(dir: string, source: ModeSource): Promise<void> {
     let entries: string[];
@@ -54,19 +54,23 @@ export class ModeRegistry {
     base: Mode | undefined,
     parsed: Record<string, unknown>,
     slug: string,
-    _source: ModeSource,
+    source: ModeSource,
   ): Mode | undefined {
     const roleDefinition = (parsed.roleDefinition as string) ?? base?.roleDefinition;
     const description = (parsed.description as string) ?? base?.description ?? "";
     const whenToUse = (parsed.whenToUse as string) ?? base?.whenToUse ?? "";
-    const allowedTools = Array.isArray(parsed.allowedTools)
+    let allowedTools = Array.isArray(parsed.allowedTools)
       ? (parsed.allowedTools as string[])
       : base?.allowedTools ?? [];
+    if (source === "workspace" && base && Array.isArray(parsed.allowedTools)) {
+      const baseTools = new Set(base.allowedTools);
+      allowedTools = allowedTools.filter((t) => baseTools.has(t));
+    }
     const writeGlob = (parsed.writeGlob as string) ?? base?.writeGlob;
     const model = (parsed.model as string) ?? base?.model;
     if (!roleDefinition && allowedTools.length === 0) return undefined;
     if (!roleDefinition && base) {
-      return { ...base, writeGlob: writeGlob ?? base.writeGlob, description, whenToUse, model: model ?? base.model };
+      return { ...base, allowedTools, writeGlob: writeGlob ?? base.writeGlob, description, whenToUse, model: model ?? base.model };
     }
     return {
       slug,
@@ -154,9 +158,20 @@ function parseSimpleToml(raw: string): Record<string, unknown> {
   }
   return result;
 }
+function unescapeBasic(s: string): string {
+  return s
+    .replace(/\\\\/g, "\0")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\r/g, "\r")
+    .replace(/\\b/g, "\b")
+    .replace(/\\f/g, "\f")
+    .replace(/\0/g, "\\");
+}
 function parseTomlValue(raw: string): unknown {
   if (raw.startsWith('"') && raw.endsWith('"')) {
-    return raw.slice(1, -1).replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+    return unescapeBasic(raw.slice(1, -1));
   }
   if (raw.startsWith("'") && raw.endsWith("'")) {
     return raw.slice(1, -1);
@@ -174,6 +189,10 @@ function parseTomlValue(raw: string): unknown {
     let stringChar = "";
     for (let i = 0; i < inner.length; i++) {
       const ch = inner[i];
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
       if (inString) {
         if (ch === stringChar) inString = false;
         continue;
@@ -198,7 +217,10 @@ function parseTomlValue(raw: string): unknown {
   return raw;
 }
 function stripQuotes(s: string): string {
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+  if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
+    return unescapeBasic(s.slice(1, -1));
+  }
+  if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) {
     return s.slice(1, -1);
   }
   return s;

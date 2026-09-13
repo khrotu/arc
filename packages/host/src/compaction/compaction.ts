@@ -138,7 +138,7 @@ export function decideCompaction(
   if ((cfg.strategy ?? "model-aware") === "fixed") {
     const rawPct = cfg.fixedAtPct ?? 75;
     const fixedPct = Math.min(1, Math.max(0.01, rawPct > 1 ? rawPct / 100 : rawPct));
-    const fixedLimit = Math.floor(window * fixedPct);
+    const fixedLimit = Math.min(Math.floor(window * fixedPct), limit);
     if (current >= fixedLimit) {
       return { shouldCompact: true, reason: `fixed: estimated ${current} >= ${Math.round(fixedPct * 100)}% of window (${fixedLimit})`, currentUsage: current, usable: fixedLimit, window };
     }
@@ -161,11 +161,20 @@ function isPriorSummary(m: ChatMessage): boolean {
   return m.role === "system" && typeof m.content === "string" && m.content.startsWith(COMPACTION_SUMMARY_HEADER);
 }
 interface Segments { lead: number; tailStart: number }
+export function clampKeepTail(keepTail: unknown): number {
+  return Number.isFinite(keepTail) ? Math.max(1, Math.min(50, Math.floor(keepTail as number))) : 5;
+}
 function segment(messages: ChatMessage[], keepTail: number): Segments {
+  const tail = clampKeepTail(keepTail);
   let lead = 0;
   while (lead < messages.length && messages[lead].role === "system" && !isPriorSummary(messages[lead])) lead++;
-  let tailStart = Math.max(lead, messages.length - keepTail);
+  let tailStart = Math.max(lead, messages.length - tail);
   while (tailStart > lead && messages[tailStart]?.role === "tool") tailStart--;
+  while (tailStart > lead) {
+    const prev = messages[tailStart - 1];
+    if (prev.role === "assistant" && (prev.toolCalls?.length ?? 0) > 0) tailStart--;
+    else break;
+  }
   return { lead, tailStart };
 }
 function protectedIndices(middle: ChatMessage[]): Set<number> {
@@ -197,8 +206,9 @@ function buildSummaryMessage(count: number, summary: string): ChatMessage {
   };
 }
 function assemble(messages: ChatMessage[], cfg: CompactionConfig, summary: string): ChatMessage[] | undefined {
-  const { lead, tailStart } = segment(messages, cfg.keepTail);
-  if (messages.length <= cfg.keepTail + lead + 1 || tailStart <= lead) return undefined;
+  const tail = clampKeepTail(cfg.keepTail);
+  const { lead, tailStart } = segment(messages, tail);
+  if (messages.length <= tail + lead + 1 || tailStart <= lead) return undefined;
   const middle = messages.slice(lead, tailStart);
   const prot = protectedIndices(middle);
   const preserved = middle.filter((_, i) => prot.has(i));
@@ -207,8 +217,9 @@ function assemble(messages: ChatMessage[], cfg: CompactionConfig, summary: strin
   return [...messages.slice(0, lead), ...preserved, buildSummaryMessage(compactable.length, summary), ...messages.slice(tailStart)];
 }
 export function compact(messages: ChatMessage[], cfg: CompactionConfig = defaultCompactionConfig, summarize: (msgs: ChatMessage[]) => string): ChatMessage[] {
-  const { lead, tailStart } = segment(messages, cfg.keepTail);
-  if (messages.length <= cfg.keepTail + lead + 1 || tailStart <= lead) return messages;
+  const tail = clampKeepTail(cfg.keepTail);
+  const { lead, tailStart } = segment(messages, tail);
+  if (messages.length <= tail + lead + 1 || tailStart <= lead) return messages;
   const middle = messages.slice(lead, tailStart);
   const prot = protectedIndices(middle);
   const compactable = middle.filter((_, i) => !prot.has(i));
@@ -220,8 +231,9 @@ export async function compactAsync(
   summarize: (msgs: ChatMessage[]) => Promise<string>,
   cfg: CompactionConfig = defaultCompactionConfig,
 ): Promise<ChatMessage[]> {
-  const { lead, tailStart } = segment(messages, cfg.keepTail);
-  if (messages.length <= cfg.keepTail + lead + 1 || tailStart <= lead) return messages;
+  const tail = clampKeepTail(cfg.keepTail);
+  const { lead, tailStart } = segment(messages, tail);
+  if (messages.length <= tail + lead + 1 || tailStart <= lead) return messages;
   const middle = messages.slice(lead, tailStart);
   const prot = protectedIndices(middle);
   const compactable = middle.filter((_, i) => !prot.has(i));
@@ -233,27 +245,51 @@ export function estimateTokens(messages: ChatMessage[], tools?: { description?: 
   let chars = 0;
   let imageTokens = 0;
   for (const m of messages) {
-    chars += m.content.length;
-    if (m.thinking) chars += m.thinking.length;
-    if (m.toolCallId) chars += m.toolCallId.length;
+    chars += contentLength(m.content);
+    if (m.thinking) chars += contentLength(m.thinking);
+    if (m.toolCallId) chars += contentLength(m.toolCallId);
     chars += ROLE_OVERHEAD[m.role] ?? ROLE_OVERHEAD.default;
     if (m.images?.length) imageTokens += m.images.length * IMAGE_TOKEN_OVERHEAD;
     if (m.toolCalls) {
       for (const t of m.toolCalls) {
-        chars += t.name.length + JSON.stringify(t.args).length;
+        chars += contentLength(t.name) + stringifyLength(t.args);
         chars += TOOL_CALL_OVERHEAD;
       }
     }
   }
   if (tools?.length) {
-    const toolDefs = tools.map((t) => ({
-      name: "name" in t ? (t as { name: string }).name : "",
-      description: t.description ?? "",
-      inputSchema: t.inputSchema ?? {},
-    }));
-    chars += JSON.stringify(toolDefs).length;
+    let defs = 0;
+    for (const t of tools) {
+      const name = "name" in t ? contentLength((t as { name: unknown }).name) : 0;
+      defs += name + contentLength(t.description) + stringifyLength(t.inputSchema);
+    }
+    chars += defs;
   }
   return Math.ceil((chars / CHARS_PER_TOKEN) * FACTOR) + imageTokens;
+}
+function contentLength(v: unknown): number {
+  if (typeof v === "string") return v.length;
+  if (v === undefined || v === null) return 0;
+  try {
+    return JSON.stringify(v)?.length ?? 8;
+  } catch {
+    return 8;
+  }
+}
+function stringifyLength(v: unknown): number {
+  try {
+    return JSON.stringify(v)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+function renderArgs(v: unknown): string {
+  try {
+    const s = JSON.stringify(v) ?? "";
+    return s.length > 200 ? `${s.slice(0, 200)}...` : s;
+  } catch {
+    return "";
+  }
 }
 const ROLE_OVERHEAD: Record<string, number> = {
   system: 12,
@@ -266,25 +302,43 @@ const ROLE_OVERHEAD: Record<string, number> = {
 const TOOL_CALL_OVERHEAD = 24;
 const SUMMARY_MSG_CAP = 2_400;
 const SUMMARY_TOTAL_BUDGET = 120_000;
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => (typeof p === "string" ? p : typeof (p as { text?: unknown })?.text === "string" ? (p as { text: string }).text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content === undefined || content === null) return "";
+  try {
+    return JSON.stringify(content) ?? "";
+  } catch {
+    return "";
+  }
+}
 export function renderForSummary(msgs: ChatMessage[]): string {
   const lines: string[] = [];
   for (const m of msgs) {
     let line: string;
+    const text = textOf(m.content);
     if (isPriorSummary(m)) {
-      line = m.content;
+      line = text;
     } else if (m.role === "system") {
-      line = `[system] ${m.content}`;
+      line = `[system] ${text}`;
     } else if (m.role === "user") {
-      line = `[user] ${m.content}`;
+      line = `[user] ${text}`;
     } else if (m.role === "assistant") {
-      const tc = m.toolCalls?.length ? ` tools=${m.toolCalls.map((t) => `${t.name}(${JSON.stringify(t.args)})`).join("; ")}` : "";
-      line = `[assistant] ${m.content}${tc}`;
+      const tc = m.toolCalls?.length ? ` tools=${m.toolCalls.map((t) => `${t.name}(${renderArgs(t.args)})`).join("; ")}` : "";
+      line = `[assistant] ${text}${tc}`;
     } else if (m.role === "tool") {
-      line = `[tool:${m.toolCallId ?? ""}] ${m.content}`;
+      line = `[tool:${m.toolCallId ?? ""}] ${text}`;
+    } else if (m.role === "developer") {
+      line = `[developer] ${text}`;
     } else {
-      continue;
+      line = `[${m.role}] ${text}`;
     }
-    if (m.thinking) line += `\n[thinking] ${m.thinking}`;
+    if (m.thinking) line += `\n[thinking] ${textOf(m.thinking)}`;
     if (line.length > SUMMARY_MSG_CAP) line = `${line.slice(0, SUMMARY_MSG_CAP)} ...`;
     lines.push(line);
   }
@@ -298,22 +352,31 @@ export function renderForSummary(msgs: ChatMessage[]): string {
     used += lines[headEnd].length + 1;
     headEnd++;
   }
+  if (used > headBudget && headEnd > 0) {
+    headEnd--;
+    used -= lines[headEnd].length + 1;
+  }
   let remaining = SUMMARY_TOTAL_BUDGET - used - OMISSION_MARK.length;
   let tailStart = lines.length;
   while (tailStart > headEnd && remaining > 0) {
     remaining -= lines[tailStart - 1].length + 1;
     if (remaining >= 0) tailStart--;
   }
+  if (tailStart <= headEnd) {
+    return [...lines.slice(0, headEnd), OMISSION_MARK].join("\n").slice(0, SUMMARY_TOTAL_BUDGET);
+  }
   return [...lines.slice(0, headEnd), OMISSION_MARK, ...lines.slice(tailStart)].join("\n");
 }
 export function summarizeInProcess(msgs: ChatMessage[]): string {
   const lines: string[] = [];
   for (const m of msgs) {
-    if (isPriorSummary(m)) lines.push(`- [prior summary]: ${m.content.replace(COMPACTION_SUMMARY_HEADER, "").slice(0, 200)}`);
-    else if (m.role === "tool") lines.push(`- [tool ${m.toolCallId ?? ""}]: ${m.content.slice(0, 80)}`);
-    else if (m.role === "assistant") lines.push(`- [assistant]: ${m.content.slice(0, 120)}${m.toolCalls?.length ? ` (${m.toolCalls.map((t) => t.name).join(", ")})` : ""}`);
-    else if (m.role === "user") lines.push(`- [user]: ${m.content.slice(0, 120)}`);
-    else if (m.role === "system") lines.push(`- [system]: ${m.content.slice(0, 120)}`);
+    const text = textOf(m.content);
+    if (isPriorSummary(m)) lines.push(`- [prior summary]: ${text.replace(COMPACTION_SUMMARY_HEADER, "").slice(0, 200)}`);
+    else if (m.role === "tool") lines.push(`- [tool ${m.toolCallId ?? ""}]: ${text.slice(0, 80)}`);
+    else if (m.role === "assistant") lines.push(`- [assistant]: ${text.slice(0, 120)}${m.toolCalls?.length ? ` (${m.toolCalls.map((t) => t.name).join(", ")})` : ""}`);
+    else if (m.role === "user") lines.push(`- [user]: ${text.slice(0, 120)}`);
+    else if (m.role === "system") lines.push(`- [system]: ${text.slice(0, 120)}`);
+    else lines.push(`- [${m.role}]: ${text.slice(0, 120)}`);
   }
   return lines.join("\n");
 }

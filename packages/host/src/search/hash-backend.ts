@@ -3,6 +3,7 @@ export class HashEmbeddingBackend implements EmbeddingBackend {
   readonly id = "hash";
   readonly dim: number;
   constructor(dim = 256, readonly model = "hash-256") {
+    if (!Number.isInteger(dim) || dim <= 0) throw new Error(`Invalid embedding dim: ${dim}`);
     this.dim = dim;
   }
   async embed(req: EmbeddingRequest): Promise<EmbeddingVector[]> {
@@ -28,7 +29,7 @@ export function hashEmbed(text: string, dim: number): EmbeddingVector {
   return { values, dim };
 }
 function tokenize(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 1);
+  return text.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter((t) => t.length >= 1);
 }
 function fnv1a(s: string): number {
   let h = 0x811c9dc5;

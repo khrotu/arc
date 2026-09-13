@@ -17,6 +17,10 @@ export const ollamaTransport: Transport = {
         }
       }
     }
+function stripImagePrefix(url: string): string {
+  const m = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+  return m ? m[2].replace(/\s+/g, "") : url;
+}
     const body: Record<string, unknown> = {
       model: remoteModel,
       stream: true,
@@ -25,7 +29,7 @@ export const ollamaTransport: Transport = {
           const images = (m as any).images as { image_url: { url: string } }[] | undefined;
           const msg: Record<string, unknown> = { role: "tool", tool_name: toApiToolName(toolNameCache.get(m.toolCallId ?? "") ?? "unknown"), content: m.content };
           if (images?.length) {
-            msg.images = images.map((img) => img.image_url.url.replace(/^data:image\/\w+;base64,/, ""));
+            msg.images = images.map((img) => stripImagePrefix(img.image_url.url));
           }
           return msg;
         }
@@ -43,7 +47,7 @@ export const ollamaTransport: Transport = {
         msg.content = m.content;
         const images = (m as any).images as { image_url: { url: string } }[] | undefined;
         if (m.role === "user" && images?.length) {
-          msg.images = images.map((img) => img.image_url.url.replace(/^data:image\/\w+;base64,/, ""));
+          msg.images = images.map((img) => stripImagePrefix(img.image_url.url));
         }
         return msg;
       }),

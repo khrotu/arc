@@ -8,10 +8,10 @@ describe("attribution headers", () => {
     expect(h["x-openrouter-categories"]).toBe("ide-extension");
     expect(h["user-agent"]).toBe(`Arc/${APP_VERSION} (+https://github.com/khrotu/arc)`);
   });
-  it("sends HTTP-Referer + X-Title for OpenRouter-dialect routers", () => {
+  it("sends X-Title without HTTP-Referer for OpenRouter-dialect routers", () => {
     for (const kind of ["poe", "zenmux", "requesty", "orcarouter", "fastrouter", "anyapi", "unorouter"] as const) {
       const h = attributionHeaders(kind);
-      expect(h["http-referer"]).toBe("https://github.com/khrotu/arc");
+      expect(h["http-referer"]).toBeUndefined();
       expect(h["x-title"]).toBe("Arc");
     }
   });

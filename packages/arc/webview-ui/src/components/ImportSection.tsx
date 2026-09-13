@@ -126,7 +126,7 @@ function ImportSection({ client }: { client: RpcClient }) {
           )}
           {status.kind === "done" && <p className="arc-section-desc" style={{ color: "var(--vscode-charts-green, var(--vscode-descriptionForeground))" }}>{status.text}</p>}
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
-            <button className="arc-btn" disabled={importing || checked.size === 0 || !agent} onClick={doImport}>Import</button>
+            <button className="arc-btn" disabled={importing || checked.size === 0 || !agent} onClick={doImport}>Import selected</button>
           </div>
         </>
       )}

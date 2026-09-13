@@ -7,6 +7,19 @@ let currentFile: string | undefined;
 let lastEditTime = 0;
 let cooldownTimer: ReturnType<typeof setTimeout> | undefined;
 let prevEditor: vscode.TextEditor | undefined;
+let providerPushed = false;
+export function deactivateDiscordRpcSpoof(): void {
+  if (cooldownTimer) clearTimeout(cooldownTimer);
+  cooldownTimer = undefined;
+  enabled = false;
+  if (textProvider) {
+    try { textProvider.dispose(); } catch {}
+    textProvider = undefined;
+  }
+  providerPushed = false;
+  currentFile = undefined;
+  prevEditor = undefined;
+}
 export function initDiscordRpcSpoof(context: vscode.ExtensionContext): void {
   const sync = (): void => {
     const next = vscode.workspace.getConfiguration().get<boolean>("arc.discord.spoofRpc", false);
@@ -14,8 +27,13 @@ export function initDiscordRpcSpoof(context: vscode.ExtensionContext): void {
     enabled = next;
     if (enabled) register(context);
     else if (textProvider) {
-      textProvider.dispose();
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+      cooldownTimer = undefined;
+      try { textProvider.dispose(); } catch {}
       textProvider = undefined;
+      providerPushed = false;
+      currentFile = undefined;
+      prevEditor = undefined;
     }
   };
   enabled = vscode.workspace.getConfiguration().get<boolean>("arc.discord.spoofRpc", false);
@@ -32,7 +50,10 @@ function register(context: vscode.ExtensionContext): void {
       return `# ${rel}\n\nArc agent is working with this file.`;
     },
   });
-  context.subscriptions.push(textProvider);
+  if (!providerPushed) {
+    context.subscriptions.push(textProvider);
+    providerPushed = true;
+  }
 }
 export function reportAgentActivity(type: "edit" | "think", filePath?: string): void {
   if (!enabled || !textProvider) return;
@@ -62,7 +83,10 @@ async function showFile(filePath?: string): Promise<void> {
   const uri = vscode.Uri.from({ scheme: ARC_SCHEME, path: `/${rel}` });
   try {
     if (prevEditor && prevEditor.document.uri.toString() !== uri.toString()) {
-      await prevEditor.hide();
+      const tab = vscode.window.tabGroups.all
+        .flatMap((g) => g.tabs)
+        .find((t) => (t.input as { uri?: vscode.Uri })?.uri?.toString() === prevEditor!.document.uri.toString());
+      if (tab) await vscode.window.tabGroups.close(tab, true);
       prevEditor = undefined;
     }
     if (!prevEditor) {

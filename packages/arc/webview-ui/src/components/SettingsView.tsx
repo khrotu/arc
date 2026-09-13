@@ -385,7 +385,7 @@ function ModelsTab({ client, providers, models, providerCatalog, onSwitchTab }: 
           className="arc-iconbtn"
           onClick={reloadCatalog}
           disabled={catalogReloading}
-          title={catalogReloadError ? `Reload failed: ${catalogReloadError}. The cached model data is unchanged; check your network/proxy and try again.` : "Reload model data from OpenRouter (prices, context window, capabilities)"}
+          title={catalogReloadError ? `Reload failed: ${catalogReloadError}. The cached model data is unchanged; check your network/proxy and try again.` : "Reload model data from your providers and OpenRouter (metadata)"}
           style={{ marginLeft: 4, verticalAlign: "middle", ...(catalogReloadError ? { color: "var(--arc-err, #f66)" } : {}) }}
         >
           {catalogReloadError ? <AlertTriangle size={13} /> : <RefreshCw size={13} style={catalogReloading ? { animation: "arc-spin 1.4s linear infinite" } : undefined} />}
@@ -702,7 +702,7 @@ function ProvidersTab({ client, providers, models, providerCatalog, serverStates
       }
       if (e.type === "provider/list") {
         if (e.providers.some((p) => p.label === "Internal" && p.enabled)) {
-          if (!internalSetup || (internalSetup.pct >= 100)) setInternalSetup(null);
+          setInternalSetup((prev) => (prev && prev.pct < 100 ? prev : null));
         }
       }
       if (e.type === "provider/serverState") {
@@ -711,7 +711,7 @@ function ProvidersTab({ client, providers, models, providerCatalog, serverStates
     });
     client.send({ type: "provider/list" });
     return off;
-  }, [client, internalSetup, setServerStates]);
+  }, [client]);
   const setupInternal = () => {
     setInternalSetup({ phase: "Starting...", pct: 0 });
     client.send({ type: "provider/setupInternal" });
@@ -1292,6 +1292,7 @@ function ImagesSection({ client, models }: { client: RpcClient; models: ModelDes
 }
 function SoundsSection({ client }: { client: RpcClient }) {
   const [attentionEnabled, setAttentionEnabled] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [attentionSound, setAttentionSound] = useState<"beep" | "system" | "pop">("beep");
   const [attentionVolume, setAttentionVolume] = useState(70);
   const [attentionCompletion, setAttentionCompletion] = useState(true);
@@ -1299,6 +1300,7 @@ function SoundsSection({ client }: { client: RpcClient }) {
   const [attentionError, setAttentionError] = useState(true);
   useEffect(() => {
     void client.request("arc.attention.enabled").then((v) => setAttentionEnabled(v === true));
+    void client.request("arc.notifications.enabled").then((v) => setNotificationsEnabled(v !== false));
     void client.request("arc.attention.sound").then((v) => setAttentionSound(v === "system" || v === "pop" ? v : "beep"));
     void client.request("arc.attention.volume").then((v) => setAttentionVolume(typeof v === "number" ? v : 70));
     void client.request("arc.attention.completion").then((v) => setAttentionCompletion(v !== false));
@@ -1306,8 +1308,14 @@ function SoundsSection({ client }: { client: RpcClient }) {
     void client.request("arc.attention.error").then((v) => setAttentionError(v !== false));
   }, [client]);
   return (
-      <Section collapsible title="Sounds" description="Optional attention sounds for agent activity.">
+      <Section collapsible title="Sounds & Notifications" description="Attention sounds and OS notifications for agent activity.">
         <ul className="arc-rows">
+          <li className="arc-row"><div className="arc-row-main">
+            <span className="arc-row-label">OS notifications</span>
+            <span className="arc-row-meta">show system notifications on agent events</span>
+            <span className="arc-spacer" />
+            <Toggle checked={notificationsEnabled} onChange={(v) => { setNotificationsEnabled(v); client.send({ type: "config/set", key: "arc.notifications.enabled", value: v }); }} />
+          </div></li>
           <li className="arc-row"><div className="arc-row-main">
             <span className="arc-row-label">Enabled</span>
             <span className="arc-row-meta">play sounds on agent events</span>
@@ -1962,6 +1970,21 @@ function WorkspaceTab({ client, models }: { client: RpcClient; models: ModelDesc
   const [monoFontFamily, setMonoFontFamily] = useState<string>("ibm-plex-mono");
   const [customFontFamily, setCustomFontFamily] = useState<string>("");
   const [customMonoFontFamily, setCustomMonoFontFamily] = useState<string>("");
+  const flushTimers = useRef<{ ui?: ReturnType<typeof setTimeout>; mono?: ReturnType<typeof setTimeout> }>({});
+  useEffect(() => () => {
+    if (flushTimers.current.ui) clearTimeout(flushTimers.current.ui);
+    if (flushTimers.current.mono) clearTimeout(flushTimers.current.mono);
+  }, []);
+  const queueFlush = (which: "ui" | "mono", value: string) => {
+    const t = flushTimers.current;
+    if (which === "ui") {
+      if (t.ui) clearTimeout(t.ui);
+      t.ui = setTimeout(() => client.send({ type: "config/set", key: "arc.appearance.customFontFamily", value: value.trim() }), 800);
+    } else {
+      if (t.mono) clearTimeout(t.mono);
+      t.mono = setTimeout(() => client.send({ type: "config/set", key: "arc.appearance.customMonoFontFamily", value: value.trim() }), 800);
+    }
+  };
   useEffect(() => {
     void client.request("arc.appearance.prideLogo").then((v) => setPrideLogo(v === "always" || v === "never" ? v as typeof prideLogo : "june"));
     void client.request("arc.appearance.toolTree").then((v) => setToolTree(v === "auto" ? "auto" : "collapsed"));
@@ -2025,7 +2048,7 @@ function WorkspaceTab({ client, models }: { client: RpcClient; models: ModelDesc
               <span className="arc-row-label">Custom UI font</span>
               <span className="arc-row-meta">font family name (system or your own self-hosted @font-face)</span>
               <span className="arc-spacer" />
-              <input className="arc-input arc-input-sm" type="text" placeholder="My Font" value={customFontFamily} onChange={(e) => { const v = e.target.value; setCustomFontFamily(v); applyFonts(fontFamily, v, monoFontFamily, customMonoFontFamily); }} onBlur={() => client.send({ type: "config/set", key: "arc.appearance.customFontFamily", value: customFontFamily.trim() })} style={{ width: 200 }} />
+              <input className="arc-input arc-input-sm" type="text" placeholder="My Font" value={customFontFamily} onChange={(e) => { const v = e.target.value; setCustomFontFamily(v); applyFonts(fontFamily, v, monoFontFamily, customMonoFontFamily); queueFlush("ui", v); }} onBlur={() => client.send({ type: "config/set", key: "arc.appearance.customFontFamily", value: customFontFamily.trim() })} style={{ width: 200 }} />
             </div></li>
           )}
           <li className="arc-row"><div className="arc-row-main">
@@ -2042,7 +2065,7 @@ function WorkspaceTab({ client, models }: { client: RpcClient; models: ModelDesc
               <span className="arc-row-label">Custom mono font</span>
               <span className="arc-row-meta">font family name (system or your own self-hosted @font-face)</span>
               <span className="arc-spacer" />
-              <input className="arc-input arc-input-sm" type="text" placeholder="My Mono" value={customMonoFontFamily} onChange={(e) => { const v = e.target.value; setCustomMonoFontFamily(v); applyFonts(fontFamily, customFontFamily, monoFontFamily, v); }} onBlur={() => client.send({ type: "config/set", key: "arc.appearance.customMonoFontFamily", value: customMonoFontFamily.trim() })} style={{ width: 200 }} />
+              <input className="arc-input arc-input-sm" type="text" placeholder="My Mono" value={customMonoFontFamily} onChange={(e) => { const v = e.target.value; setCustomMonoFontFamily(v); applyFonts(fontFamily, customFontFamily, monoFontFamily, v); queueFlush("mono", v); }} onBlur={() => client.send({ type: "config/set", key: "arc.appearance.customMonoFontFamily", value: customMonoFontFamily.trim() })} style={{ width: 200 }} />
             </div></li>
           )}
         </ul>

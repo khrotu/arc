@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SkillMetadata } from "./types.js";
+const MAX_SKILL_MD_BYTES = 256 * 1024;
 export async function parseSkillMd(filePath: string, scope: "workspace" | "global"): Promise<SkillMetadata | undefined> {
+  const stat = await fs.stat(filePath).catch(() => undefined);
+  if (stat && stat.size > MAX_SKILL_MD_BYTES) return undefined;
   const raw = await fs.readFile(filePath, "utf-8");
+  if (raw.length > MAX_SKILL_MD_BYTES) return undefined;
   const frontmatter = extractFrontmatter(raw);
   const name = (frontmatter?.name as string)?.trim() ?? path.basename(filePath, ".md");
-  const description = (frontmatter?.description as string)?.trim() ?? firstHeading(raw);
+  if (!/^[a-z0-9-]+$/.test(name)) return undefined;
+  const description = ((frontmatter?.description as string)?.trim() ?? firstHeading(raw))?.slice(0, 2000);
   if (!name || !description) return undefined;
   const skillDir = path.dirname(filePath);
   const shortDescription = description.slice(0, 120);
@@ -26,7 +31,7 @@ export async function parseSkillMd(filePath: string, scope: "workspace" | "globa
 }
 export async function readSkillBody(filePath: string): Promise<string> {
   const raw = await fs.readFile(filePath, "utf-8");
-  return bodyAfterFrontmatter(raw);
+  return bodyAfterFrontmatter(raw).slice(0, MAX_SKILL_MD_BYTES);
 }
 function extractFrontmatter(raw: string): Record<string, unknown> | undefined {
   const lines = raw.split(/\r?\n/);

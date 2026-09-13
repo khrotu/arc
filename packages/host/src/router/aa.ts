@@ -70,19 +70,21 @@ export function matchIntelligence(modelId: string, label?: string): AAMatch | un
     const exact = index.find((x) => x.key === key);
     if (exact) return { entry: exact.entry, confidence: 1 };
   }
+  let best: AAMatch | undefined;
   for (const x of index) {
-    if (x.key.length >= 4 && (id.includes(x.key) || x.key.includes(id))) {
-      return { entry: x.entry, confidence: Math.min(x.key.length / Math.max(id.length, x.key.length), 1) };
+    if (x.key.length >= 8 && id.length >= 8 && (id.includes(x.key) || x.key.includes(id))) {
+      const confidence = Math.min(x.key.length / Math.max(id.length, x.key.length), 1);
+      if (!best || confidence > best.confidence) best = { entry: x.entry, confidence };
     }
   }
+  if (best) return best;
   const labelTokens = label ? label.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean) : [];
   const idTokens = modelId.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  let best: AAMatch | undefined;
   for (const tokens of [labelTokens, idTokens]) {
     if (!tokens.length) continue;
     for (const x of index) {
       const c = tokenOverlap(tokens, x.tokens);
-      if (c > 0.5 && (!best || c > best.confidence)) best = { entry: x.entry, confidence: c };
+      if (c > 0.6 && (!best || c > best.confidence)) best = { entry: x.entry, confidence: c };
     }
     if (best) return best;
   }
@@ -99,8 +101,10 @@ export function consolidateOpenRouterModels(text: string): AAModel[] {
     const rec = m as { id?: string; name?: string; benchmarks?: { artificial_analysis?: Record<string, number | null> } };
     const id = rec.id ?? "";
     const slash = id.indexOf("/");
-    if (slash <= 0 || id.includes(":", slash)) continue;
-    const slug = id.slice(slash + 1);
+    if (slash <= 0) continue;
+    const colonAfter = id.indexOf(":", slash);
+    const variant = colonAfter > slash ? id.slice(colonAfter) : "";
+    const slug = colonAfter > slash ? id.slice(slash + 1, colonAfter) : id.slice(slash + 1);
     if (!slug) continue;
     const raw = rec.benchmarks?.artificial_analysis;
     if (!raw) continue;
@@ -115,10 +119,10 @@ export function consolidateOpenRouterModels(text: string): AAModel[] {
     const colon = orName.indexOf(": ");
     const name = colon >= 0 ? orName.slice(colon + 2) : orName;
     if (!name) continue;
-    const key = norm(name);
+    const key = `${norm(name)}${variant}`;
     const prev = best.get(key);
     if (!prev || (prev.score ?? 0) < score) {
-      best.set(key, { name, slug, provider: id.slice(0, slash), score, aa });
+      best.set(key, { name: variant ? `${name} (${variant.slice(1)})` : name, slug: variant ? `${slug}${variant}` : slug, provider: id.slice(0, slash), score, aa });
     }
   }
   const rows = [...best.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.name.localeCompare(b.name));

@@ -1,37 +1,33 @@
-//nodel 2026-08-31
 export interface ModelIconEntry {
-  family: string
   icon: string | undefined
   pattern: string
 }
 const q = "(?:[\\s._-]?\\d+(?:[.-]\\d+)*)?(?![a-z0-9])"
 const p = (...names: string[]): string => names.length > 1 ? "(?:" + names.map((n) => n + q).join("|") + ")" : names[0] + q
 export const MODEL_ICONS: ModelIconEntry[] = [
-  { family: "mistral", icon: "mistral", pattern: p("magistral", "ministral", "devstral", "mistral") },
-  { family: "meta", icon: "meta", pattern: p("muse-glimmer", "muse-spark", "llama") },
-  { family: "poolside", icon: "poolside", pattern: p("poolside", "laguna") },
-  { family: "deepseek", icon: "deepseek", pattern: p("deepseek") },
-  { family: "nemotron", icon: "nvidia", pattern: p("nemotron") },
-  { family: "gpt-oss", icon: "openai", pattern: p("gpt-oss") },
-  { family: "longcat", icon: "longcat", pattern: p("longcat") },
-  { family: "mercury", icon: "inception", pattern: p("mercury") },
-  { family: "minimax", icon: "minimax", pattern: p("minimax") },
-  { family: "trinity", icon: "arcee", pattern: p("trinity") },
-  { family: "claude", icon: "anthropic", pattern: p("claude") },
-  { family: "gemini", icon: "google", pattern: p("gemini") },
-  { family: "gemma", icon: "google", pattern: p("gemma") },
-  { family: "north", icon: "cohere", pattern: p("north") },
-  { family: "grok", icon: "xai", pattern: p("grok") },
-  { family: "kimi", icon: "moonshotai", pattern: p("kimi") },
-  { family: "mimo", icon: "xiaomi", pattern: p("mimo") },
-  { family: "nova", icon: "amazon", pattern: p("nova") },
-  { family: "qwen", icon: "alibaba", pattern: p("qwen") },
-  { family: "step", icon: "stepfun", pattern: p("step") },
-  { family: "glm", icon: "zai", pattern: p("glm") },
-  { family: "gpt", icon: "openai", pattern: p("gpt") },
-  { family: "hy3", icon: "tencent", pattern: p("hy3") },
-  { family: "kat", icon: "kwaikat", pattern: p("kat") },
-  { family: "o3", icon: "openai", pattern: "o\\d+(?:[.-]\\d+)*(?![a-z0-9])" }
+  { icon: "mistral", pattern: p("magistral", "ministral", "devstral", "mistral", "codestral", "mixtral", "voxtral") },
+  { icon: "meta", pattern: p("muse-glimmer", "muse-spark", "llama") },
+  { icon: "poolside", pattern: p("laguna") },
+  { icon: "deepseek", pattern: p("deepseek") },
+  { icon: "nvidia", pattern: p("nemotron") },
+  { icon: "longcat", pattern: p("longcat") },
+  { icon: "inception", pattern: p("mercury") },
+  { icon: "minimax", pattern: p("minimax") },
+  { icon: "arcee", pattern: p("trinity") },
+  { icon: "anthropic", pattern: p("claude") },
+  { icon: "google", pattern: p("gemini", "gemma") },
+  { icon: "cohere", pattern: p("command", "north") },
+  { icon: "xai", pattern: p("grok") },
+  { icon: "moonshotai", pattern: p("kimi") },
+  { icon: "xiaomi", pattern: p("mimo") },
+  { icon: "amazon", pattern: p("nova") },
+  { icon: "alibaba", pattern: p("qwen") },
+  { icon: "stepfun", pattern: p("step", "stepfun") },
+  { icon: "zai", pattern: p("glm") },
+  { icon: "openai", pattern: p("gpt") },
+  { icon: "tencent", pattern: p("hy", "hunyuan") },
+  { icon: "kwaikat", pattern: p("kat", "kwai", "kwaikat") },
+  { icon: "openai", pattern: "o\\d+(?:[.-]\\d+)*(?![a-z0-9])" }
 ]
 export const DEFAULT_ICON = "generic"
 export const ICON_SVGS: Record<string, { mode?: "fill" | "stroke"; transform?: string; paths: { d: string; fillRule?: string; stroke?: string; opacity?: string }[] }> = {
@@ -62,17 +58,10 @@ export const ICON_SVGS: Record<string, { mode?: "fill" | "stroke"; transform?: s
 const COMPILED_PATTERNS = MODEL_ICONS.map((e) => ({
   re: new RegExp("\\b" + e.pattern, "i"),
   icon: e.icon ?? DEFAULT_ICON,
-  family: e.family,
 }));
 export function iconForModel(model: string): string {
   for (let i = 0; i < COMPILED_PATTERNS.length; i++) {
     if (COMPILED_PATTERNS[i].re.test(model)) return COMPILED_PATTERNS[i].icon;
   }
   return DEFAULT_ICON;
-}
-export function familyForModel(model: string): string | undefined {
-  for (let i = 0; i < COMPILED_PATTERNS.length; i++) {
-    if (COMPILED_PATTERNS[i].re.test(model)) return COMPILED_PATTERNS[i].family;
-  }
-  return undefined;
 }

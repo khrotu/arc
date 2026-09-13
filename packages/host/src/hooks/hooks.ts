@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getArcDir, getWorkspaceArcDir } from "../arc-dir.js";
 import { minimalEnvironment, PROCESS_OUTPUT_LIMIT, runShellCommand } from "../util/process.js";
+import { globToRegExpSource } from "../util/glob.js";
 import type { SandboxProfile } from "../sandbox/sandbox.js";
 const ANSI_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 function stripAnsi(s: string): string { return s.replace(ANSI_RE, ""); }
@@ -126,15 +127,11 @@ export async function runHooks(ctx: HookEventContext): Promise<HookDecision[]> {
       if (!trimmed) continue;
       try {
         const d = JSON.parse(trimmed) as HookDecision;
-        if (d.decision === "deny" || d.decision === "ask" || d.decision === "block") {
+        if (d.decision === "deny" || d.decision === "block") {
           decisions.push(d);
           return decisions;
         }
-        if (d.decision === "allow" && d.modifiedArgs) {
-          decisions.push(d);
-          return decisions;
-        }
-        if (d.contextMessage) decisions.push(d);
+        if (d.decision === "ask" || (d.decision === "allow" && d.modifiedArgs) || d.contextMessage) decisions.push(d);
       } catch {
         decisions.push({ decision: "deny", message: `Hook ${hook.event} returned invalid JSON: ${trimmed.slice(0, 200)}` });
         return decisions;
@@ -207,7 +204,7 @@ export async function runPostEditHooks(filePath: string, root: string, sandboxPr
     if (hook.type !== "command" || !hook.command) continue;
     if (hook.glob) {
       const rel = path.relative(root, filePath).replace(/\\/g, "/");
-      const globRe = new RegExp("^" + hook.glob.replace(/\*/g, "[^/]*").replace(/\./g, "\\.").replace(/\*\*/g, ".*") + "$");
+      const globRe = new RegExp("^" + globToRegExpSource(hook.glob) + "$");
       if (!globRe.test(rel)) continue;
     }
     try {

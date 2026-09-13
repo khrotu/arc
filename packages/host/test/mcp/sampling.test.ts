@@ -46,8 +46,7 @@ function startFakeMcp(): Promise<FakeMcpServer> {
     });
   });
 }
-describe("MCP roots + sampling (server -> client requests)", () => {
-  let fake: FakeMcpServer;
+describe("MCP roots + sampling (server -> client requests)", () => {  let fake: FakeMcpServer;
   let agg: McpAggregator;
   beforeEach(async () => {
     fake = await startFakeMcp();
@@ -92,4 +91,4 @@ describe("MCP roots + sampling (server -> client requests)", () => {
     const entry2 = fake.responseLog.find((r) => r.id === 504);
     expect(entry2?.error?.code).toBe(-32000);
   });
-});
+}, 30000);

@@ -62,10 +62,12 @@ describe("compress roundtrip", () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "arc-compress-"));
     const content = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ i, v: `value-${i}` })));
     const id = await saveBlob(tmp, "file.grep", content);
-    expect(id).toHaveLength(12);
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
     const restored = await loadBlob(tmp, id);
-    expect(restored).toBe(content);
+    expect(restored?.content).toBe(content);
+    expect(restored?.truncated).toBe(false);
     expect(await loadBlob(tmp, "deadbeef")).toBeUndefined();
+    expect(await loadBlob(tmp, id.slice(0, 12))).toBeUndefined();
     const dir = path.join(getWorkspaceArcDir(tmp), "context");
     const files = await fs.readdir(dir);
     expect(files.length).toBe(1);
@@ -79,7 +81,7 @@ describe("compress roundtrip", () => {
     expect(r.id).toBeDefined();
     expect(r.output.length).toBeLessThan(big.length * 0.7);
     expect(r.output).toContain("context.retrieve");
-    expect(await loadBlob(tmp, r.id!)).toBe(big);
+    expect((await loadBlob(tmp, r.id!))?.content).toBe(big);
   });
   it("leaves small outputs untouched", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "arc-compress-"));

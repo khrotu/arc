@@ -261,8 +261,12 @@ class MathParser {
     }
     const marker = `\\end{${env}}`;
     const idx = this.s.indexOf(marker, this.i);
+    const raw = idx >= 0 ? this.s.slice(this.i, idx) : this.s.slice(this.i);
     this.i = idx >= 0 ? idx + marker.length : this.s.length;
-    return "";
+    if (!raw.trim()) return "";
+    const rows = raw.split(/\\\\/).map((r) => r.split("&").map((cell) => new MathParser(cell).seq()));
+    const mtrs = rows.map((r) => `<span class="mtr">${r.map((c) => `<span class="mtd">${c}</span>`).join("")}</span>`).join("");
+    return atom(MINNER, `<span class="mtable">${mtrs}</span>`);
   }
 }
 export function renderMath(src: string, display = false): string {

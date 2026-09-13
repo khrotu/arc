@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { parseOpenRouterCatalogue, matchModelInfo, groupProviderModels, stripVariantCandidates, formatFallbackName, type OpenRouterModelInfo } from "../src/providers/model-catalog";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { parseOpenRouterCatalogue, matchModelInfo, groupProviderModels, stripVariantCandidates, formatFallbackName, listProviderModelSlugs, clearProviderSlugCache, type OpenRouterModelInfo } from "../src/providers/model-catalog";
 function catalogueFrom(entries: { id: string; name?: string; context_length?: number; max_completion_tokens?: number; prompt?: string; completion?: string; input_modalities?: string[] }[]): Map<string, OpenRouterModelInfo> {
   return parseOpenRouterCatalogue({
     data: entries.map((e) => ({
@@ -113,5 +113,48 @@ describe("groupProviderModels", () => {
       { slug: "glm-5.3-flash:free", providerId: "a" },
     ], new Map());
     expect(grouped).toHaveLength(1);
+  });
+});
+describe("listProviderModelSlugs caching", () => {
+  const modelsResponse = (ids: string[]): Response =>
+    new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), { status: 200, headers: { "content-type": "application/json" } });
+  beforeEach(() => {
+    clearProviderSlugCache();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  it("caches /models responses within the TTL instead of refetching", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(modelsResponse(["m1", "m2"])));
+    vi.stubGlobal("fetch", fetchMock);
+    const source = { providerId: `p-cache-${Date.now()}`, kind: "openai-compatible", baseUrl: "https://models.example.com/v1", apiKey: "k" };
+    expect(await listProviderModelSlugs(source)).toEqual(["m1", "m2"]);
+    expect(await listProviderModelSlugs(source)).toEqual(["m1", "m2"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it("force bypasses the cache and stores the fresh result", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(modelsResponse(["old"]))
+      .mockResolvedValueOnce(modelsResponse(["new"]));
+    vi.stubGlobal("fetch", fetchMock);
+    const source = { providerId: `p-force-${Date.now()}`, kind: "openai-compatible", baseUrl: "https://models.example.com/v1", apiKey: "k" };
+    expect(await listProviderModelSlugs(source)).toEqual(["old"]);
+    expect(await listProviderModelSlugs(source, undefined, { force: true })).toEqual(["new"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(await listProviderModelSlugs(source)).toEqual(["new"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+  it("dedupes concurrent fetches for the same provider", async () => {
+    let resolveFetch: ((r: Response) => void) | undefined;
+    const gate = new Promise<Response>((resolve) => { resolveFetch = resolve; });
+    const fetchMock = vi.fn(() => gate);
+    vi.stubGlobal("fetch", fetchMock);
+    const source = { providerId: `p-inflight-${Date.now()}`, kind: "openai-compatible", baseUrl: "https://models.example.com/v1", apiKey: "k" };
+    const a = listProviderModelSlugs(source);
+    const b = listProviderModelSlugs(source);
+    resolveFetch!(modelsResponse(["m1"]));
+    expect(await a).toEqual(["m1"]);
+    expect(await b).toEqual(["m1"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

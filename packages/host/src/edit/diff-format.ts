@@ -13,7 +13,13 @@ const SEARCH_OPEN = /^<<<<<<< SEARCH\s*$/;
 const DIVIDER = /^=======\s*$/;
 const REPLACE_CLOSE = /^>>>>>>> REPLACE\s*$/;
 export function parseDiff(input: string): ParseDiffResult {
+  if (input.length > 4 * 1024 * 1024) {
+    return { ok: false, blocks: [], errors: ["Diff input exceeds the 4 MiB limit."] };
+  }
   const lines = input.split(/\r\n?|\n/);
+  if (lines.length > 100_000) {
+    return { ok: false, blocks: [], errors: ["Diff input exceeds 100,000 lines."] };
+  }
   const blocks: ParsedBlock[] = [];
   const errors: string[] = [];
   let i = 0;
@@ -57,6 +63,9 @@ export function parseDiff(input: string): ParseDiffResult {
       return { ok: false, blocks, errors };
     }
     i++;
+    if (blocks.length >= 500) {
+      return { ok: false, blocks: [], errors: ["Diff input exceeds 500 blocks."] };
+    }
     blocks.push({
       file,
       search: search.join("\n"),

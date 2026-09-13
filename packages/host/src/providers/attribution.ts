@@ -16,7 +16,6 @@ const UA = (a: AppIdentity): Record<string, string> => ({
   "user-agent": `${a.title}/${a.version} (+${a.url})`,
 });
 const OR = (a: AppIdentity): Record<string, string> => ({
-  "http-referer": a.url,
   "x-title": a.title,
 });
 const OR_DIALECT = new Set<ProviderKind>([
@@ -30,7 +29,7 @@ const OR_DIALECT = new Set<ProviderKind>([
 ]);
 const OPENCODE_HOSTS = new Set(["opencode.ai"]);
 export function isOpencodeEndpoint(baseUrl: string | undefined, kind: ProviderKind): boolean {
-  if (kind === "opencode") return true;
+  if (kind === "opencode" || kind === "opencode-go") return true;
   if (!baseUrl) return false;
   try {
     const host = new URL(baseUrl).hostname.toLowerCase();
@@ -88,9 +87,12 @@ export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Re
       return { ...UA(a), "x-litellm-tags": `app:${a.title.toLowerCase()}` };
     case "trustedrouter":
       return { ...UA(a), ...OR(a) };
+    case "opencode":
+    case "opencode-go":
+      return UA(a);
     default:
       if (OR_DIALECT.has(kind)) return { ...UA(a), ...OR(a) };
       if (kind === "anthropic") return UA(a);
-      return { ...UA(a), ...OR(a) };
+      return UA(a);
   }
 }

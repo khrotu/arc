@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { wrapSandbox, type SandboxProfile } from "../sandbox/sandbox.js";
 import { scratchDirFor } from "../sandbox/win-sandbox.js";
 export const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
@@ -32,7 +33,7 @@ export interface ShellInvocation {
   kind: ShellKind;
 }
 export function findOnPath(name: string): string | undefined {
-  const dirs = (process.env.PATH ?? process.env.Path ?? "").split(";").filter(Boolean);
+  const dirs = (process.env.PATH ?? process.env.Path ?? "").split(path.delimiter).filter(Boolean);
   for (const dir of dirs) {
     try {
       const p = path.join(dir, name);
@@ -94,12 +95,19 @@ export function proxyEnvironment(proxyUrl: string | undefined): NodeJS.ProcessEn
     return undefined;
   }
 }
+const ENV_BLOCK = new Set(["LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONHOME", "RUBYLIB", "RUBYOPT", "PERL5LIB", "PERL5OPT", "JAVA_TOOL_OPTIONS", "GIT_SSH_COMMAND", "BASH_ENV", "ENV", "ZDOTDIR"]);
 export function minimalEnvironment(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const keys = ["HOME", "USERPROFILE", "TMP", "TEMP", "SystemRoot", "ComSpec", "PATHEXT", "PSModulePath", "LOCALAPPDATA", "APPDATA", "LANG"];
   const env: NodeJS.ProcessEnv = {};
   env.PATH = process.env.PATH ?? process.env.Path;
   for (const key of keys) if (process.env[key] !== undefined) env[key] = process.env[key];
-  return { ...env, ...extra };
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v === undefined || ENV_BLOCK.has(k.toUpperCase())) continue;
+      env[k] = v;
+    }
+  }
+  return env;
 }
 export function spawnBounded(executable: string, args: string[], opts: ProcessOptions): ChildProcess {
   const sandboxed = !!opts.sandboxProfile && opts.sandboxProfile !== "off";
@@ -146,10 +154,14 @@ export function runProcess(executable: string, args: string[], opts: ProcessOpti
     let truncated = false;
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const outDec = new StringDecoder("utf-8");
+    const errDec = new StringDecoder("utf-8");
     const finish = (ok: boolean, exitCode?: number) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      stdout += outDec.end();
+      stderr += errDec.end();
       resolve({ ok, stdout, stderr, exitCode, truncated });
     };
     const append = (stream: "stdout" | "stderr", chunk: Buffer) => {
@@ -157,7 +169,7 @@ export function runProcess(executable: string, args: string[], opts: ProcessOpti
       const remaining = Math.max(0, max - bytes);
       const accepted = remaining > 0 ? chunk.subarray(0, remaining) : Buffer.alloc(0);
       bytes += accepted.length;
-      const text = accepted.toString();
+      const text = (stream === "stdout" ? outDec : errDec).write(accepted);
       if (stream === "stdout") stdout += text;
       else stderr += text;
       if (text) opts.onChunk?.(stream, text);

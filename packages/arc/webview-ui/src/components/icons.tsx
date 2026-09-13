@@ -48,10 +48,6 @@ export const Bot =  mk([
   ["path", { d: "M15 13v2" }],
   ["path", { d: "M9 13v2" }],
 ]);
-export const Braces =  mk([
-  ["path", { d: "M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1" }],
-  ["path", { d: "M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1" }],
-]);
 export const BugPlay =  mk([
   ["path", { d: "M12.765 21.522a.5.5 0 0 1-.765-.424v-8.196a.5.5 0 0 1 .765-.424l5.878 3.674a1 1 0 0 1 0 1.696z" }],
   ["path", { d: "M14.12 3.88 16 2" }],
@@ -82,18 +78,6 @@ export const CircleDot =  mk([
 export const CornerDownLeft =  mk([
   ["polyline", { points: "9 10 4 15 9 20" }],
   ["path", { d: "M20 4v7a4 4 0 0 1-4 4H4" }],
-]);
-export const Cpu =  mk([
-  ["rect", { width: "16", height: "16", x: "4", y: "4", rx: "2" }],
-  ["rect", { width: "6", height: "6", x: "9", y: "9", rx: "1" }],
-  ["path", { d: "M15 2v2" }],
-  ["path", { d: "M15 20v2" }],
-  ["path", { d: "M2 15h2" }],
-  ["path", { d: "M2 9h2" }],
-  ["path", { d: "M20 15h2" }],
-  ["path", { d: "M20 9h2" }],
-  ["path", { d: "M9 2v2" }],
-  ["path", { d: "M9 20v2" }],
 ]);
 export const ExternalLink =  mk([
   ["path", { d: "M15 3h6v6" }],
@@ -130,10 +114,6 @@ export const Info =  mk([
   ["circle", { cx: "12", cy: "12", r: "10" }],
   ["path", { d: "M12 16v-4" }],
   ["path", { d: "M12 8h.01" }],
-]);
-export const KeyRound =  mk([
-  ["path", { d: "M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" }],
-  ["circle", { cx: "16.5", cy: "7.5", r: ".5", fill: "currentColor" }],
 ]);
 export const Layers =  mk([
   ["path", { d: "m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z" }],

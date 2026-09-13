@@ -3,6 +3,8 @@ export interface LineChange {
   removed?: boolean;
   value: string;
   count: number;
+  oldStart?: number;
+  newStart?: number;
 }
 function splitLines(value: string): string[] {
   if (!value) return [];
@@ -23,7 +25,7 @@ export function diffLines(before: string, after: string): LineChange[] {
   const added = newLines.slice(prefix, newEnd);
   const result: LineChange[] = [];
   const push = (change: Omit<LineChange, "count"> & { count?: number }) => {
-    const count = change.count ?? (change.value ? change.value.match(/\r\n|\n|[^\r\n]+/g)?.length ?? 1 : 0);
+    const count = change.count ?? splitLines(change.value).length;
     const last = result[result.length - 1];
     if (last && last.added === change.added && last.removed === change.removed) {
       last.value += change.value;
@@ -35,6 +37,9 @@ export function diffLines(before: string, after: string): LineChange[] {
     if (added.length) push({ added: true, value: added.join("") });
   } else if (!added.length) {
     push({ removed: true, value: removed.join("") });
+  } else if (removed.length * added.length > 4_000_000) {
+    push({ removed: true, value: removed.join("") });
+    push({ added: true, value: added.join("") });
   } else {
     const backtracks = traceback(removed, added);
     let oldIndex = 0;
@@ -48,6 +53,14 @@ export function diffLines(before: string, after: string): LineChange[] {
     }
   }
   if (oldEnd < oldLines.length) push({ value: oldLines.slice(oldEnd).join("") });
+  let oldAt = 1;
+  let newAt = 1;
+  for (const h of result) {
+    h.oldStart = oldAt;
+    h.newStart = newAt;
+    if (h.removed || (!h.added && !h.removed)) oldAt += h.count;
+    if (h.added || (!h.added && !h.removed)) newAt += h.count;
+  }
   return result;
 }
 function traceback(oldLines: string[], newLines: string[]): [number, number][] {

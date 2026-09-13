@@ -12,6 +12,7 @@ import { saveBlob } from "../compress/store.js";
 import { defaultPolicy, nextModelForHandoff, type HandoffRecord } from "../routing/handoff.js";
 import { generateDependencyGraph, formatDepGraph } from "../util/dep-graph.js";
 import { tools as builtinTools, type ToolContext, killActiveProcesses, checkWriteGlob } from "./tools.js";
+import { markUsed } from "../util/suggestions.js";
 import { buildToolSpecs, isMcpToolSpec, parseMcpToolSpec } from "./tool-specs.js";
 import { SubagentRunner } from "./subagent.js";
 import { runHooks } from "../hooks/hooks.js";
@@ -28,8 +29,10 @@ import type { ChatMessage, ModelDescriptor, ToolCall, TurnUsage, ExecutionEvent 
 import type { ProcessStep, TodoItem } from "../protocol/process.js";
 const PSEUDO_TOOLS = new Set(["handoff", "subagent.spawn", "subagent.askParent", "clarification.askUser", "checkpoint.revert", "checkpoint.list", "checkpoint.compare", "mode.switch", "skill.use", "memory.add", "memory.note", "session.exportTrace"]);
 const TOOL_OUTPUT_MAX_CHARS = 8000;
+const MODE_FREE_TOOLS = new Set(["mode.switch", "clarification.askUser", "subagent.askParent"]);
+const HOOKED_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.customRun", "shell.editCustomRun", "shell.runCustomRun", "browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "web.fetch", "web.search", "mcp.call", "file.edit", "file.write", "file.read", "subagent.spawn", "handoff", "notebook.editCell", "notebook.addCell", "notebook.deleteCell", "notebook.execute", "test.run", "git.stage", "git.commit", "git.push", "git.branch", "git.pr", "hooks.create", "hooks.update", "hooks.delete", "rule.create", "skill.use", "mode.switch", "checkpoint.revert", "todo.write", "wait.forCommand", "context.retrieve", "memory.add", "memory.note"]);
 const REMOTE_OUT = /^web\.|^mcp\.(?:call|resources|prompts)|browser\.read(?:Page|Dom)/;
-const LOCAL_OUT = /^(?:shell\.|file\.read|file\.grep|file\.semanticSearch|context\.retrieve|subagent\.spawn|handoff)/;
+export const LOCAL_OUT = /^(?:shell\.|file\.read|file\.grep|file\.semanticSearch|syms\.context|context\.retrieve|subagent\.spawn|handoff)/;
 export interface AgentEventSink {
   message(m: ChatMessage): void;
   assistantDelta?(id: string, text: string): void;
@@ -292,13 +295,18 @@ export class Agent {
   addCommandPrefix(prefix: string) { this.sessionApprovals.commandPrefixMemory.push({ prefix, createdAt: new Date().toISOString() }); }
   getSessionApprovals(): SessionApprovals { return this.sessionApprovals; }
   switchMode(slug: string): string {
+    return this.setMode(slug, "");
+  }
+  private setMode(slug: string, turnId: string): string {
     const modeDef = this.opts.modeRegistry.get(slug);
     if (!modeDef) return `Unknown mode '${slug}'`;
+    const oldMode = this.currentMode;
     this.currentMode = slug;
     this.userRequestedMode = slug;
     this.applyModeModelOverride(modeDef);
     const output = `Switched to '${slug}' mode.\n\n${modeDef.roleDefinition}`;
     this.messages.push({ id: randomUUID(), role: "system", content: output, ts: Date.now() });
+    if (turnId) this.pushTimeline({ type: "mode_switch", turnId, from: oldMode, to: slug, ts: Date.now() });
     return output;
   }
   addContextMessage(content: string): void {
@@ -327,11 +335,15 @@ export class Agent {
   }
   private emptyResponseRetries = 0;
   private static readonly MAX_EMPTY_RESPONSE_RETRIES = 2;
+  private turnDepth = 0;
+  private static readonly MAX_TURNS_PER_MESSAGE = 40;
+  private turnEpoch = 0;
   async send(text: string, attachments?: { uri: string; preview?: string }[], images?: string[]): Promise<void> {
     if (this.active) throw new Error("Agent is already running");
     this.verifyAttempts = 0;
     this.consecutiveStreamErrors = 0;
     this.emptyResponseRetries = 0;
+    this.turnDepth = 0;
     if (!this.sessionStarted) {
       this.sessionStarted = true;
       runHooks({
@@ -346,7 +358,7 @@ export class Agent {
             this.messages.push({ id: randomUUID(), role: "system", content: `[Hooks] ${d.contextMessage}`, ts: Date.now() });
           }
         }
-      });
+      }).catch(() => {});
     }
     void runHooks({
       event: "user.submit",
@@ -354,7 +366,7 @@ export class Agent {
       sandboxProfile: this.opts.toolContext.sandboxProfile,
       mode: this.currentMode,
       userMessage: text,
-    });
+    }).catch(() => {});
     this.turnCount++;
     if (this.todoItems.length > 0 && this.turnCount - this.lastTodoUpdate > 5) {
       const staleFor = this.turnCount - this.lastTodoUpdate;
@@ -367,7 +379,7 @@ export class Agent {
     }
     let content = text;
     if (attachments && attachments.length) {
-      const lines = attachments.map((a) => `- ${a.preview ?? a.uri}`);
+      const lines = attachments.slice(0, 20).map((a) => `- ${(a.preview ?? a.uri).slice(0, 4000)}`);
       content = `${text}\n\nAttached context:\n${lines.join("\n")}`;
     }
     const modeDef = this.opts.modeRegistry.get(this.currentMode);
@@ -386,7 +398,16 @@ export class Agent {
     }
     const userMsg: ChatMessage = { id: randomUUID(), role: "user", content, ts: Date.now() };
     if (images?.length) {
-      (userMsg as unknown as Record<string, unknown>).images = images.map((dataUrl) => ({ type: "image_url", image_url: { url: dataUrl } }));
+      const MAX_SEND_IMAGES = 8;
+      const MAX_SEND_IMAGE_BYTES = 8 * 1024 * 1024;
+      const kept: { type: string; image_url: { url: string } }[] = [];
+      let bytes = 0;
+      for (const dataUrl of images.slice(0, MAX_SEND_IMAGES)) {
+        bytes += dataUrl.length;
+        if (bytes > MAX_SEND_IMAGE_BYTES) break;
+        kept.push({ type: "image_url", image_url: { url: dataUrl } });
+      }
+      if (kept.length) (userMsg as unknown as Record<string, unknown>).images = kept;
     }
     this.messages.push(userMsg);
     this.sink.message(userMsg);
@@ -396,15 +417,17 @@ export class Agent {
   }
   async continue(): Promise<void> {
     if (this.active) return;
+    this.turnDepth = 0;
     await this.runTurn();
   }
   async stop() {
+    this.turnEpoch++;
     void runHooks({
       event: "stop",
       workspaceRoot: this.opts.workspaceRoot,
       sandboxProfile: this.opts.toolContext.sandboxProfile,
       mode: this.currentMode,
-    });
+    }).catch(() => {});
     this.abortController?.abort();
     const killed = killActiveProcesses();
     for (const [id, p] of this.pendingClarifications) {
@@ -479,7 +502,7 @@ export class Agent {
       this.archivedMessages = [];
     }
     const removed = totalBefore - newMessages.length;
-    this.messages = newMessages;
+    this.messages = sanitizeToolChains(newMessages);
     const keptSteps = this.steps.filter((s) => (s.ts ?? 0) <= revertTs);
     this.steps = keptSteps;
     this.sink.steps(keptSteps);
@@ -493,6 +516,7 @@ export class Agent {
   }
   async guidance(text: string) {
     if (!this.active) return;
+    this.turnEpoch++;
     this.abortController?.abort();
     const killed = killActiveProcesses();
     for (let i = this.steps.length - 1; i >= 0; i--) {
@@ -528,9 +552,22 @@ export class Agent {
   }
   private async runTurn() {
     this.active = true;
+    const epoch = this.turnEpoch;
     const turnId = randomUUID();
     this.sink.turnStart(turnId);
     this.abortController = new AbortController();
+    this.turnDepth++;
+    if (this.turnDepth > Agent.MAX_TURNS_PER_MESSAGE) {
+      this.turnDepth--;
+      const msg = `Turn budget exhausted (${Agent.MAX_TURNS_PER_MESSAGE} tool rounds for one message). Summarize progress and stop; ask the user how to proceed.`;
+      const budgetMsg: ChatMessage = { id: randomUUID(), role: "assistant", content: msg, ts: Date.now() };
+      this.messages.push(budgetMsg);
+      this.sink.message(budgetMsg);
+      this.sink.turnEnd(turnId, false, msg);
+      this.sink.done();
+      this.active = false;
+      return;
+    }
     try {
       const current = this.getCurrentModel();
       const modeDef = this.opts.modeRegistry.get(this.currentMode);
@@ -553,7 +590,7 @@ export class Agent {
             const beforeArr = this.messages;
             const before = beforeArr.length;
             const afterArr = await compactAsync(beforeArr, (msgs) => this.summarizeForCompaction(msgs, current), cfg);
-            if (afterArr !== beforeArr && afterArr.length !== beforeArr.length) {
+            if (afterArr !== beforeArr) {
               this.messages = afterArr;
               const dropped = beforeArr.filter((m) => !afterArr.includes(m));
               let archivedNote = "";
@@ -621,6 +658,7 @@ export class Agent {
       let firstTextTs = 0;
       let thoughtStart = 0;
       this.toolAcc.clear();
+      this.toolAccPrevContent.clear();
       for await (const ev of stream.events) {
         if (this.abortController.signal.aborted) break;
         if (ev.type !== "error") this.consecutiveStreamErrors = 0;
@@ -702,7 +740,7 @@ export class Agent {
               this.lastPromptTokens = Math.max(this.lastPromptTokens, ev.usage.prompt);
             }
             this.sink.usage(turnUsage, this.usageByModel);
-            recordSuccess(model.id, usedProvider!.id);
+            if (usedProvider) recordSuccess(model.id, usedProvider.id);
             break;
           }
           case "error": {
@@ -719,13 +757,14 @@ export class Agent {
         }
       }
       if (thoughtStart) this.finalizeThought(assistantId, thoughtStart);
-      this.pushTimeline({ type: "model_call", turnId, modelId: model.id, providerId: usedProvider!.id, tier: model.tier, ts: Date.now(), durationMs: Date.now() - turnTs, usage: this.usageByModel[model.id] });
+      const providerId = usedProvider?.id ?? "unknown";
+      this.pushTimeline({ type: "model_call", turnId, modelId: model.id, providerId, tier: model.tier, ts: Date.now(), durationMs: Date.now() - turnTs, usage: this.usageByModel[model.id] });
       const abortedTurn = this.abortController.signal.aborted;
       const isEmptyResponse = !abortedTurn && !text.trim() && toolCalls.length === 0;
       if (isEmptyResponse && this.emptyResponseRetries < Agent.MAX_EMPTY_RESPONSE_RETRIES) {
         this.emptyResponseRetries++;
         if (thinking) {
-          const thoughtMsg: ChatMessage = { id: assistantId, role: "assistant", content: "", thinking, ts: firstTextTs || turnTs, meta: { modelId: model.id, providerId: usedProvider!.id, tier: model.tier } };
+          const thoughtMsg: ChatMessage = { id: assistantId, role: "assistant", content: "", thinking, ts: firstTextTs || turnTs, meta: { modelId: model.id, providerId, tier: model.tier } };
           this.messages.push(thoughtMsg);
           this.sink.message(thoughtMsg);
         }
@@ -741,7 +780,7 @@ export class Agent {
         thinking: thinking || undefined,
         toolCalls: (!abortedTurn && toolCalls.length) ? toolCalls : undefined,
         ts: firstTextTs || turnTs,
-        meta: { modelId: model.id, providerId: usedProvider!.id, tier: model.tier },
+        meta: { modelId: model.id, providerId, tier: model.tier },
       };
       if (text.trim() || thinking || (!abortedTurn && toolCalls.length)) {
         this.messages.push(finalAssistant);
@@ -802,27 +841,24 @@ export class Agent {
         this.sink.error((e as Error).message);
       }
     } finally {
-      this.active = false;
+      if (this.turnEpoch === epoch) this.active = false;
+      this.turnDepth = Math.max(0, this.turnDepth - 1);
     }
   }
   private partitionToolCalls(toolCalls: ToolCall[]): ToolCall[][] {
     const phases: ToolCall[][] = [];
-    const parallelSafe = (n: string): boolean =>
-      n !== "handoff" && n !== "subagent.spawn";
+    const parallelSafe = (n: string): boolean => READ_TOOLS.has(n);
     let current: ToolCall[] = [];
     for (const tc of toolCalls) {
-      if (current.length === 0) {
-        current.push(tc);
+      if (!parallelSafe(tc.name)) {
+        if (current.length) {
+          phases.push(current);
+          current = [];
+        }
+        phases.push([tc]);
         continue;
       }
-      const curSafe = parallelSafe(current[0].name);
-      const newSafe = parallelSafe(tc.name);
-      if (curSafe === newSafe) {
-        current.push(tc);
-      } else {
-        phases.push(current);
-        current = [tc];
-      }
+      current.push(tc);
     }
     if (current.length) phases.push(current);
     return phases;
@@ -843,7 +879,114 @@ export class Agent {
       }
     }
   }
+  private async checkToolApproval(tc: ToolCall, turnId: string, category: string): Promise<{ ok: boolean; allowExternalPath: boolean }> {
+    const extra = buildApprovalExtra(tc.name, tc.args, this.opts.workspaceRoot);
+    const allowExternalPath = !!(extra?.filePath && extra.workspaceRoot && classifyWorkspacePath(extra.workspaceRoot, extra.filePath).external);
+    const level = resolveApproval(this.opts.approvalsConfig ?? DEFAULT_APPROVALS, this.sessionApprovals, category, extra);
+    if (level !== "ask") return { ok: true, allowExternalPath };
+    const approvalHandler = this.opts.approveShell ?? this.opts.toolContext.requestApproval;
+    if (!approvalHandler) {
+      this.appendToolOutput(tc.id, `Tool '${tc.name}' requires approval and no approval handler is set.`, false);
+      this.messages.push({ id: randomUUID(), role: "tool", content: `Approval required but no handler available.`, toolCallId: tc.id, ts: Date.now() });
+      return { ok: false, allowExternalPath };
+    }
+    const rawCommand = extra?.command || String(tc.args.command ?? "");
+    const approved = await approvalHandler(`Run ${tc.name}?\n\n${prettyToolSummary(tc.name, tc.args)}`, rawCommand ? { command: rawCommand } : undefined);
+    this.pushTimeline({ type: "approval", turnId, toolName: tc.name, category, allowed: approved, ts: Date.now() });
+    if (!approved) {
+      this.appendToolOutput(tc.id, `Tool '${tc.name}' denied by user.`, false);
+      this.messages.push({ id: randomUUID(), role: "tool", content: "Denied by user.", toolCallId: tc.id, ts: Date.now() });
+      return { ok: false, allowExternalPath };
+    }
+    return { ok: true, allowExternalPath };
+  }
+  private async runPreToolHooks(tc: ToolCall): Promise<boolean> {
+    const decisions = await runHooks({
+      event: "pre.tool",
+      tool: tc.name,
+      args: tc.args,
+      workspaceRoot: this.opts.workspaceRoot,
+      sandboxProfile: this.opts.toolContext.sandboxProfile,
+      mode: this.currentMode,
+    });
+    for (const hookDecision of decisions) {
+      if (hookDecision.decision === "deny") {
+        const msg = hookDecision.message ?? `Tool '${tc.name}' blocked by pre.tool hook.`;
+        this.appendToolOutput(tc.id, msg, false);
+        this.messages.push({ id: randomUUID(), role: "tool", content: msg, toolCallId: tc.id, ts: Date.now() });
+        return false;
+      }
+      if (hookDecision.decision === "ask") {
+        const approvalHandler = this.opts.approveShell ?? this.opts.toolContext.requestApproval;
+        if (!approvalHandler || !await approvalHandler(hookDecision.message ?? `Hook requires approval for ${tc.name}`)) {
+          this.appendToolOutput(tc.id, `Tool '${tc.name}' denied by user via hook.`, false);
+          return false;
+        }
+      }
+      if (hookDecision.modifiedArgs) tc.args = hookDecision.modifiedArgs;
+    }
+    return true;
+  }
+  private async listCheckpointEntries(sinceMs?: number): Promise<{ turnId: string; ts: number; files: string; label: string }[]> {
+    const turns = await this.store.listTurns(this.opts.workspaceRoot);
+    const entries: { turnId: string; ts: number; files: string; label: string }[] = [];
+    for (const turn of turns) {
+      const snap = await this.store.load(this.opts.workspaceRoot, turn);
+      if (!snap) continue;
+      if (sinceMs !== undefined && !Number.isNaN(sinceMs) && snap.ts < sinceMs) continue;
+      entries.push({ turnId: turn, ts: snap.ts, files: Object.keys(snap.files).join(", ") || "(none)", label: snap.label ?? "" });
+    }
+    entries.sort((a, b) => b.ts - a.ts || (a.turnId < b.turnId ? -1 : a.turnId > b.turnId ? 1 : 0));
+    return entries;
+  }
+  private denyTool(tc: ToolCall, content: string): void {
+    this.appendToolOutput(tc.id, content, false);
+    this.messages.push({ id: randomUUID(), role: "tool", content, toolCallId: tc.id, ts: Date.now() });
+  }
+  async revertFileToLastSnapshot(rel: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const entries = await this.listCheckpointEntries();
+      for (const e of entries) {
+        const snap = await this.store.load(this.opts.workspaceRoot, e.turnId);
+        const hash = snap?.files[rel];
+        if (typeof hash !== "string" || hash === "__none__") continue;
+        const result = await this.store.restoreSingleFile(this.opts.workspaceRoot, rel, hash);
+        if (result.errors?.length) return { ok: false, error: result.errors.join("; ") };
+        return { ok: true };
+      }
+      return { ok: false, error: "no snapshot covers this file" };
+    } catch (e) {
+      return { ok: false, error: (e as Error)?.message ?? String(e) };
+    }
+  }
   private async executeToolCall(tc: ToolCall, turnId: string) {
+    try {
+      markUsed("tool", tc.name);
+      if (tc.name === "mcp.call" && typeof tc.args?.server === "string") markUsed("mcp", String(tc.args.server));
+      if ((tc.name === "skill.use" || tc.name === "skill.read") && typeof tc.args?.name === "string") markUsed("skill", String(tc.args.name));
+      if (tc.name.startsWith("rule.") && typeof (tc.args as Record<string, unknown>)?.name === "string") markUsed("rule", String((tc.args as Record<string, unknown>).name));
+      if (tc.name.startsWith("memory.")) markUsed("memory", "memory");
+      if (isMcpToolSpec(tc.name)) {
+        const parsed = parseMcpToolSpec(tc.name);
+        if (parsed) markUsed("mcp", parsed.server);
+      }
+} catch {  }
+    if (!MODE_FREE_TOOLS.has(tc.name)) {
+      const modeDef = this.opts.modeRegistry.get(this.currentMode);
+      if (modeDef && !modeDef.allowedTools.includes(tc.name)) {
+        this.appendToolOutput(tc.id, `Tool '${tc.name}' is not allowed in '${this.currentMode}' mode.`, false);
+        this.messages.push({ id: randomUUID(), role: "tool", content: `Tool '${tc.name}' not allowed in ${this.currentMode} mode.`, toolCallId: tc.id, ts: Date.now() });
+        return;
+      }
+    }
+    if (tc.name === "subagent.spawn" && !this.opts.isMain) {
+      this.denyTool(tc, "Subagents cannot spawn further subagents.");
+      return;
+    }
+    if (tc.name === "clarification.askUser" && !this.opts.isMain) {
+      this.denyTool(tc, "Subagents must use subagent.askParent, not askUser.");
+      return;
+    }
     if (isMcpToolSpec(tc.name)) {
       const parsed = parseMcpToolSpec(tc.name);
       if (!parsed) {
@@ -860,8 +1003,16 @@ export class Agent {
         return;
       }
       const resolved = this.mcpReverse.get(tc.name);
-      const server = resolved?.server ?? parsed.server;
-      const tool = resolved?.tool ?? parsed.tool;
+      if (!resolved) {
+        this.appendToolOutput(tc.id, `Unknown MCP tool '${tc.name}': no live server provides it. Ask the user to check Tools > MCP.`, false);
+        this.messages.push({ id: randomUUID(), role: "tool", content: `Unknown MCP tool '${tc.name}'.`, toolCallId: tc.id, ts: Date.now() });
+        return;
+      }
+      const server = resolved.server;
+      const tool = resolved.tool;
+      if (!await this.runPreToolHooks(tc)) return;
+      const checked = await this.checkToolApproval(tc, turnId, "mcp");
+      if (!checked.ok) return;
       const result = await mcp.call(server, tool, tc.args);
       const raw = typeof result.output === "string" ? result.output : JSON.stringify(result.output, null, 2);
       const guarded = await this.guardToolOutput(tc.name, raw);
@@ -904,8 +1055,15 @@ export class Agent {
         output = "No current model to hand off from.";
         ok = false;
       } else {
-        const target = nextModelForHandoff(this.registry, current, direction, defaultPolicy);
+        const target = nextModelForHandoff(this.registry, current, direction, defaultPolicy, this.handoffs);
         if (target) {
+          void runHooks({
+            event: "pre.handoff",
+            workspaceRoot: this.opts.workspaceRoot,
+            sandboxProfile: this.opts.toolContext.sandboxProfile,
+            mode: this.currentMode,
+            extra: { direction, fromModelId: current.id, toModelId: target.id, reason },
+          }).catch(() => {});
           this.handoffs.push({ turnId, direction, fromModelId: current.id, toModelId: target.id, reason, ts: Date.now(), costIncurred: 0 });
           this.sink.handoff(current.label, target.label, reason);
           this.pushTimeline({ type: "handoff", turnId, fromModel: current.id, toModel: target.id, direction, reason, ts: Date.now() });
@@ -937,18 +1095,22 @@ export class Agent {
         workspaceRoot: this.opts.workspaceRoot,
         sandboxProfile: this.opts.toolContext.sandboxProfile,
         mode: this.currentMode,
-      });
+      }).catch(() => {});
       if (!this.opts.isMain) {
-        this.appendToolOutput(tc.id, "Subagents cannot spawn further subagents.", false);
+        this.denyTool(tc, "Subagents cannot spawn further subagents.");
         return;
       }
       const parent = this.getCurrentModel();
       if (!parent) {
-        this.appendToolOutput(tc.id, "No current model to spawn from.", false);
+        this.denyTool(tc, "No current model to spawn from.");
         return;
       }
       const batch = Array.isArray(tc.args.batch) ? (tc.args.batch as any[]) : null;
       if (batch && batch.length) {
+        if (batch.length > 5) {
+          this.denyTool(tc, `Too many subagents requested (${batch.length}; maximum is 5). Split the work into smaller batches.`);
+          return;
+        }
         const specs: import("./subagent.js").SubagentSpec[] = batch.map((b: any) => ({
           name: String(b.name ?? "subagent"),
           instructions: String(b.instructions ?? ""),
@@ -1082,7 +1244,7 @@ export class Agent {
     }
     if (tc.name === "clarification.askUser") {
       if (!this.opts.isMain) {
-        this.appendToolOutput(tc.id, "Subagents must use subagent.askParent, not askUser.", false);
+        this.denyTool(tc, "Subagents must use subagent.askParent, not askUser.");
         return;
       }
       const question = String(tc.args.question ?? "");
@@ -1103,9 +1265,9 @@ export class Agent {
       const rawIdx = tc.args.index !== undefined ? Number(tc.args.index) : undefined;
       let resolvedId: string | undefined = targetId || undefined;
       if (!resolvedId && rawIdx !== undefined) {
-        const turns = await this.store.listTurns(this.opts.workspaceRoot);
+        const entries = await this.listCheckpointEntries();
         const idx = rawIdx - 1;
-        if (idx >= 0 && idx < turns.length) resolvedId = turns[idx];
+        if (idx >= 0 && idx < entries.length) resolvedId = entries[idx].turnId;
       }
       if (!resolvedId) {
         this.appendToolOutput(tc.id, "checkpoint.revert requires a valid index (1=most recent) or turnId. Use checkpoint.list to see available turns.", false);
@@ -1127,6 +1289,9 @@ export class Agent {
         return;
       }
       const { restored, conflicts } = await this.retract(resolvedId, true);
+      this.verifyAttempts = 0;
+      this.consecutiveMistakes = 0;
+      this.emptyResponseRetries = 0;
       const conflictNote = conflicts.length ? ` (note: ${conflicts.length} file(s) had uncommitted changes since snapshot: ${conflicts.map((f) => `\`${f}\``).join(", ")})` : "";
       const snapFileCount = Object.keys(snap.files ?? {}).length;
       const output = restored.length
@@ -1139,22 +1304,11 @@ export class Agent {
       return;
     }
     if (tc.name === "checkpoint.list") {
-      const turns = await this.store.listTurns(this.opts.workspaceRoot);
-      if (turns.length === 0) {
-        this.appendToolOutput(tc.id, "No checkpoints available.", true);
-        this.messages.push({ id: randomUUID(), role: "tool", content: "No checkpoints available.", toolCallId: tc.id, ts: Date.now() });
-        return;
-      }
-      const limit = Math.max(1, Math.min(Number(tc.args.limit ?? 25) || 25, 200));
       const sinceRaw = String(tc.args.since ?? "").trim();
       const sinceMs = sinceRaw ? Date.parse(sinceRaw) : NaN;
-      let entries: { turnId: string; ts: number; files: string; label: string }[] = [];
-      for (const turn of turns) {
-        const snap = await this.store.load(this.opts.workspaceRoot, turn);
-        if (!snap) continue;
-        if (!Number.isNaN(sinceMs) && snap.ts < sinceMs) continue;
-        entries.push({ turnId: turn, ts: snap.ts, files: Object.keys(snap.files).join(", ") || "(none)", label: snap.label ?? "" });
-      }
+      const limit = Math.max(1, Math.min(Number(tc.args.limit ?? 25) || 25, 200));
+      const turns = await this.store.listTurns(this.opts.workspaceRoot);
+      let entries = await this.listCheckpointEntries(sinceMs);
       entries = entries.slice(0, limit);
       const lines = entries.map((e, i) => `${i + 1}. turnId=${e.turnId}  ts=${new Date(e.ts).toISOString()}  files=${e.files}${e.label ? `  label="${e.label}"` : ""}`);
       const totalNote = `(${turns.length} checkpoint(s) total${Number.isNaN(sinceMs) ? `, showing latest ${entries.length} - pass limit or since (ISO date) to widen` : `, showing ${entries.length} since ${sinceRaw}`})`;
@@ -1169,10 +1323,10 @@ export class Agent {
       const indexB = tc.args.indexB ? Number(tc.args.indexB) : undefined;
       const turnIdA = tc.args.turnIdA ? String(tc.args.turnIdA) : undefined;
       const turnIdB = tc.args.turnIdB ? String(tc.args.turnIdB) : undefined;
-      const turns = await this.store.listTurns(this.opts.workspaceRoot);
+      const entries = await this.listCheckpointEntries();
       const resolveId = (idOrIndex: string | number | undefined): string | undefined => {
-        if (typeof idOrIndex === "number" && idOrIndex > 0 && idOrIndex <= turns.length) return turns[idOrIndex - 1];
-        if (typeof idOrIndex === "string" && turns.includes(idOrIndex)) return idOrIndex;
+        if (typeof idOrIndex === "number" && idOrIndex > 0 && idOrIndex <= entries.length) return entries[idOrIndex - 1].turnId;
+        if (typeof idOrIndex === "string" && entries.some((e) => e.turnId === idOrIndex)) return idOrIndex;
         return undefined;
       };
       const idA = resolveId(turnIdA ?? indexA);
@@ -1204,19 +1358,13 @@ export class Agent {
         this.messages.push({ id: randomUUID(), role: "tool", content: "mode.switch requires a slug.", toolCallId: tc.id, ts: Date.now() });
         return;
       }
-      const targetMode = this.opts.modeRegistry.get(slug);
-      if (!targetMode) {
+      const output = this.setMode(slug, turnId);
+      if (output.startsWith("Unknown mode")) {
         const available = this.opts.modeRegistry.list().map((m) => m.slug).join(", ");
         this.appendToolOutput(tc.id, `Unknown mode '${slug}'. Available modes: ${available}`, false);
         this.messages.push({ id: randomUUID(), role: "tool", content: `Unknown mode '${slug}'. Available modes: ${available}.`, toolCallId: tc.id, ts: Date.now() });
         return;
       }
-      const oldMode = this.currentMode;
-      this.currentMode = slug;
-      this.userRequestedMode = slug;
-      this.applyModeModelOverride(targetMode);
-      this.pushTimeline({ type: "mode_switch", turnId, from: oldMode, to: slug, ts: Date.now() });
-      const output = `Switched from '${oldMode}' to '${slug}' mode.\n\n## ${slug} mode\n\n${targetMode.roleDefinition}`;
       this.appendToolOutput(tc.id, `Switched to ${slug} mode.`, true);
       this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
       if (slug === "audit") {
@@ -1310,7 +1458,7 @@ export class Agent {
     if (tc.name === "skill.use") {
       const name = String(tc.args.name ?? "").trim();
       if (!name) {
-        this.appendToolOutput(tc.id, "skill.use requires a `name` argument.", false);
+        this.denyTool(tc, "skill.use requires a `name` argument.");
         return;
       }
       const reg = (this.opts.toolContext as unknown as ToolContext).skillRegistry;
@@ -1344,7 +1492,7 @@ export class Agent {
       const category = String(tc.args.category ?? "preferences");
       const content = String(tc.args.content ?? "");
       if (!content) {
-        this.appendToolOutput(tc.id, "memory.add requires a `content` argument.", false);
+        this.denyTool(tc, "memory.add requires a `content` argument.");
         return;
       }
       const memScan = scanInjection(content);
@@ -1364,7 +1512,7 @@ export class Agent {
     if (tc.name === "memory.note") {
       const content = String(tc.args.content ?? "");
       if (!content) {
-        this.appendToolOutput(tc.id, "memory.note requires a `content` argument.", false);
+        this.denyTool(tc, "memory.note requires a `content` argument.");
         return;
       }
       const noteScan = scanInjection(content);
@@ -1375,7 +1523,7 @@ export class Agent {
       const { appendNote } = await import("../memory/notes.js");
       const r = await appendNote(this.opts.workspaceRoot, content.slice(0, 500));
       if (r.index < 0) {
-        this.appendToolOutput(tc.id, "memory.note requires a `content` argument.", false);
+        this.denyTool(tc, "memory.note requires a `content` argument.");
         return;
       }
       this.appendToolOutput(tc.id, `Note saved (entry ${r.index} of ${r.total}).`, true);
@@ -1384,43 +1532,17 @@ export class Agent {
     }
     if (!def) return;
     const modeDef = this.opts.modeRegistry.get(this.currentMode);
-    if (modeDef && !modeDef.allowedTools.includes(tc.name)) {
-      this.appendToolOutput(tc.id, `Tool '${tc.name}' is not allowed in '${this.currentMode}' mode.`, false);
-      this.messages.push({ id: randomUUID(), role: "tool", content: `Tool '${tc.name}' not allowed in ${this.currentMode} mode.`, toolCallId: tc.id, ts: Date.now() });
-      return;
-    }
-    const hookTools = new Set(["shell.run", "browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "web.fetch", "web.search", "mcp.call", "file.edit", "file.write", "file.read", "subagent.spawn", "handoff", "notebook.editCell", "notebook.addCell", "notebook.deleteCell", "notebook.execute"]);
-    if (hookTools.has(tc.name)) {
-      const decisions = await runHooks({
-        event: "pre.tool",
-        tool: tc.name,
-        args: tc.args,
-        workspaceRoot: this.opts.workspaceRoot,
-        sandboxProfile: this.opts.toolContext.sandboxProfile,
-        mode: this.currentMode,
-      });
-      for (const hookDecision of decisions) {
-        if (hookDecision.decision === "deny") {
-          const msg = hookDecision.message ?? `Tool '${tc.name}' blocked by pre.tool hook.`;
-          this.appendToolOutput(tc.id, msg, false);
-          this.messages.push({ id: randomUUID(), role: "tool", content: msg, toolCallId: tc.id, ts: Date.now() });
-          return;
-        }
-        if (hookDecision.decision === "ask") {
-          const approvalHandler = this.opts.approveShell ?? this.opts.toolContext.requestApproval;
-          if (!approvalHandler || !await approvalHandler(hookDecision.message ?? `Hook requires approval for ${tc.name}`)) {
-            this.appendToolOutput(tc.id, `Tool '${tc.name}' denied by user via hook.`, false);
-            return;
-          }
-        }
-        if (hookDecision.modifiedArgs) tc.args = hookDecision.modifiedArgs;
-      }
+    if (HOOKED_TOOLS.has(tc.name) || isMcpToolSpec(tc.name)) {
+      if (!await this.runPreToolHooks(tc)) return;
     }
     const target = (tc.args.path as string) ?? (tc.args.file as string);
     const shouldSnapshot = target && this.opts.enabledTools.has(tc.name);
     const isShellOrBrowser = tc.name === "shell.run" || tc.name.startsWith("browser.");
     const isMcpMutation = tc.name === "mcp.create" || tc.name === "mcp.remove" || tc.name === "mcp.toggle";
-    if (shouldSnapshot || isShellOrBrowser || isMcpMutation) {
+    const isOtherMutator = tc.name === "test.run" || tc.name === "wait.forCommand" || tc.name === "notebook.execute" ||
+      GIT_WRITE_TOOLS.has(tc.name) || HOOK_WRITE_TOOLS.has(tc.name) || tc.name === "rule.create" ||
+      tc.name === "shell.backgroundRun" || tc.name === "shell.write";
+    if (shouldSnapshot || isShellOrBrowser || isMcpMutation || isOtherMutator) {
       try {
         const label = tc.name === "shell.run"
           ? `shell.run: ${String(tc.args.command ?? "").slice(0, 60)}`
@@ -1439,7 +1561,7 @@ export class Agent {
     if (WRITE_TOOLS.has(tc.name)) {
       const writeFilePath = String(tc.args.path);
       if (modeDef?.writeGlob) {
-        const check = checkWriteGlob(writeFilePath, modeDef.writeGlob);
+        const check = checkWriteGlob(writeFilePath, modeDef.writeGlob, this.opts.workspaceRoot);
         if (!check.allowed) {
           const msg = `Write blocked by mode '${this.currentMode}': path '${writeFilePath}' does not match writeGlob pattern '${modeDef.writeGlob}'. Switch to a different mode via mode.switch or narrow your edit scope.`;
           this.appendToolOutput(tc.id, msg, false);
@@ -1451,25 +1573,9 @@ export class Agent {
     const approvalCategory = categoryForTool(tc.name);
     let allowExternalPath = false;
     if (approvalCategory) {
-      const extra = buildApprovalExtra(tc.name, tc.args, this.opts.workspaceRoot);
-      allowExternalPath = !!(extra?.filePath && extra.workspaceRoot && classifyWorkspacePath(extra.workspaceRoot, extra.filePath).external);
-      const level = resolveApproval(this.opts.approvalsConfig ?? DEFAULT_APPROVALS, this.sessionApprovals, approvalCategory, extra);
-      if (level === "ask") {
-        const approvalHandler = this.opts.approveShell ?? this.opts.toolContext.requestApproval;
-        if (!approvalHandler) {
-          this.appendToolOutput(tc.id, `Tool '${tc.name}' requires approval and no approval handler is set.`, false);
-          this.messages.push({ id: randomUUID(), role: "tool", content: `Approval required but no handler available.`, toolCallId: tc.id, ts: Date.now() });
-          return;
-        }
-        const rawCommand = extra?.command || String(tc.args.command ?? "");
-        const approved = await approvalHandler(`Run ${tc.name}?\n\n${prettyToolSummary(tc.name, tc.args)}`, rawCommand ? { command: rawCommand } : undefined);
-        this.pushTimeline({ type: "approval", turnId, toolName: tc.name, category: approvalCategory, allowed: approved, ts: Date.now() });
-        if (!approved) {
-          this.appendToolOutput(tc.id, `Tool '${tc.name}' denied by user.`, false);
-          this.messages.push({ id: randomUUID(), role: "tool", content: "Denied by user.", toolCallId: tc.id, ts: Date.now() });
-          return;
-        }
-      }
+      const checked = await this.checkToolApproval(tc, turnId, approvalCategory);
+      if (!checked.ok) return;
+      allowExternalPath = checked.allowExternalPath;
     }
     const ctx: ToolContext = {
       ...this.opts.toolContext,
@@ -1536,7 +1642,7 @@ export class Agent {
           this.messages.push({ id: randomUUID(), role: "system", content: `[Hooks] ${d.contextMessage}`, ts: Date.now() });
         }
       }
-    });
+    }).catch(() => {});
     if (result.touchedFiles && result.touchedFiles.length && this.opts.fileContextTracker) {
       const kind = isEditOrWrite ? "edit" : "read";
       for (const f of result.touchedFiles) this.opts.fileContextTracker.touch(f, kind);
@@ -1577,14 +1683,14 @@ export class Agent {
   }
   private async askModel(question: string, options: string[], parentModel?: import("../protocol/protocol.js").ModelDescriptor): Promise<string> {
     const model = parentModel ?? this.getCurrentModel();
-    if (!model) return options[options.length - 1] ?? "";
+    if (!model) return "";
     const decision = pickProvider(this.registry, model);
-    if (!decision) return options[options.length - 1] ?? "";
+    if (!decision) return "";
       const transport = transportFor(decision.provider);
       try {
         const optsStr = options.map((o, i) => `${i + 1}. ${o}`).join("\n");
         const prompt: ChatMessage[] = [
-          { id: randomUUID(), role: "system", content: `You are an agentic coding assistant. A subagent you delegated work to is asking for your approval. Answer with ONLY a single digit (1 or 2) corresponding to the option. Do not explain.`, ts: Date.now() },
+          { id: randomUUID(), role: "system", content: `You are an agentic coding assistant. A subagent you delegated work to is asking for your approval. Answer with ONLY a single digit (1-${options.length}) corresponding to the option. Do not explain.`, ts: Date.now() },
           { id: randomUUID(), role: "user", content: `${question}\n\nOptions:\n${optsStr}`, ts: Date.now() },
         ];
         const stream = await transport.stream({
@@ -1602,17 +1708,18 @@ export class Agent {
         if (ev.type === "error") break;
       }
       const answer = text.trim();
-      const digitMatch = answer.match(/^[12]/);
+      const digitMatch = answer.match(/^(\d+)/);
       if (digitMatch) {
-        const idx = parseInt(digitMatch[0]) - 1;
+        const idx = parseInt(digitMatch[1], 10) - 1;
         if (idx >= 0 && idx < options.length) return options[idx];
       }
       const lower = answer.toLowerCase();
-      if (lower.includes(options[options.length - 1].toLowerCase())) return options[options.length - 1];
-      if (lower.includes(options[0].toLowerCase())) return options[0];
-      return options[options.length - 1];
+      for (let i = 0; i < options.length; i++) {
+        if (options[i] && lower.includes(options[i].toLowerCase())) return options[i];
+      }
+      return "";
     } catch {
-      return options[options.length - 1] ?? "";
+      return "";
     }
   }
   private askUserInteractive(question: string, options: string[]): Promise<string> {
@@ -1881,7 +1988,7 @@ function redactAuditData<T>(value: T): T {
 }
 function addUsage(a: TurnUsage | undefined, b: TurnUsage): TurnUsage {
   return {
-    prompt: Math.max(a?.prompt ?? 0, b.prompt),
+    prompt: (a?.prompt ?? 0) + b.prompt,
     completion: (a?.completion ?? 0) + b.completion,
     thinking: (a?.thinking ?? 0) + b.thinking,
     cost: (a?.cost ?? 0) + b.cost,
@@ -1990,6 +2097,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "handoff": return `Handing off (${args.direction ?? "escalate"})`;
       case "clarification.askUser": return `Asking: ${clip(String(args.question ?? ""), 80)}`;
       case "file.semanticSearch": return `Searching: ${clip(String(args.query ?? ""), 80)}`;
+      case "syms.context": return `Building context: ${clip(String(args.query ?? ""), 80)}`;
       case "web.fetch": return `Fetching ${clip(String(args.url ?? ""))}`;
       case "web.search": return `Searching for: ${clip(String(args.query ?? ""), 60)}`;
       case "mode.switch": return `Switching to ${String(args.slug ?? "")} mode`;
@@ -2088,6 +2196,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "checkpoint.list": return "Failed to list checkpoints";
       case "checkpoint.compare": return "Failed to compare checkpoints";
       case "file.semanticSearch": return `Semantic search failed: ${clip(String(args.query ?? ""))}`;
+      case "syms.context": return `Code context failed: ${clip(String(args.query ?? ""))}`;
       case "web.fetch": return `Failed to fetch ${clip(String(args.url ?? ""))}`;
       case "web.search": return `Search failed: ${clip(String(args.query ?? ""))}`;
       case "mode.switch": return `Failed to switch to ${String(args.slug ?? "")} mode`;
@@ -2185,6 +2294,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
     case "handoff": return `Handed off (${args.direction ?? "escalate"})`;
     case "clarification.askUser": return `Asked: ${clip(String(args.question ?? ""), 80)}`;
     case "file.semanticSearch": return `Searched: ${clip(String(args.query ?? ""), 80)}`;
+    case "syms.context": return `Built context: ${clip(String(args.query ?? ""), 80)}`;
     case "web.fetch": return `Fetched ${clip(String(args.url ?? ""))}`;
     case "web.search": return `Searched for: ${clip(String(args.query ?? ""), 60)}`;
     case "mode.switch": return `Switched to ${String(args.slug ?? "")} mode`;
@@ -2230,7 +2340,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
     default: return name;
   }
 }
-const READ_TOOLS = new Set(["file.read", "file.grep", "file.glob", "file.semanticSearch", "notebook.read"]);
+export const READ_TOOLS = new Set(["file.read", "file.grep", "file.glob", "file.semanticSearch", "syms.context", "notebook.read"]);
 const WRITE_TOOLS = new Set(["file.edit", "file.write", "notebook.editCell", "notebook.addCell", "notebook.deleteCell"]);
 const SHELL_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.customRun", "shell.editCustomRun", "shell.runCustomRun"]);
 const BROWSER_TOOLS = new Set(["browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.close", "browser.hover", "browser.scroll", "browser.waitFor", "browser.console", "browser.network", "browser.domSnapshot", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "browser.newTab", "browser.switchTab", "browser.closeTab", "browser.listTabs", "browser.intercept", "browser.unintercept"]);
@@ -2241,6 +2351,7 @@ const HOOK_WRITE_TOOLS = new Set(["hooks.create", "hooks.update", "hooks.delete"
 const CODE_EXECUTE_TOOLS = new Set(["test.run", "browser.runCode", "notebook.execute"]);
 function categoryForTool(name: string): string | undefined {
   if (READ_TOOLS.has(name)) return "read";
+  if (isMcpToolSpec(name)) return "mcp";
   if (WRITE_TOOLS.has(name)) return "write.local";
   if (SHELL_TOOLS.has(name)) return "shell.other";
   if (GIT_WRITE_TOOLS.has(name)) return "shell.other";
@@ -2274,6 +2385,10 @@ function buildApprovalExtra(name: string, args: Record<string, unknown>, workspa
     return { toolName: name, command: `${name} ${String(m.event ?? "")}${m.tool ? ` (tool: ${String(m.tool)})` : ""}`.trim(), workspaceRoot };
   }
   if (MCP_TOOLS.has(name)) return { toolName: name, mcpServer: String(args.server ?? args.name ?? ""), workspaceRoot };
+  if (isMcpToolSpec(name)) {
+    const parsed = parseMcpToolSpec(name);
+    return { toolName: name, mcpServer: parsed?.server ?? "", workspaceRoot };
+  }
   return { toolName: name };
 }
 function prettyToolSummary(name: string, args: Record<string, unknown>): string {
@@ -2332,6 +2447,7 @@ function prettyToolSummary(name: string, args: Record<string, unknown>): string 
     case "lsp.problemsFor": return `Check problems in ${clip(String(args.path ?? ""))}`;
     case "todo.write": return `Update plan (${Array.isArray(args.items) ? `${args.items.length} items` : "items"})`;
     case "file.semanticSearch": return `Semantic search for ${clip(String(args.query ?? ""), 40)}`;
+    case "syms.context": return `Code context for ${clip(String(args.query ?? ""), 40)}`;
     case "mcp.resources/list": return `List MCP resources on ${args.server ?? ""}`;
     case "mcp.resources/read": return `Read MCP resource ${args.uri ?? ""}`;
     case "mcp.prompts/list": return `List MCP prompts on ${args.server ?? ""}`;

@@ -12,6 +12,7 @@ function isRateLimitError(msg: string): boolean {
   const m = msg.toLowerCase();
   return m.includes("429") || m.includes("rate limit") || m.includes("too many requests");
 }
+const AUTH_FAILURE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid[ .-]?api[ .-]?key|api[ .-]?key.*invalid|authentication (failed|error|required))/i;
 export type { StreamEvent, StreamHandle };
 export interface RoutingDecision {
   model: ModelDescriptor;
@@ -114,6 +115,7 @@ async function tryEach<T>(
   opts?: { rerank?: boolean },
 ): Promise<T> {
   const MAX_RETRIES = 4;
+  const authFails = new Map<string, number>();
   for (let cycle = 0; cycle <= MAX_RETRIES; cycle++) {
     let lastErr: unknown;
     let attempt = 0;
@@ -122,22 +124,38 @@ async function tryEach<T>(
       const prov = registry.resolveProvider(ref);
       if (!prov) continue;
       const keys = prov.apiKeys?.length ? prov.apiKeys : prov.apiKey ? [prov.apiKey] : [];
-      const effProv = keys.length > 1 ? { ...prov, apiKey: keys[attempt % keys.length] } : prov;
+      if ((authFails.get(ref.id) ?? 0) >= Math.max(1, keys.length)) continue;
       const t0 = Date.now();
-      try {
-        const out = await fn(ref, effProv, attempt++);
-        perf.recordSuccess(ref.id, model.id, Date.now() - t0);
-        return out;
-      } catch (e) {
-        lastErr = e;
-        if ((e as Error)?.name === "AbortError") throw e;
-        const msg = (e as Error)?.message ?? String(e);
-        if (isRateLimitError(msg)) anyRateLimited = true;
-        perf.recordFailure(ref.id, model.id);
-        if (e instanceof StallError) perf.recordStall(ref.id, model.id);
+      let keyIdx = 0;
+      for (;;) {
+        const effProv = keys.length > 1 ? { ...prov, apiKey: keys[keyIdx % keys.length] } : prov;
+        try {
+          const out = await fn(ref, effProv, attempt++);
+          perf.recordSuccess(ref.id, model.id, Date.now() - t0);
+          return out;
+        } catch (e) {
+          lastErr = e;
+          if ((e as Error)?.name === "AbortError") throw e;
+          const msg = (e as Error)?.message ?? String(e);
+          if (AUTH_FAILURE.test(msg)) {
+            const n = (authFails.get(ref.id) ?? 0) + 1;
+            authFails.set(ref.id, n);
+            keyIdx++;
+            if (keyIdx < Math.max(1, keys.length)) continue;
+            perf.recordFailure(ref.id, model.id);
+            break;
+          }
+          if (isRateLimitError(msg)) anyRateLimited = true;
+          perf.recordFailure(ref.id, model.id);
+          if (e instanceof StallError) perf.recordStall(ref.id, model.id);
+          break;
+        }
       }
     }
     if (!anyRateLimited || cycle >= MAX_RETRIES) {
+      if (lastErr === undefined) {
+        throw new Error(`All providers for ${model.id} rejected the configured credentials. Check API keys.`);
+      }
       throw new Error(`All providers for ${model.id} failed: ${(lastErr as Error)?.message ?? lastErr}`);
     }
     await new Promise((r) => setTimeout(r, Math.min(2000 * 2 ** cycle, 60_000)));
@@ -169,7 +187,7 @@ function timeoutFor(pid: string, mid: string, userMs: number | undefined, minMs:
   const adaptive = Math.round(lat * 3);
   return Math.max(minMs, Math.min(maxMs, adaptive));
 }
-function wrapStall(handle: StreamHandle, pid: string, stallMs: number, firstByteMs: number): StreamHandle {
+function wrapStall(handle: StreamHandle, pid: string, stallMs: number, firstByteMs: number, primed = false): StreamHandle {
   const q = new AsyncEventQueue<StreamEvent>();
   let dead = false;
   let sTimer: ReturnType<typeof setTimeout> | undefined;
@@ -192,15 +210,23 @@ function wrapStall(handle: StreamHandle, pid: string, stallMs: number, firstByte
   };
   void (async () => {
     try {
-      fbTimer = setTimeout(onFirstByteTimeout, firstByteMs);
+      let fbExtensions = 0;
+      if (primed) {
+        got = true;
+      } else {
+        fbTimer = setTimeout(onFirstByteTimeout, firstByteMs);
+      }
       for await (const ev of handle.events) {
         if (dead) break;
         if (ev.type === "ping") {
-          if (!got) {
-            if (fbTimer) { clearTimeout(fbTimer); fbTimer = setTimeout(onFirstByteTimeout, firstByteMs); }
-          } else if (sTimer) {
+          if (got && sTimer) {
             clearTimeout(sTimer);
             sTimer = setTimeout(onStall, stallMs);
+          } else if (!got && fbTimer) {
+            fbExtensions++;
+            if (fbExtensions > 30) continue;
+            clearTimeout(fbTimer);
+            fbTimer = setTimeout(onFirstByteTimeout, firstByteMs);
           }
           continue;
         }
@@ -226,8 +252,64 @@ export async function routeStream(
     const stallMs = timeoutFor(ref.id, model.id, opts?.stallMs, MIN_STALL_MS, MAX_STALL_MS, DEFAULT_STALL_MS);
     const fbMs = timeoutFor(ref.id, model.id, opts?.firstByteMs, MIN_FB_MS, MAX_FB_MS, DEFAULT_FB_MS);
     const raw = await create({ model, provider: prov, ref, attempt: n });
-    return wrapStall(raw, ref.id, stallMs, fbMs);
+    const primed = await primeFirstEvent(raw, ref.id, model.id, fbMs);
+    return wrapStall(primed, ref.id, stallMs, fbMs, true);
   }, { rerank: opts?.rerank });
+}
+async function primeFirstEvent(raw: StreamHandle, pid: string, mid: string, firstByteMs: number): Promise<StreamHandle> {
+  const iter = raw.events[Symbol.asyncIterator]();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), firstByteMs);
+  });
+  try {
+    const raced = await Promise.race([iter.next(), timeout]);
+    if (timer) clearTimeout(timer);
+    if (raced === "timeout") {
+      try { raw.abort(); } catch {}
+      try { await iter.return?.(); } catch {}
+      perf.recordStall(pid, mid);
+      throw new StallError(`Provider ${pid} timed out waiting for first byte (${firstByteMs}ms)`, pid, firstByteMs);
+    }
+    const first = raced as IteratorResult<StreamEvent>;
+    if (first.done) {
+      try { raw.abort(); } catch {}
+      try { await iter.return?.(); } catch {}
+      throw new StallError(`Provider ${pid} closed the stream without events`, pid, firstByteMs);
+    }
+    if (first.value?.type === "error") {
+      try { raw.abort(); } catch {}
+      try { await iter.return?.(); } catch {}
+      throw new Error(first.value.message || `Provider ${pid} failed before first byte`);
+    }
+    const q = new AsyncEventQueue<StreamEvent>();
+    q.push(first.value);
+    void (async () => {
+      try {
+        let r = await iter.next();
+        while (!r.done) {
+          q.push(r.value);
+          r = await iter.next();
+        }
+      } catch (e) {
+        q.push({ type: "error", message: (e as Error)?.message ?? String(e) });
+      } finally {
+        q.close();
+      }
+    })();
+    return {
+      events: q,
+      abort: () => {
+        try { raw.abort(); } catch {}
+        try { q.close(); } catch {}
+      },
+    };
+  } catch (e) {
+    if (timer) clearTimeout(timer);
+    if (e instanceof StallError) throw e;
+    try { raw.abort(); } catch {}
+    throw e;
+  }
 }
 export function estimateCost(model: ModelDescriptor, usage: { prompt: number; completion: number; thinking?: number }, ref?: Pick<ProviderRef, "costPer1mIn" | "costPer1mOut">): number {
   const t = usage.thinking ?? 0;

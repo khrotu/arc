@@ -1,6 +1,6 @@
 {
   "name": "@arc/host",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "type": "commonjs",
   "main": "dist/index.js",
@@ -24,7 +24,7 @@
     "./util": {
       "types": "./dist/util/index.d.ts",
       "import": "./dist/util/index.js",
-      "require": "./dist/util/index.js"
+      "require": "./dist/util/index.cjs"
     }
   },
   "scripts": {
@@ -37,9 +37,6 @@
     "@types/node": "22.18.0",
     "typescript": "5.5.4",
     "vitest": "4.1.10"
-  },
-  "optionalDependencies": {
-    "playwright": "1.62.0"
   },
   "peerDependencies": {
     "playwright": "1.55.1"

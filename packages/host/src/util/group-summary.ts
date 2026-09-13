@@ -15,6 +15,7 @@ const TOOL_PHRASES: Record<string, ToolPhrase> = {
   "file.grep": ["Searched", "files"],
   "file.glob": ["Globbed", "files"],
   "file.semanticSearch": ["Ran", "semantic search"],
+  "syms.context": ["Built", "code context"],
   "shell.run": ["Ran", "commands"],
   "shell.backgroundRun": ["Started", "background process"],
   "shell.check": ["Checked", "processes"],

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getArcDir } from "../arc-dir.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
-import { readBodyLimited } from "../security/network.js";
+import { readBodyLimited, safeFetch } from "../security/network.js";
 export interface OrFrontEntry {
   slug?: string;
   name?: string;
@@ -25,8 +25,8 @@ export interface OrFrontOptions {
   cachePath?: string;
   ttlMs?: number;
 }
-let cache: { at: number; entries: OrFrontEntry[] } | undefined;
-let inflight: Promise<OrFrontEntry[] | undefined> | undefined;
+let cache: { at: number; entries: OrFrontEntry[]; key: string } | undefined;
+let inflight: { key: string; task: Promise<OrFrontEntry[] | undefined> } | undefined;
 function defaultCachePath(): string {
   return path.join(getArcDir(), "or-front.json");
 }
@@ -36,39 +36,44 @@ export function parseOrFront(json: unknown): OrFrontEntry[] {
 }
 export async function getOrFrontEntries(opts: OrFrontOptions = {}): Promise<OrFrontEntry[] | undefined> {
   const ttl = opts.ttlMs ?? OR_FRONT_TTL_MS;
-  if (cache && Date.now() - cache.at < ttl) return cache.entries;
-  if (!inflight) {
-    inflight = (async () => {
+  const key = `${opts.cachePath ?? defaultCachePath()}|${ttl}`;
+  if (cache && cache.key === key && Date.now() - cache.at < ttl) return cache.entries;
+  if (!inflight || inflight.key !== key) {
+    let taskRef: Promise<OrFrontEntry[] | undefined> | undefined;
+    const task = (async () => {
       const cachePath = opts.cachePath ?? defaultCachePath();
       try {
         const parsed = JSON.parse(await fs.promises.readFile(cachePath, "utf8")) as { fetched?: unknown; data?: unknown };
         const fetched = typeof parsed.fetched === "number" ? parsed.fetched : undefined;
         const entries = parseOrFront(parsed.data);
         if (fetched && entries.length) {
-          cache = { at: fetched, entries };
+          cache = { at: fetched, entries, key };
           if (Date.now() - fetched < ttl) return entries;
         }
       } catch {  }
       try {
-        const fetchImpl = opts.fetchImpl ?? fetch;
         const init: RequestInit = { headers: { accept: "application/json" }, signal: AbortSignal.timeout(20_000) };
         if (opts.proxyUrl) (init as Record<string, unknown>).dispatcher = makeProxyDispatcher(opts.proxyUrl);
-        const res = await fetchImpl(OR_FRONT_URL, init);
+        const res = opts.fetchImpl
+          ? await opts.fetchImpl(OR_FRONT_URL, init)
+          : await safeFetch(OR_FRONT_URL, init);
         if (!res.ok) throw new Error(`or-front download failed (${res.status})`);
         const entries = parseOrFront(JSON.parse(await readBodyLimited(res, OR_FRONT_MAX_BYTES)));
         if (!entries.length) throw new Error("empty or-front payload");
-        cache = { at: Date.now(), entries };
+        cache = { at: Date.now(), entries, key };
         try {
           await fs.promises.mkdir(path.dirname(cachePath), { recursive: true, mode: 0o700 });
           await fs.promises.writeFile(cachePath, JSON.stringify({ fetched: cache.at, data: entries }), { encoding: "utf-8", mode: 0o600 });
         } catch {  }
         return entries;
       } catch {
-        return cache?.entries;
+        return cache?.key === key ? cache.entries : undefined;
       } finally {
-        inflight = undefined;
+        if (inflight?.task === taskRef) inflight = undefined;
       }
     })();
+    taskRef = task;
+    inflight = { key, task };
   }
-  return inflight;
+  return inflight.task;
 }

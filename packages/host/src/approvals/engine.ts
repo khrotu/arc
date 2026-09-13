@@ -80,6 +80,7 @@ export function resolveApproval(
     return taskConfig[actual] ?? "ask";
   }
   if (category === "write.local" || category === "write.external") {
+    if (extra?.filePath && extra?.workspaceRoot && isProtectedConfigPath(extra.workspaceRoot, extra.filePath)) return "ask";
     const actual = classifyWritePath(extra?.filePath, extra?.workspaceRoot);
     return taskConfig[actual] ?? "ask";
   }

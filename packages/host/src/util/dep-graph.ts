@@ -37,6 +37,7 @@ export async function generateDependencyGraph(workspaceRoot: string): Promise<De
       const content = await fs.readFile(file, "utf-8");
       const deps = new Set<string>();
       let m: RegExpExecArray | null;
+      pattern.re.lastIndex = 0;
       while ((m = pattern.re.exec(content)) !== null) {
         const imp = m[1] || m[2] || m[3];
         if (!imp) continue;
@@ -47,8 +48,11 @@ export async function generateDependencyGraph(workspaceRoot: string): Promise<De
     } catch { }
   }
   const nodes: DepNode[] = [];
-  const fileSet = new Set(imports.keys());
-  for (const file of fileSet) {
+  const parseable = files
+    .filter((f) => PATTERNS.some((p) => p.ext.test(path.extname(f))))
+    .map((f) => path.relative(workspaceRoot, f));
+  const fileSet = new Set(parseable);
+  for (const file of parseable) {
     const outImports = [...(imports.get(file) ?? [])].filter((d) => fileSet.has(d));
     const importedBy: string[] = [];
     for (const [f, deps] of imports) {

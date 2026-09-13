@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { safeFetch } from "../security/network.js";
+import { safeFetch, readBodyLimited, assertSafeUrl } from "../security/network.js";
 import type { McpOAuthTokens } from "./client.js";
 export interface OAuthClientInfo {
   clientId: string;
@@ -44,15 +44,14 @@ function parseWwwAuthenticate(header: string): Record<string, string> {
   while ((m = re.exec(params))) out[m[1].toLowerCase()] = m[2];
   return out;
 }
-async function fetchJson(url: string): Promise<Record<string, unknown> | undefined> {
+async function fetchJson(url: string, sameOrigin?: string): Promise<Record<string, unknown> | undefined> {
   try {
-    const res = await safeFetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+    const res = await safeFetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) }, sameOrigin ? { sameOrigin } : {});
     if (!res.ok) {
       await res.body?.cancel().catch(() => undefined);
       return undefined;
     }
-    const text = await res.text();
-    if (text.length > 1024 * 1024) return undefined;
+    const text = await readBodyLimited(res, 1024 * 1024);
     const json = JSON.parse(text);
     return json && typeof json === "object" && !Array.isArray(json) ? json as Record<string, unknown> : undefined;
   } catch {
@@ -77,15 +76,30 @@ export async function discoverAuthorizationServer(serverUrl: string, wwwAuthenti
     const params = parseWwwAuthenticate(wwwAuthenticate);
     const resourceMeta = params["resource_metadata"];
     if (resourceMeta) {
-      const meta = await fetchJson(resourceMeta) as ProtectedResourceMetadata | undefined;
+      const meta = await fetchJson(resourceMeta, new URL(serverUrl).origin) as ProtectedResourceMetadata | undefined;
       issuer = meta?.authorization_servers?.[0];
       resourceScopes = meta?.scopes_supported;
     }
   }
   if (!issuer) issuer = new URL(serverUrl).origin;
+  let issuerOrigin: string;
+  try {
+    const issuerUrl = new URL(issuer);
+    if (issuerUrl.protocol !== "https:") return undefined;
+    issuerOrigin = issuerUrl.origin;
+  } catch {
+    return undefined;
+  }
   for (const candidate of wellKnownCandidates(issuer)) {
-    const metadata = await fetchJson(candidate) as AuthServerMetadata | undefined;
+    const metadata = await fetchJson(candidate, issuerOrigin) as AuthServerMetadata | undefined;
     if (metadata?.authorization_endpoint && metadata.token_endpoint) {
+      try {
+        const authUrl = new URL(String(metadata.authorization_endpoint));
+        const tokenUrl = new URL(String(metadata.token_endpoint));
+        if (authUrl.protocol !== "https:" || tokenUrl.protocol !== "https:") continue;
+      } catch {
+        continue;
+      }
       return { metadata: { ...metadata, scopes_supported: metadata.scopes_supported ?? resourceScopes }, issuer };
     }
   }
@@ -106,7 +120,7 @@ export async function registerClient(registrationEndpoint: string, redirectUri: 
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`Dynamic client registration failed (HTTP ${res.status}).`);
-  const json = JSON.parse(await res.text()) as Record<string, unknown>;
+  const json = JSON.parse(await readBodyLimited(res, 1024 * 1024)) as Record<string, unknown>;
   const clientId = typeof json.client_id === "string" ? json.client_id : undefined;
   if (!clientId) throw new Error("Dynamic client registration returned no client_id.");
   return { clientId, clientSecret: typeof json.client_secret === "string" ? json.client_secret : undefined };
@@ -131,9 +145,20 @@ export async function runAuthorizationFlow(opts: OAuthFlowOptions): Promise<OAut
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   let client: OAuthClientInfo | undefined;
   if (metadata.registration_endpoint) {
+    try {
+      const regUrl = new URL(String(metadata.registration_endpoint));
+      if (regUrl.protocol !== "https:") throw new Error("registration endpoint must use https");
+      await assertSafeUrl(regUrl, { sameOrigin: new URL(opts.serverUrl).origin });
+    } catch (e) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw e instanceof Error ? e : new Error("Invalid registration endpoint.");
+    }
     client = await registerClient(metadata.registration_endpoint, redirectUri).catch(() => undefined);
   }
-  if (!client) throw new Error("MCP OAuth requires dynamic client registration, which the authorization server does not support.");
+  if (!client) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("MCP OAuth requires dynamic client registration, which the authorization server does not support.");
+  }
   const state = base64Url(crypto.randomBytes(16));
   const { verifier, challenge } = pkce();
   const resource = new URL(opts.serverUrl).origin;
@@ -148,16 +173,37 @@ export async function runAuthorizationFlow(opts: OAuthFlowOptions): Promise<OAut
   authUrl.searchParams.set("code_challenge_method", "S256");
   authUrl.searchParams.set("resource", resource);
   const codePromise = new Promise<string>((resolve, reject) => {
+    let settled = false;
     server.on("request", (req: IncomingMessage, res: ServerResponse) => {
+      if (settled) {
+        res.writeHead(410, { "content-type": "text/plain" });
+        res.end("Authorization already completed.");
+        return;
+      }
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (req.method !== "GET" || url.pathname !== "/callback") {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("Not found.");
+        return;
+      }
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
+      const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
       res.writeHead(200, { "content-type": "text/html" });
-      res.end(`<!doctype html><html><body style="font-family:sans-serif;background:#1e1e1e;color:#ccc;display:flex;align-items:center;justify-content:center;height:100vh"><p>${error ? `Authorization failed: ${error}` : "Authorization complete. You can close this tab."}</p></body></html>`);
-      if (error) reject(new Error(`Authorization failed: ${error} (${url.searchParams.get("error_description") ?? ""})`));
-      else if (url.searchParams.get("state") !== state) reject(new Error("OAuth state mismatch."));
-      else if (code) resolve(code);
-      else reject(new Error("Authorization callback contained no code."));
+      res.end(`<!doctype html><html><body style="font-family:sans-serif;background:#1e1e1e;color:#ccc;display:flex;align-items:center;justify-content:center;height:100vh"><p>${error ? `Authorization failed: ${esc(error)}` : "Authorization complete. You can close this tab."}</p></body></html>`);
+      if (error) {
+        settled = true;
+        reject(new Error(`Authorization failed: ${error} (${url.searchParams.get("error_description") ?? ""})`));
+      } else if (url.searchParams.get("state") !== state) {
+        settled = true;
+        reject(new Error("OAuth state mismatch."));
+      } else if (code) {
+        settled = true;
+        resolve(code);
+      } else {
+        settled = true;
+        reject(new Error("Authorization callback contained no code."));
+      }
     });
   });
   await opts.openExternal(authUrl.toString());
@@ -211,7 +257,7 @@ async function tokenRequest(endpoint: string, body: URLSearchParams): Promise<Mc
     body: body.toString(),
     signal: AbortSignal.timeout(15_000),
   });
-  const text = await res.text();
+  const text = await readBodyLimited(res, 1024 * 1024);
   let json: Record<string, unknown> = {};
   try { json = JSON.parse(text) as Record<string, unknown>; } catch {}
   if (!res.ok || typeof json.access_token !== "string") {

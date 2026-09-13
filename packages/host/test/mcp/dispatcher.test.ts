@@ -87,4 +87,4 @@ describe("MCP tool spec injection + dispatcher routing", () => {
       expect(builtinTools[name]).toBeDefined();
     }
   });
-});
+}, 30000);

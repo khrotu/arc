@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { sanitizeToolChains } from "../src/agent/agent";
+import { toApiToolName, fromApiToolName } from "../src/providers/transport";
 import type { ChatMessage } from "../src/protocol/protocol";
 function msg(over: Partial<ChatMessage> & { id: string }): ChatMessage {
   return { role: "user", content: "", ts: 0, ...over };
@@ -61,13 +62,13 @@ describe("sanitizeToolChains", () => {
     expect(asst.toolCalls).toBeUndefined();
     expect(out).toHaveLength(3);
   });
-  it("strips toolCalls when only some responses are present", () => {
+  it("prunes unanswered calls but keeps answered ones", () => {
     const msgs = [
       msg({ id: "a", role: "assistant", content: "", toolCalls: [{ id: "x", name: "x", args: {} }, { id: "y", name: "y", args: {} }] }),
       msg({ id: "r1", role: "tool", content: "x done", toolCallId: "x" }),
     ];
     const out = sanitizeToolChains(msgs);
-    expect(out.find((m) => m.id === "a")!.toolCalls).toBeUndefined();
+    expect(out.find((m) => m.id === "a")!.toolCalls).toEqual([{ id: "x", name: "x", args: {} }]);
   });
   it("dedupes duplicate tool_call ids in the assistant message", () => {
     const msgs = [
@@ -76,5 +77,15 @@ describe("sanitizeToolChains", () => {
     ];
     const out = sanitizeToolChains(msgs);
     expect(out.find((m) => m.id === "a")!.toolCalls).toEqual([{ id: "c0", name: "x", args: {} }]);
+  });
+});
+describe("tool name codec", () => {
+  it("round-trips dots, slashes, underscores, and dunder names", () => {
+    for (const name of ["file.read", "mcp.call", "a/b", "x_y", "mcp__fs__echo", "a.b_c/d__e"]) {
+      expect(fromApiToolName(toApiToolName(name))).toBe(name);
+    }
+  });
+  it("emits API-safe names", () => {
+    expect(toApiToolName("file.read")).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 });

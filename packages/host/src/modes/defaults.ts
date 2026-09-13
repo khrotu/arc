@@ -1,17 +1,15 @@
 import type { Mode } from "./types.js";
 const PLAN_TOOLS = [
-  "file.read", "file.grep", "file.glob", "file.semanticSearch",
+  "file.read", "file.grep", "file.glob", "file.semanticSearch", "syms.context",
   "lsp.problems", "lsp.problemsFor",
   "web.fetch", "web.search",
   "todo.write",
   "clarification.askUser",
   "mode.switch",
   "memory.list", "memory.edit", "memory.delete", "memory.add", "memory.note",
-  "rule.list", "rule.read", "rule.create",
+  "rule.list", "rule.read",
   "skill.read", "skill.use",
-  "git.stage", "git.commit", "git.push", "git.branch", "git.pr",
   "git.diffStaged", "git.diffUnstaged", "git.changedFiles", "git.branchDiff", "git.commitMessage",
-  "hooks.list", "hooks.create", "hooks.update", "hooks.delete",
   "hooks.list",
   "wait.for", "wait.until", "context.retrieve",
   "session.exportTrace",
@@ -32,7 +30,7 @@ const FULL_TOOLS = [
   "mcp.resources/list", "mcp.resources/read", "mcp.prompts/list", "mcp.prompts/get",
   "subagent.spawn", "handoff", "clarification.askUser",
   "checkpoint.revert", "checkpoint.list", "checkpoint.compare",
-  "file.semanticSearch",
+  "file.semanticSearch", "syms.context",
   "mode.switch",
   "memory.list", "memory.edit", "memory.delete", "memory.add", "memory.note",
   "rule.list", "rule.read", "rule.create",
@@ -51,7 +49,7 @@ export const DEFAULT_MODES: Mode[] = [
       "You are in **Plan mode** - a careful planner and architect. Your goal is to gather information and produce a detailed, decision-complete implementation plan that another engineer or agent could execute without needing to make any decisions.\n\n" +
       "## Workflow (4 phases)\n\n" +
       "### Phase 1 - Silent investigation\n" +
-      "- Work silently: explore the codebase with `file.read`, `file.grep`, `file.glob`, `file.semanticSearch`, and `lsp.problems` without explaining every step.\n" +
+      "- Work silently: explore the codebase with `file.read`, `file.grep`, `file.glob`, `file.semanticSearch`, `syms.context`, and `lsp.problems` without explaining every step.\n" +
       "- Resolve every discoverable fact from the codebase before asking the user anything.\n" +
       "- Identify all related files, functions, classes, and affected call sites.\n" +
       "- Run non-mutating diagnostic commands (linters, static analysis, dry-run builds) if they help refine the plan. Do NOT edit or write any files.\n\n" +

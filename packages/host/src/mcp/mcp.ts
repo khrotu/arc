@@ -22,6 +22,7 @@ export interface McpServerInfo {
   name: string;
   enabled: boolean;
   tools: McpTool[];
+  toolCount: number;
   resources: McpResource[];
   prompts: McpPrompt[];
   transport: McpTransport;
@@ -47,6 +48,7 @@ export interface McpAuthDelegate {
 export class McpAggregator {
   private servers = new Map<string, ServerEntry>();
   private listeners = new Set<McpListener>();
+  private notificationSubs = new Set<(n: McpServerNotification) => void>();
   private persist?: McpPersistence;
   private roots: McpRoot[] = [];
   private samplingHandler?: McpSamplingHandler;
@@ -103,7 +105,6 @@ export class McpAggregator {
     const lower = name.toLowerCase();
     for (const [key, entry] of this.servers) {
       if (key.toLowerCase() === lower) return entry;
-      if (key.toLowerCase().endsWith("/" + lower) || key.toLowerCase().endsWith("_" + lower)) return entry;
     }
     return undefined;
   }
@@ -167,6 +168,7 @@ export class McpAggregator {
       name: s.config.name,
       enabled: s.config.enabled,
       tools: s.tools,
+      toolCount: s.tools.length,
       resources: s.resources,
       prompts: s.prompts,
       transport: s.config.transport,
@@ -241,8 +243,10 @@ export class McpAggregator {
   }
   onNotification(fn: (n: McpServerNotification) => void): () => void {
     const wrap = (n: McpServerNotification) => fn(n);
+    this.notificationSubs.add(wrap);
     for (const s of this.servers.values()) s.client?.on("notification", wrap);
     return () => {
+      this.notificationSubs.delete(wrap);
       for (const s of this.servers.values()) s.client?.off("notification", wrap);
     };
   }
@@ -265,34 +269,47 @@ export class McpAggregator {
     client.on("notification", (n) => {
       void this.handleNotification(entry, n);
     });
+    for (const sub of this.notificationSubs) client.on("notification", sub);
     client.on("status", () => this.notify());
     client.on("unhealthy", () => this.notify());
     client.on("exit", () => this.notify());
     client.setRequestHandler((method, params) => this.handleServerRequest(entry, method, params));
     await client.start();
     entry.client = client;
-    await new Promise((r) => setTimeout(r, 1500));
-    await this.refreshEntry(entry);
-    await new Promise((r) => setTimeout(r, 3000));
-    await this.refreshEntry(entry);
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const refreshed = await Promise.race([
+        this.refreshEntry(entry).catch(() => false),
+        new Promise<boolean>((r) => setTimeout(() => r(false), remaining)),
+      ]);
+      if (refreshed || Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
   }
-  private async refreshEntry(entry: ServerEntry) {
-    if (!entry.client) return;
+  private async refreshEntry(entry: ServerEntry): Promise<boolean> {
+    if (!entry.client) return false;
+    let ok = true;
     try {
       entry.tools = (await entry.client.listTools()).map((t) => ({ ...t, server: entry.config.name }));
     } catch {
       entry.tools = [];
+      ok = false;
     }
     try {
       entry.resources = (await entry.client.listResources()).map((r) => ({ ...r, server: entry.config.name }));
     } catch {
       entry.resources = [];
+      ok = false;
     }
     try {
       entry.prompts = (await entry.client.listPrompts()).map((p) => ({ ...p, server: entry.config.name }));
     } catch {
       entry.prompts = [];
+      ok = false;
     }
+    return ok;
   }
   private async handleNotification(entry: ServerEntry, n: McpServerNotification): Promise<void> {
     if (n.method === "notifications/tools/list_changed") {
