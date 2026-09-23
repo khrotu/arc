@@ -18,15 +18,15 @@
 
 ## Efficiency
 
-| Extension | VSIX Size (as of September 13th, 2026) |
+| Extension | VSIX Size (as of September 23rd, 2026) |
 | :--- | :--- |
-| **Arc** | [**0.27 MB***](#faq-vsix-size) |
-| Cline | 19.72 MB |
+| **Arc** | [**0.28 MB***](#faq-vsix-size) |
+| Cline | 19.76 MB |
 | Roo Code | 30.84 MB |
-| Kilo Code | 99.83 MB |
-| Claude Code | 101.34 MB |
+| Kilo Code | 98.60 MB |
+| Claude Code | 108.27 MB |
 | Continue | 114.16 MB |
-| Codex | 385.71 MB |
+| Codex | 442.79 MB |
 
 Here are the sizes visualized:
 

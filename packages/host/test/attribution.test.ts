@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attributionHeaders, opencodeSessionHeader, isOpencodeEndpoint, APP_VERSION } from "../src/providers/attribution";
+import { attributionHeaders, opencodeSessionHeader, isOpencodeEndpoint, APP_VERSION, OPENCODE_UA, OPENCODE_CLIENT, OPENCODE_VER_DEFAULT, setOpencodeVer } from "../src/providers/attribution";
 describe("attribution headers", () => {
   it("sends the OpenRouter dialect for openrouter with its own title header", () => {
     const h = attributionHeaders("openrouter");
@@ -27,7 +27,7 @@ describe("attribution headers", () => {
   });
   it("sends mandatory Copilot headers for github-copilot", () => {
     const h = attributionHeaders("github-copilot");
-    expect(h["copilot-integration-id"]).toBe("vscode-chat");
+    expect(h["copilot-integration-id"]).toBe("copilot-developer-cli");
     expect(h["editor-version"]).toBe(`Arc/${APP_VERSION}`);
     expect(h["user-agent"]).toBe(`Arc/${APP_VERSION}`);
   });
@@ -65,9 +65,28 @@ describe("attribution headers", () => {
     expect(isOpencodeEndpoint(undefined, "openai")).toBe(false);
   });
   it("emits x-opencode-session only for OpenCode endpoints with a conversation id", () => {
-    expect(opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", "conv-1")).toEqual({ "x-opencode-session": "conv-1" });
-    expect(opencodeSessionHeader("https://opencode.ai/zen/v1", "openai-compatible", "conv-1")).toEqual({ "x-opencode-session": "conv-1" });
-    expect(opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", undefined)).toEqual({});
+    const withConv = opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", "conv-1");
+    expect(withConv["x-opencode-session"]).toBe("conv-1");
+    expect(withConv["user-agent"]).toBe(OPENCODE_UA);
+    expect(withConv["x-opencode-client"]).toBe(OPENCODE_CLIENT);
+    expect(typeof withConv["x-opencode-request"]).toBe("string");
+    const compat = opencodeSessionHeader("https://opencode.ai/zen/v1", "openai-compatible", "conv-1");
+    expect(compat["x-opencode-session"]).toBe("conv-1");
+    const noConv = opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", undefined);
+    expect(noConv["user-agent"]).toBe(OPENCODE_UA);
+    expect(noConv["x-opencode-client"]).toBe(OPENCODE_CLIENT);
+    expect(typeof noConv["x-opencode-request"]).toBe("string");
+    expect(noConv["x-opencode-session"]).toBeUndefined();
+    expect(opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", "conv-1", "req-123")["x-opencode-request"]).toBe("req-123");
     expect(opencodeSessionHeader("https://api.openai.com/v1", "openai", "conv-1")).toEqual({});
+  });
+  it("uses OpenCode identity on Zen/Go endpoints", () => {
+    expect(attributionHeaders("opencode")["user-agent"]).toBe(OPENCODE_UA);
+    expect(attributionHeaders("opencode-go")["user-agent"]).toBe(OPENCODE_UA);
+  });
+  it("updates UA when cached version refreshes", () => {
+    setOpencodeVer("9.9.9");
+    expect(attributionHeaders("opencode")["user-agent"]).toBe("opencode/9.9.9");
+    setOpencodeVer(OPENCODE_VER_DEFAULT);
   });
 });

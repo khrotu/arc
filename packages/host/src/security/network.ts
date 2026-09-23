@@ -87,7 +87,11 @@ function pinnedDispatcher(addresses: string[]): unknown {
   try {
     const { Agent } = require("undici") as { Agent?: new (opts: unknown) => unknown };
     if (typeof Agent !== "function") return undefined;
-    const lookup = (_hostname: string, _opts: unknown, cb: (err: null, address: string, family: number) => void): void => {
+    const lookup = (_hostname: string, opts: { all?: boolean }, cb: (err: null, address: string | { address: string; family: number }[], family?: number) => void): void => {
+      if (opts?.all) {
+        cb(null, addresses.map((address) => ({ address, family: net.isIP(address) })));
+        return;
+      }
       const pick = addresses[0];
       cb(null, pick, net.isIP(pick) === 6 ? 6 : 4);
     };
@@ -113,9 +117,13 @@ export async function safeFetch(raw: string | URL, init: RequestInit = {}, polic
   }
   throw new Error("Too many redirects.");
 }
-function pinnedLookup(addresses: string[]): (hostname: string, opts: object, cb: (err: Error | null, address: string, family: number) => void) => void {
+function pinnedLookup(addresses: string[]): (hostname: string, opts: { all?: boolean }, cb: (err: Error | null, address: string | { address: string; family: number }[], family?: number) => void) => void {
   let cursor = 0;
-  return (_hostname, _opts, cb) => {
+  return (_hostname, opts, cb) => {
+    if (opts?.all) {
+      cb(null, addresses.map((address) => ({ address, family: net.isIP(address) })));
+      return;
+    }
     if (cursor >= addresses.length) {
       cb(new Error(`All ${addresses.length} resolved addresses failed.`), "", 4);
       return;

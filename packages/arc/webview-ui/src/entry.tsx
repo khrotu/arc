@@ -6,8 +6,8 @@ if (!root) {
   document.body.innerHTML = "<pre style='color:#f88;padding:20px'>Arc: #root element missing</pre>";
 } else {
   const capErrors = () => {
-    while (root.querySelectorAll("pre[data-arc-err]").length >= 3) {
-      root.querySelector("pre[data-arc-err]")?.remove();
+    while (document.body.querySelectorAll("pre[data-arc-err]").length >= 3) {
+      document.body.querySelector("pre[data-arc-err]")?.remove();
     }
   };
   window.addEventListener("error", (ev) => {
@@ -16,7 +16,7 @@ if (!root) {
     el.setAttribute("data-arc-err", "1");
     el.style.cssText = "color:#f88;padding:12px;white-space:pre-wrap;font:12px monospace;background:#2a1010;border:1px solid #f44;margin:8px;border-radius:4px;";
     el.textContent = `[arc webview error]\n${(ev as ErrorEvent).error?.stack ?? ev.message}`;
-    root.appendChild(el);
+    document.body.appendChild(el);
   });
   window.addEventListener("unhandledrejection", (ev) => {
     capErrors();
@@ -24,7 +24,7 @@ if (!root) {
     el.setAttribute("data-arc-err", "1");
     el.style.cssText = "color:#f88;padding:12px;white-space:pre-wrap;font:12px monospace;background:#2a1010;border:1px solid #f44;margin:8px;border-radius:4px;";
     el.textContent = `[arc webview unhandled rejection]\n${(ev.reason as Error)?.stack ?? String(ev.reason)}`;
-    root.appendChild(el);
+    document.body.appendChild(el);
   });
   try {
     const mode = (root.getAttribute("data-mode") as "sidebar" | "fullscreen") || "sidebar";

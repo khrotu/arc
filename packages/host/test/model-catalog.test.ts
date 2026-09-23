@@ -114,6 +114,31 @@ describe("groupProviderModels", () => {
     ], new Map());
     expect(grouped).toHaveLength(1);
   });
+  it("groups fast serving-tier variants under the base model without duplicate labels", async () => {
+    const map = catalogueFrom([{ id: "acme/gpt-6-astra", name: "Acme: GPT-6 Astra" }]);
+    const grouped = await groupProviderModels([
+      { slug: "acme/gpt-6-astra", providerId: "a" },
+      { slug: "acme/gpt-6-astra-fast", providerId: "a" },
+    ], map);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0].key).toBe("gpt-6-astra");
+    expect(grouped[0].label).toBe("GPT-6 Astra");
+    expect(grouped[0].providers).toEqual([
+      { slug: "acme/gpt-6-astra", providerId: "a" },
+      { slug: "acme/gpt-6-astra-fast", providerId: "a" },
+    ]);
+  });
+  it("disambiguates unknown variant suffixes instead of duplicating labels", async () => {
+    const map = catalogueFrom([{ id: "acme/gpt-6-luna", name: "Acme: GPT-6 Luna" }]);
+    const grouped = await groupProviderModels([
+      { slug: "copilot/gpt-6-luna", providerId: "vscode-lm" },
+      { slug: "copilot/gpt-6-luna-turbo", providerId: "vscode-lm" },
+    ], map);
+    expect(grouped).toHaveLength(2);
+    const labels = grouped.map((g) => g.label);
+    expect(new Set(labels).size).toBe(2);
+    expect(labels).toContain("GPT-6 Luna");
+  });
 });
 describe("listProviderModelSlugs caching", () => {
   const modelsResponse = (ids: string[]): Response =>

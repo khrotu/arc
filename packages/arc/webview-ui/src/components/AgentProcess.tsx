@@ -420,10 +420,6 @@ const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, 
       groupTitle = aiTitle;
     }
   }
-  // Toggle .is-stuck only while the header is actually pinned (stuck to the
-  // top of the scroll container), so the divider never shows on expanded /
-  // resting chains. Sentinel sits just above the header: when it scrolls out
-  // of view upward, the header is stuck.
   const sentinelRef = useRef<HTMLSpanElement>(null);
   const toggleRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {

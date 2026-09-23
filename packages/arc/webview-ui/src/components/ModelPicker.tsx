@@ -100,7 +100,7 @@ export default function ModelPicker({ models, currentModelId, onSelect, compact 
     return (
       <div className="arc-model">
         <button className="arc-model-trigger arc-model-trigger-empty">
-          <span className="arc-model-trigger-label">no models - open settings</span>
+          <span className="arc-model-trigger-label">no models</span>
         </button>
       </div>
     );

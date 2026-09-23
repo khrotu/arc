@@ -129,12 +129,25 @@ export function chargeStreamContent(budget: StreamContentBudget, delta: string):
   budget.bytes += Buffer.byteLength(delta);
   if (budget.bytes > MAX_STREAM_CONTENT_BYTES) throw new StreamContentLimitError();
 }
+export type TransportFactory = (provider: import("../protocol/protocol.js").ProviderConfig) => Transport | undefined;
+const customTransportFactories = new Map<string, TransportFactory>();
+export function registerTransport(kind: string, factory: TransportFactory): void {
+  customTransportFactories.set(kind, factory);
+}
+export function unregisterTransport(kind: string): void {
+  customTransportFactories.delete(kind);
+}
 import { openAICompatibleTransport } from "./openai-compatible.js";
 import { anthropicTransport } from "./anthropic.js";
 import { ollamaTransport } from "./ollama.js";
 export { openAICompatibleTransport, anthropicTransport, ollamaTransport };
 import type { TurnUsage } from "../protocol/protocol.js";
 export function transportFor(provider: import("../protocol/protocol.js").ProviderConfig): Transport {
+  const custom = customTransportFactories.get(provider.kind);
+  if (custom) {
+    const t = custom(provider);
+    if (t) return t;
+  }
   if (provider.kind === "ollama") return ollamaTransport;
   if (provider.kind === "anthropic") return anthropicTransport;
   if (provider.kind === "vscode-lm") {

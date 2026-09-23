@@ -16,7 +16,7 @@ export interface OrFrontEntry {
   is_private?: boolean;
   supports_reasoning?: boolean;
 }
-export const OR_FRONT_URL = "https://openrouter.ai/api/frontend/v1/models";
+export const OR_FRONT_URL = "https://openrouter.ai/api/frontend/v1/models/find";
 const OR_FRONT_TTL_MS = 24 * 60 * 60 * 1000;
 const OR_FRONT_MAX_BYTES = 16 * 1024 * 1024;
 export interface OrFrontOptions {
@@ -30,9 +30,19 @@ let inflight: { key: string; task: Promise<OrFrontEntry[] | undefined> } | undef
 function defaultCachePath(): string {
   return path.join(getArcDir(), "or-front.json");
 }
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
 export function parseOrFront(json: unknown): OrFrontEntry[] {
-  const arr = Array.isArray(json) ? json : (json as { data?: unknown } | undefined)?.data;
-  return Array.isArray(arr) ? arr.filter((x): x is OrFrontEntry => !!x && typeof x === "object" && !Array.isArray(x)) : [];
+  const data = isRecord(json) ? json.data : undefined;
+  const arr = Array.isArray(json)
+    ? json
+    : Array.isArray(data)
+      ? data
+      : isRecord(data) && Array.isArray(data.models)
+        ? data.models
+        : [];
+  return arr.filter((x): x is OrFrontEntry => isRecord(x));
 }
 export async function getOrFrontEntries(opts: OrFrontOptions = {}): Promise<OrFrontEntry[] | undefined> {
   const ttl = opts.ttlMs ?? OR_FRONT_TTL_MS;

@@ -2,6 +2,7 @@ import { getProviderSpec } from "./catalog.js";
 import { createHash } from "node:crypto";
 import type { ProviderKind } from "../protocol/protocol.js";
 import { attributionHeaders } from "./attribution.js";
+import { getCopilotBearerToken } from "./github-copilot.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { getOrBackEntries, type OrBackEntry } from "./or-back.js";
 import { readBodyLimited } from "../security/network.js";
@@ -292,7 +293,7 @@ export function formatFallbackName(id: string): string {
   }
   return out.join(" ");
 }
-const ALIAS_FIELDS = ["instruct", "thinking", "reasoning", "free", "online", "search", "experimental", "preview", "latest", "exacto", "it", "chat"];
+const ALIAS_FIELDS = ["instruct", "thinking", "reasoning", "free", "online", "search", "experimental", "preview", "latest", "exacto", "it", "chat", "fast"];
 export function aliasKeyForSlug(slug: string): string {
   const normalized = normalizeForMatch(slug);
   const base = normalized.split("/").pop() ?? normalized;
@@ -317,12 +318,19 @@ export async function listOpenAICompatibleModels(baseUrl: string | undefined, ki
   if (!base) return undefined;
   const isAnthropic = kind === "anthropic";
   const isOllama = kind === "ollama";
+  const isCopilot = kind === "github-copilot";
   const headers: Record<string, string> = { accept: "application/json", ...attributionHeaders(kind as ProviderKind) };
   if (isAnthropic) {
     headers["x-api-key"] = apiKey ?? "";
     headers["anthropic-version"] = "2023-06-01";
   } else if (!isOllama && apiKey) {
-    headers.authorization = `Bearer ${apiKey}`;
+    if (isCopilot) {
+      const bearer = await getCopilotBearerToken(apiKey, { proxyUrl }).catch(() => undefined);
+      if (!bearer) return undefined;
+      headers.authorization = `Bearer ${bearer}`;
+    } else {
+      headers.authorization = `Bearer ${apiKey}`;
+    }
   }
   const endpoint = isAnthropic ? `${base}/v1/models` : isOllama ? `${base}/api/tags` : `${base}/models`;
   const init: RequestInit = { method: "GET", headers, signal: AbortSignal.timeout(8_000) };
@@ -436,6 +444,18 @@ export async function groupProviderModels(entries: ProviderModelEntry[], info?: 
     if (!group.providers.some((p) => p.providerId === entry.providerId && p.slug === entry.slug)) {
       group.providers.push(entry);
     }
+  }
+  const claimedLabels = new Set<string>();
+  for (const group of groups.values()) {
+    if (!claimedLabels.has(group.label)) {
+      claimedLabels.add(group.label);
+      continue;
+    }
+    const firstSlug = group.providers[0]?.slug ?? group.key;
+    let alt = formatFallbackName(firstSlug);
+    if (claimedLabels.has(alt)) alt = `${group.label} (${firstSlug})`;
+    group.label = alt;
+    claimedLabels.add(alt);
   }
   return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
 }

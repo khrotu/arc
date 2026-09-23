@@ -335,15 +335,12 @@ export class Agent {
   }
   private emptyResponseRetries = 0;
   private static readonly MAX_EMPTY_RESPONSE_RETRIES = 2;
-  private turnDepth = 0;
-  private static readonly MAX_TURNS_PER_MESSAGE = 40;
   private turnEpoch = 0;
   async send(text: string, attachments?: { uri: string; preview?: string }[], images?: string[]): Promise<void> {
     if (this.active) throw new Error("Agent is already running");
     this.verifyAttempts = 0;
     this.consecutiveStreamErrors = 0;
     this.emptyResponseRetries = 0;
-    this.turnDepth = 0;
     if (!this.sessionStarted) {
       this.sessionStarted = true;
       runHooks({
@@ -417,7 +414,6 @@ export class Agent {
   }
   async continue(): Promise<void> {
     if (this.active) return;
-    this.turnDepth = 0;
     await this.runTurn();
   }
   async stop() {
@@ -556,18 +552,6 @@ export class Agent {
     const turnId = randomUUID();
     this.sink.turnStart(turnId);
     this.abortController = new AbortController();
-    this.turnDepth++;
-    if (this.turnDepth > Agent.MAX_TURNS_PER_MESSAGE) {
-      this.turnDepth--;
-      const msg = `Turn budget exhausted (${Agent.MAX_TURNS_PER_MESSAGE} tool rounds for one message). Summarize progress and stop; ask the user how to proceed.`;
-      const budgetMsg: ChatMessage = { id: randomUUID(), role: "assistant", content: msg, ts: Date.now() };
-      this.messages.push(budgetMsg);
-      this.sink.message(budgetMsg);
-      this.sink.turnEnd(turnId, false, msg);
-      this.sink.done();
-      this.active = false;
-      return;
-    }
     try {
       const current = this.getCurrentModel();
       const modeDef = this.opts.modeRegistry.get(this.currentMode);
@@ -842,7 +826,6 @@ export class Agent {
       }
     } finally {
       if (this.turnEpoch === epoch) this.active = false;
-      this.turnDepth = Math.max(0, this.turnDepth - 1);
     }
   }
   private partitionToolCalls(toolCalls: ToolCall[]): ToolCall[][] {
@@ -1228,7 +1211,7 @@ export class Agent {
         return;
       }
       const question = String(tc.args.question ?? "");
-      const options = Array.isArray(tc.args.options) ? (tc.args.options as string[]) : [];
+      const options = Array.isArray(tc.args.options) ? (tc.args.options as unknown[]).map((o) => String(o)) : [];
       const clId = `cl-${randomUUID()}`;
       this.openStep({ id: clId, type: "clarification", title: "Asking parent", content: question, options });
       const answer = await this.opts.parent.askFromSubagent(question, options);
@@ -1248,7 +1231,7 @@ export class Agent {
         return;
       }
       const question = String(tc.args.question ?? "");
-      const options = Array.isArray(tc.args.options) ? (tc.args.options as string[]) : [];
+      const options = Array.isArray(tc.args.options) ? (tc.args.options as unknown[]).map((o) => String(o)) : [];
       const answer = await this.askUserInteractive(question, options);
       this.appendToolOutput(tc.id, answer || "(no answer)", true);
       this.messages.push({
@@ -1917,9 +1900,6 @@ Rules: terse bullets; no pleasantries; never invent facts; preserve exact identi
     return remote ? wrapUntrusted(text, toolName) : text;
   }
   private async truncateToolOutput(output: string, toolName: string): Promise<string> {
-    // context.retrieve explicitly restores full archived content; re-compressing
-    // it here regenerates the identical content-hashed stub id and traps the
-    // agent in an endless retrieve loop. The tool itself caps at 512 KiB.
     if (toolName === "context.retrieve") return output;
     if (output.length <= TOOL_OUTPUT_MAX_CHARS) return output;
     const { compressForContext } = await import("../compress/compress.js");

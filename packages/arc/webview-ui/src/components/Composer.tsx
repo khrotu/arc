@@ -56,7 +56,6 @@ type Props = {
   routePending?: { modelLabel: string; domain?: string; confidence?: number } | null;
   onAcceptRouted?: () => void;
   onRejectRouted?: () => void;
-  // Task 8: approvals + clarifications live in the composer extension
   approval?: { description: string; queueCount: number } | null;
   approvalMenuOpen?: boolean;
   onToggleApprovalMenu?: () => void;

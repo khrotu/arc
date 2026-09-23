@@ -9,11 +9,12 @@ type Props = {
 export default function ModelIcon({ modelId, size = 14, className, title }: Props) {
   const name = modelId ? iconForModel(modelId) : DEFAULT_ICON;
   const svg = ICON_SVGS[name] ?? ICON_SVGS[DEFAULT_ICON];
-  const paths = svg.paths.map((p, i) =>
-    createElement("path", { key: i, d: p.d, ...(p.fillRule ? { fillRule: p.fillRule } : {}), ...(p.opacity ? { opacity: p.opacity } : {}) }),
+  const stroke = svg[0] === 1;
+  const paths = svg[2].map((p, i) =>
+    createElement("path", { key: i, d: p[0], ...(p[1] ? { fillRule: p[1] } : {}), ...(p[2] ? { opacity: p[2] } : {}) }),
   );
-  const content = svg.transform
-    ? createElement("g", { key: "fit", transform: svg.transform }, paths)
+  const content = svg[1]
+    ? createElement("g", { key: "fit", transform: svg[1] }, paths)
     : paths;
   return createElement(
     "svg",
@@ -24,11 +25,11 @@ export default function ModelIcon({ modelId, size = 14, className, title }: Prop
       height: size,
       className,
       title,
-      fill: svg.mode === "stroke" ? "none" : "currentColor",
-      stroke: svg.mode === "stroke" ? "currentColor" : undefined,
-      strokeWidth: svg.mode === "stroke" ? 1.5 : undefined,
-      strokeLinecap: svg.mode === "stroke" ? ("round" as const) : undefined,
-      strokeLinejoin: svg.mode === "stroke" ? ("round" as const) : undefined,
+      fill: stroke ? "none" : "currentColor",
+      stroke: stroke ? "currentColor" : undefined,
+      strokeWidth: stroke ? 1.5 : undefined,
+      strokeLinecap: stroke ? ("round" as const) : undefined,
+      strokeLinejoin: stroke ? ("round" as const) : undefined,
       "aria-hidden": true,
     },
     content,

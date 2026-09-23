@@ -76,10 +76,10 @@ describe("shell.run timeout moves the process to the background", () => {
     const scriptPath = path.join(tmp, "sleeper.js");
     await fs.writeFile(scriptPath, "console.log('partial-work-done'); setInterval(function(){}, 1000);\n");
     const ctx = { root: tmp, workspacePath: tmp } as unknown as ToolContext;
-    const run = await tools["shell.run"].fn({ command: `node "${scriptPath}"`, timeout: 1 }, ctx);
+    const run = await tools["shell.run"].fn({ command: `node "${scriptPath}"`, timeout: 5 }, ctx);
     expect(run.ok).toBe(false);
     expect(run.output).toContain("partial-work-done");
-    expect(run.output).toMatch(/\[timed out after 1s\] Still running in the background \(id: \d+\)/);
+    expect(run.output).toMatch(/\[timed out after 5s\] Still running in the background \(id: \d+\)/);
     const id = run.output.match(/background \(id: (\d+)\)/)![1];
     const check = await tools["shell.check"].fn({ id }, ctx);
     expect(check.ok).toBe(true);

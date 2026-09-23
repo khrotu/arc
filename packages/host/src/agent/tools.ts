@@ -34,6 +34,13 @@ async function resolveBrowser(src: BrowserSource | undefined): Promise<BrowserAd
   if (!src) return undefined;
   return typeof src === "function" ? await src() : src;
 }
+function withBrowser(ctx: ToolContext, call: (b: BrowserAdapter) => Promise<ToolResult> | ToolResult): Promise<ToolResult> {
+  return (async () => {
+    const b = await resolveBrowser(ctx.browser);
+    if (!b) return { ok: false, output: "Browser not available." };
+    return call(b);
+  })();
+}
 interface BgProcess { proc: ChildProcess; command: string; stdout: string; stderr: string; exited: boolean; exitCode: number | undefined; }
 const bgProcesses = new Map<string, BgProcess>();
 let bgIds = 0;
@@ -759,19 +766,19 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       return { ok: true, output: `Todo list updated (${items.length} items).`, todoState: { items } };
     },
   },
-  "browser.navigate": { description: "Navigate the browser. Args: { url, tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.navigate(String(a.url), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.click": { description: "Click a selector. Args: { selector, tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.click(String(a.selector), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.type": { description: "Type into a selector. Args: { selector, text, tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.type(String(a.selector), String(a.text), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.screenshot": { description: "Take a screenshot. Args: { path?, fullPage?, type?, tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.screenshot(a.path ? String(a.path) : undefined, !!a.fullPage, (a.type === "jpeg" ? "jpeg" : "png"), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.evaluate": { description: "Run JS in the page. Args: { script, tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.evaluate(String(a.script), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.readDom": { description: "Read the page's accessibility tree. Args: { tabId? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.readDom(a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.close": { description: "Close the browser. Args: {}", fn: async (_a, ctx) => { const b = await resolveBrowser(ctx.browser); if (b) await b.close(); return { ok: true, output: "Browser closed." }; } },
-  "browser.newTab": { description: "Open a new browser tab, optionally navigating to a URL. Args: { url? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.newTab(a.url ? String(a.url) : undefined) : { ok: false, output: "Browser not available." }; } },
-  "browser.switchTab": { description: "Switch the active tab used by browser tools that omit tabId. Args: { tabId }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.switchTab(String(a.tabId ?? "")) : { ok: false, output: "Browser not available." }; } },
-  "browser.closeTab": { description: "Close a browser tab. Args: { tabId }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.closeTab(String(a.tabId ?? "")) : { ok: false, output: "Browser not available." }; } },
-  "browser.listTabs": { description: "List open browser tabs. Args: {}", fn: async (_a, ctx) => { const b = await resolveBrowser(ctx.browser); return b ? b.listTabs() : { ok: false, output: "Browser not available." }; } },
-  "browser.intercept": { description: "Intercept requests matching a URL glob pattern. Args: { pattern, status?, body?, contentType?, block? }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); if (!b) return { ok: false, output: "Browser not available." }; const pattern = String(a.pattern ?? ""); if (!pattern) return { ok: false, output: "No pattern provided." }; return b.intercept(pattern, { status: a.status ? Number(a.status) : undefined, body: a.body ? String(a.body) : undefined, contentType: a.contentType ? String(a.contentType) : undefined, block: !!a.block }); } },
-  "browser.unintercept": { description: "Stop intercepting a previously registered pattern. Args: { pattern }", fn: async (a, ctx) => { const b = await resolveBrowser(ctx.browser); if (!b) return { ok: false, output: "Browser not available." }; return b.unintercept(String(a.pattern ?? "")); } },
+  "browser.navigate": { description: "Navigate the browser. Args: { url, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.navigate(String(a.url), a.tabId ? String(a.tabId) : undefined)) },
+  "browser.click": { description: "Click a selector. Args: { selector, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.click(String(a.selector), a.tabId ? String(a.tabId) : undefined)) },
+  "browser.type": { description: "Type into a selector. Args: { selector, text, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.type(String(a.selector), String(a.text), a.tabId ? String(a.tabId) : undefined)) },
+  "browser.screenshot": { description: "Take a screenshot. Args: { path?, fullPage?, type?, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.screenshot(a.path ? String(a.path) : undefined, !!a.fullPage, (a.type === "jpeg" ? "jpeg" : "png"), a.tabId ? String(a.tabId) : undefined)) },
+  "browser.evaluate": { description: "Run JS in the page. Args: { script, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.evaluate(String(a.script), a.tabId ? String(a.tabId) : undefined)) },
+  "browser.readDom": { description: "Read the page's accessibility tree. Args: { tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.readDom(a.tabId ? String(a.tabId) : undefined)) },
+  "browser.close": { description: "Close the browser. Args: {}", fn: (_a, ctx) => withBrowser(ctx, async (b) => { await b.close(); return { ok: true, output: "Browser closed." }; }) },
+  "browser.newTab": { description: "Open a new browser tab, optionally navigating to a URL. Args: { url? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.newTab(a.url ? String(a.url) : undefined)) },
+  "browser.switchTab": { description: "Switch the active tab used by browser tools that omit tabId. Args: { tabId }", fn: (a, ctx) => withBrowser(ctx, (b) => b.switchTab(String(a.tabId ?? ""))) },
+  "browser.closeTab": { description: "Close a browser tab. Args: { tabId }", fn: (a, ctx) => withBrowser(ctx, (b) => b.closeTab(String(a.tabId ?? ""))) },
+  "browser.listTabs": { description: "List open browser tabs. Args: {}", fn: (_a, ctx) => withBrowser(ctx, (b) => b.listTabs()) },
+  "browser.intercept": { description: "Intercept requests matching a URL glob pattern. Args: { pattern, status?, body?, contentType?, block? }", fn: (a, ctx) => withBrowser(ctx, (b) => { const pattern = String(a.pattern ?? ""); if (!pattern) return { ok: false, output: "No pattern provided." }; return b.intercept(pattern, { status: a.status ? Number(a.status) : undefined, body: a.body ? String(a.body) : undefined, contentType: a.contentType ? String(a.contentType) : undefined, block: !!a.block }); }) },
+  "browser.unintercept": { description: "Stop intercepting a previously registered pattern. Args: { pattern }", fn: (a, ctx) => withBrowser(ctx, (b) => b.unintercept(String(a.pattern ?? ""))) },
   "web.fetch": {
     fn: async (args, ctx) => {
       try {
@@ -1272,77 +1279,45 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
     },
   },
   "browser.hover": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
-      return b.hover(String(args.selector ?? ""), args.tabId ? String(args.tabId) : undefined);
-    },
+    fn: (args, ctx) => withBrowser(ctx, (b) => b.hover(String(args.selector ?? ""), args.tabId ? String(args.tabId) : undefined)),
   },
   "browser.scroll": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
-      return b.scroll(args.pixels ? Number(args.pixels) : undefined, args.selector ? String(args.selector) : undefined, args.tabId ? String(args.tabId) : undefined);
-    },
+    fn: (args, ctx) => withBrowser(ctx, (b) => b.scroll(args.pixels ? Number(args.pixels) : undefined, args.selector ? String(args.selector) : undefined, args.tabId ? String(args.tabId) : undefined)),
   },
   "browser.waitFor": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
-      return b.waitFor(
-        args.selector ? String(args.selector) : undefined,
-        args.url ? String(args.url) : undefined,
-        args.state ? String(args.state) as "networkidle" | "load" | "domcontentloaded" : undefined,
-        args.tabId ? String(args.tabId) : undefined,
-      );
-    },
+    fn: (args, ctx) => withBrowser(ctx, (b) => b.waitFor(
+      args.selector ? String(args.selector) : undefined,
+      args.url ? String(args.url) : undefined,
+      args.state ? String(args.state) as "networkidle" | "load" | "domcontentloaded" : undefined,
+      args.tabId ? String(args.tabId) : undefined,
+    )),
   },
   "browser.console": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
+    fn: (args, ctx) => withBrowser(ctx, (b) => {
       const logs = b.consoleLog(args.tabId ? String(args.tabId) : undefined);
       return { ok: true, output: logs.length ? logs.join("\n") : "(no console output)" };
-    },
+    }),
   },
   "browser.network": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
+    fn: (args, ctx) => withBrowser(ctx, (b) => {
       const logs = b.networkLog(args.tabId ? String(args.tabId) : undefined);
       return { ok: true, output: logs.length ? logs.join("\n") : "(no network requests)" };
-    },
+    }),
   },
   "browser.domSnapshot": {
-    fn: async (args, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      if (!b) return { ok: false, output: "Browser not available." };
-      return { ok: true, output: b.domSnapshot(args.tabId ? String(args.tabId) : undefined) || "(empty snapshot)" };
-    },
+    fn: (args, ctx) => withBrowser(ctx, (b) => ({ ok: true, output: b.domSnapshot(args.tabId ? String(args.tabId) : undefined) || "(empty snapshot)" })),
   },
   "browser.drag": {
-    fn: async (a, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      return b ? b.drag(String(a.from), String(a.to), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
-    },
+    fn: (a, ctx) => withBrowser(ctx, (b) => b.drag(String(a.from), String(a.to), a.tabId ? String(a.tabId) : undefined)),
   },
   "browser.dialog": {
-    fn: async (a, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      return b ? b.dialog(a.accept !== false, a.promptText ? String(a.promptText) : undefined) : { ok: false, output: "Browser not available." };
-    },
+    fn: (a, ctx) => withBrowser(ctx, (b) => b.dialog(a.accept !== false, a.promptText ? String(a.promptText) : undefined)),
   },
   "browser.runCode": {
-    fn: async (a, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      return b ? b.runCode(String(a.code), a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
-    },
+    fn: (a, ctx) => withBrowser(ctx, (b) => b.runCode(String(a.code), a.tabId ? String(a.tabId) : undefined)),
   },
   "browser.readPage": {
-    fn: async (a, ctx) => {
-      const b = await resolveBrowser(ctx.browser);
-      return b ? b.readPage(a.tabId ? String(a.tabId) : undefined) : { ok: false, output: "Browser not available." };
-    },
+    fn: (a, ctx) => withBrowser(ctx, (b) => b.readPage(a.tabId ? String(a.tabId) : undefined)),
   },
   "notebook.read": {
     fn: async (args, ctx) => {

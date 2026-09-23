@@ -127,7 +127,6 @@ export type ProviderKind =
   | "galadriel"
   | "gcp-vertex"
   | "github-copilot"
-  | "github-models"
   | "gmi-cloud"
   | "google"
   | "gpt4all"

@@ -28,20 +28,46 @@ const OR_DIALECT = new Set<ProviderKind>([
   "unorouter",
 ]);
 const OPENCODE_HOSTS = new Set(["opencode.ai"]);
+export const OPENCODE_VER_DEFAULT = "1.18.31";
+export let OPENCODE_VER = OPENCODE_VER_DEFAULT;
+export let OPENCODE_UA = `opencode/${OPENCODE_VER}`;
+export const OPENCODE_CLIENT = "cli";
+export function setOpencodeVer(ver: string): void {
+  if (!ver) return;
+  OPENCODE_VER = ver;
+  OPENCODE_UA = `opencode/${ver}`;
+}
 export function isOpencodeEndpoint(baseUrl: string | undefined, kind: ProviderKind): boolean {
   if (kind === "opencode" || kind === "opencode-go") return true;
   if (!baseUrl) return false;
   try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    return OPENCODE_HOSTS.has(host) || host.endsWith(".opencode.ai");
-  } catch {
+    const url = new URL(baseUrl);
+    const host = url.hostname.toLowerCase();
+    if (OPENCODE_HOSTS.has(host) || host.endsWith(".opencode.ai")) return true;
+    const path = url.pathname.toLowerCase();
+    if (path.includes("/zen/") || path.includes("/zen") || path.includes("/go/v1")) return true;
     return false;
+  } catch {
+    const lower = baseUrl.toLowerCase();
+    return lower.includes("opencode.ai") || lower.includes("/zen/") || lower.includes("/go/v1");
   }
 }
-export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined): Record<string, string> {
-  if (!conversationId) return {};
+function newOpencodeRequestId(): string {
+  try {
+    const g = globalThis as { crypto?: { randomUUID?: () => string } };
+    if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  } catch {}
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined, requestId?: string): Record<string, string> {
   if (!isOpencodeEndpoint(baseUrl, kind)) return {};
-  return { "x-opencode-session": conversationId };
+  const out: Record<string, string> = {
+    "user-agent": OPENCODE_UA,
+    "x-opencode-client": OPENCODE_CLIENT,
+  };
+  if (conversationId) out["x-opencode-session"] = conversationId;
+  out["x-opencode-request"] = requestId || newOpencodeRequestId();
+  return out;
 }
 export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Record<string, string> {
   switch (kind) {
@@ -58,7 +84,7 @@ export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Re
       return { ...UA(a), ...OR(a), "x-source": new URL(a.url).host };
     case "github-copilot":
       return {
-        "copilot-integration-id": "vscode-chat",
+        "copilot-integration-id": "copilot-developer-cli",
         "editor-version": `${a.title}/${a.version}`,
         "editor-plugin-version": `${a.title}/${a.version}`,
         "user-agent": `${a.title}/${a.version}`,
@@ -89,7 +115,7 @@ export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Re
       return { ...UA(a), ...OR(a) };
     case "opencode":
     case "opencode-go":
-      return UA(a);
+      return { "user-agent": OPENCODE_UA };
     default:
       if (OR_DIALECT.has(kind)) return { ...UA(a), ...OR(a) };
       if (kind === "anthropic") return UA(a);

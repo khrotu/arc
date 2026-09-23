@@ -18,30 +18,22 @@ const GREEK: Record<string, string> = {
   Upsilon: "Υ", Phi: "Φ", Psi: "Ψ", Omega: "Ω", Omicron: "Ο", Epsilon: "Ε",
   Zeta: "Ζ", Eta: "Η", Iota: "Ι", Kappa: "Κ", Mu: "Μ", Nu: "Ν", Rho: "Ρ", Tau: "Τ", Chi: "Χ",
 };
-const SYM: Record<string, string> = {
-  times: "×", div: "÷", cdot: "·", pm: "±", mp: "∓", le: "≤", leq: "≤", ge: "≥", geq: "≥",
-  ne: "≠", neq: "≠", approx: "≈", sim: "∼", simeq: "≃", propto: "∝", equiv: "≡", cong: "≅",
-  in: "∈", notin: "∉", ni: "∋", subset: "⊂", supset: "⊃", subseteq: "⊆", supseteq: "⊇",
-  cup: "∪", cap: "∩", land: "∧", wedge: "∧", lor: "∨", vee: "∨", lnot: "¬", neg: "¬",
-  forall: "∀", exists: "∃", nexists: "∄", nabla: "∇", partial: "∂", infty: "∞", infinity: "∞",
-  to: "→", rightarrow: "→", leftarrow: "←", leftrightarrow: "↔", uparrow: "↑", downarrow: "↓",
-  updownarrow: "↕", Rightarrow: "⇒", Leftarrow: "⇐", mapsto: "↦", rightleftharpoons: "⇌",
+const SYM: Record<string, string | [string, string]> = {
+  times: ["×", MBIN], div: ["÷", MBIN], cdot: ["·", MBIN], pm: ["±", MBIN], mp: ["∓", MBIN],
+  le: ["≤", MREL], leq: ["≤", MREL], ge: ["≥", MREL], geq: ["≥", MREL],
+  ne: ["≠", MREL], neq: ["≠", MREL], approx: ["≈", MREL], sim: ["∼", MREL], simeq: ["≃", MREL],
+  propto: ["∝", MREL], equiv: ["≡", MREL], cong: ["≅", MREL],
+  in: ["∈", MREL], notin: ["∉", MREL], ni: ["∋", MREL], subset: ["⊂", MREL], supset: ["⊃", MREL], subseteq: ["⊆", MREL], supseteq: ["⊇", MREL],
+  cup: ["∪", MBIN], cap: ["∩", MBIN], land: ["∧", MBIN], wedge: ["∧", MBIN], lor: ["∨", MBIN], vee: ["∨", MBIN], lnot: ["¬", MREL], neg: ["¬", MREL],
+  forall: ["∀", MREL], exists: ["∃", MREL], nexists: ["∄", MREL], nabla: "∇", partial: "∂",
+  infty: ["∞", MORD], infinity: ["∞", MORD],
+  to: ["→", MREL], rightarrow: ["→", MREL], leftarrow: ["←", MREL], leftrightarrow: ["↔", MREL], uparrow: ["↑", MREL], downarrow: ["↓", MREL], updownarrow: ["↕", MREL],
+  Rightarrow: ["⇒", MREL], Leftarrow: ["⇐", MREL], mapsto: ["↦", MREL], rightleftharpoons: ["⇌", MREL],
   cdots: "⋯", ldots: "...", dots: "...", vdots: "⋮", ddots: "⋱",
-  prime: "′", degree: "°", angle: "∠", perp: "⊥", parallel: "∥", therefore: "∴", because: "∵",
+  prime: "′", degree: "°", angle: "∠", perp: ["⊥", MREL], parallel: ["∥", MREL], therefore: ["∴", MREL], because: ["∵", MREL],
   emptyset: "∅", aleph: "ℵ", hbar: "ℏ", ell: "ℓ", Re: "ℜ", Im: "ℑ",
-  langle: "⟨", rangle: "⟩", mid: "|", vert: "|", Vert: "‖", ast: "∗", star: "∗",
-  circ: "∘", bullet: "∙", diamond: "⋄",
-};
-const SYM_CLASS: Record<string, string> = {
-  times: MBIN, div: MBIN, cdot: MBIN, pm: MBIN, mp: MBIN, ast: MBIN, star: MBIN, circ: MBIN, bullet: MBIN, diamond: MBIN,
-  cap: MBIN, cup: MBIN, land: MBIN, lor: MBIN, wedge: MBIN, vee: MBIN,
-  le: MREL, leq: MREL, ge: MREL, geq: MREL, ne: MREL, neq: MREL, approx: MREL, sim: MREL, simeq: MREL,
-  propto: MREL, equiv: MREL, cong: MREL, in: MREL, notin: MREL, ni: MREL, subset: MREL, supset: MREL,
-  subseteq: MREL, supseteq: MREL, to: MREL, rightarrow: MREL, leftarrow: MREL, leftrightarrow: MREL,
-  uparrow: MREL, downarrow: MREL, updownarrow: MREL, Rightarrow: MREL, Leftarrow: MREL, mapsto: MREL,
-  rightleftharpoons: MREL, mid: MREL, vert: MREL, Vert: MREL, parallel: MREL, perp: MREL, therefore: MREL,
-  because: MREL, lnot: MREL, neg: MREL, forall: MREL, exists: MREL, nexists: MREL,
-  langle: MOPEN, rangle: MCLOSE,
+  langle: ["⟨", MOPEN], rangle: ["⟩", MCLOSE], mid: ["|", MREL], vert: ["|", MREL], Vert: ["‖", MREL], ast: ["∗", MBIN], star: ["∗", MBIN],
+  circ: ["∘", MBIN], bullet: ["∙", MBIN], diamond: ["⋄", MBIN],
 };
 const BIG_OPS: Record<string, string> = {
   sum: "∑", prod: "∏", int: "∫", oint: "∮", coprod: "∐",
@@ -219,7 +211,7 @@ class MathParser {
     }
     if (BIG_OPS[name]) return this.bigOp(BIG_OPS[name]);
     if (GREEK[name]) return atom(`${MORD} mathnormal`, GREEK[name]);
-    if (SYM[name]) return atom(SYM_CLASS[name] ?? MORD, SYM[name]);
+    if (SYM[name] !== undefined) { const s = SYM[name]; return typeof s === "string" ? atom(MORD, s) : atom(s[1], s[0]); }
     return atom(MORD, esc(name));
   }
   private funcOp(name: string): string {
@@ -247,26 +239,17 @@ class MathParser {
   private env(): string {
     const env = this.rawGroup();
     const m = MATRICES[env];
-    if (m) {
-      const marker = `\\end{${env}}`;
-      const idx = this.s.indexOf(marker, this.i);
-      const raw = idx >= 0 ? this.s.slice(this.i, idx) : this.s.slice(this.i);
-      this.i = idx >= 0 ? idx + marker.length : this.s.length;
-      const rows = raw.split(/\\\\/).map((r) => r.split("&").map((cell) => new MathParser(cell).seq()));
-      const mtrs = rows.map((r) => `<span class="mtr">${r.map((c) => `<span class="mtd">${c}</span>`).join("")}</span>`).join("");
-      const inner = `<span class="mtable">${mtrs}</span>`;
-      const open = m.open ? atom(`${MOPEN} delimcenter is-big`, esc(m.open)) : "";
-      const close = m.open ? atom(`${MCLOSE} delimcenter is-big`, esc(m.close)) : "";
-      return atom(MINNER, `${open}${inner}${close}`);
-    }
     const marker = `\\end{${env}}`;
     const idx = this.s.indexOf(marker, this.i);
     const raw = idx >= 0 ? this.s.slice(this.i, idx) : this.s.slice(this.i);
     this.i = idx >= 0 ? idx + marker.length : this.s.length;
-    if (!raw.trim()) return "";
+    if (!m && !raw.trim()) return "";
     const rows = raw.split(/\\\\/).map((r) => r.split("&").map((cell) => new MathParser(cell).seq()));
     const mtrs = rows.map((r) => `<span class="mtr">${r.map((c) => `<span class="mtd">${c}</span>`).join("")}</span>`).join("");
-    return atom(MINNER, `<span class="mtable">${mtrs}</span>`);
+    const inner = `<span class="mtable">${mtrs}</span>`;
+    const open = m?.open ? atom(`${MOPEN} delimcenter is-big`, esc(m.open)) : "";
+    const close = m?.open ? atom(`${MCLOSE} delimcenter is-big`, esc(m.close)) : "";
+    return atom(MINNER, `${open}${inner}${close}`);
   }
 }
 export function renderMath(src: string, display = false): string {

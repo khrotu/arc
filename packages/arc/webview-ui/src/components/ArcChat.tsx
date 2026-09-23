@@ -270,7 +270,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
           if (e.sessionId && sessionIdRef.current !== e.sessionId) sessionIdRef.current = e.sessionId;
           setStreaming({ id: "pending", text: "" }); setShowOnboarding(false); setLastTurnError(null); break;
         case "session/turnEnd": stopSeqRef.current++; setStopping(false); if (attentionRef.current.completion) playAttention("done"); cancelStreamFlush(); setStreaming(null); break;
-        case "session/clarification": setClarification({ id: e.id, question: e.question, options: e.options }); break;
+        case "session/clarification": setClarification({ id: String(e.id ?? ""), question: String(e.question ?? ""), options: Array.isArray(e.options) ? e.options.map((o: unknown) => String(o)) : [] }); break;
         case "suggestions/list":
           setSuggestions((e as { items: { kind: string; id: string; label: string; detail?: string; tokens: number }[] }).items ?? []);
           break;
@@ -764,7 +764,6 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   }, [steps]);
   const [todosOpen, setTodosOpen] = useState(true);
   const [todosVisible, setTodosVisible] = useState(false);
-  // Task 14: suggestions for unused context.
   const [suggestions, setSuggestions] = useState<{ kind: string; id: string; label: string; detail?: string; tokens: number }[]>([]);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   useEffect(() => {

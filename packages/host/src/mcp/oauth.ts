@@ -76,22 +76,20 @@ export async function discoverAuthorizationServer(serverUrl: string, wwwAuthenti
     const params = parseWwwAuthenticate(wwwAuthenticate);
     const resourceMeta = params["resource_metadata"];
     if (resourceMeta) {
-      const meta = await fetchJson(resourceMeta, new URL(serverUrl).origin) as ProtectedResourceMetadata | undefined;
+      const meta = await fetchJson(resourceMeta) as ProtectedResourceMetadata | undefined;
       issuer = meta?.authorization_servers?.[0];
       resourceScopes = meta?.scopes_supported;
     }
   }
   if (!issuer) issuer = new URL(serverUrl).origin;
-  let issuerOrigin: string;
   try {
     const issuerUrl = new URL(issuer);
     if (issuerUrl.protocol !== "https:") return undefined;
-    issuerOrigin = issuerUrl.origin;
   } catch {
     return undefined;
   }
   for (const candidate of wellKnownCandidates(issuer)) {
-    const metadata = await fetchJson(candidate, issuerOrigin) as AuthServerMetadata | undefined;
+    const metadata = await fetchJson(candidate) as AuthServerMetadata | undefined;
     if (metadata?.authorization_endpoint && metadata.token_endpoint) {
       try {
         const authUrl = new URL(String(metadata.authorization_endpoint));
@@ -100,7 +98,7 @@ export async function discoverAuthorizationServer(serverUrl: string, wwwAuthenti
       } catch {
         continue;
       }
-      return { metadata: { ...metadata, scopes_supported: metadata.scopes_supported ?? resourceScopes }, issuer };
+      return { metadata: { ...metadata, scopes_supported: resourceScopes ?? metadata.scopes_supported }, issuer };
     }
   }
   return undefined;
@@ -148,7 +146,7 @@ export async function runAuthorizationFlow(opts: OAuthFlowOptions): Promise<OAut
     try {
       const regUrl = new URL(String(metadata.registration_endpoint));
       if (regUrl.protocol !== "https:") throw new Error("registration endpoint must use https");
-      await assertSafeUrl(regUrl, { sameOrigin: new URL(opts.serverUrl).origin });
+      await assertSafeUrl(regUrl);
     } catch (e) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       throw e instanceof Error ? e : new Error("Invalid registration endpoint.");

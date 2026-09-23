@@ -27,6 +27,9 @@ export interface McpOAuthTokens {
   expiresAt?: number;
 }
 export type McpTokenProvider = () => Promise<string | undefined>;
+function isBearerChallenge(header?: string): boolean {
+  return !!header && /^\s*Bearer(\s|,|$)/i.test(header);
+}
 interface JsonRpcRequest {
   jsonrpc: "2.0";
   id: number | string;
@@ -81,6 +84,7 @@ export class McpClient extends EventEmitter {
   private tokenProvider?: McpTokenProvider;
   private onAuthRequired?: (wwwAuthenticate?: string) => Promise<string | undefined>;
   private oauthPrompted = false;
+  private lastAuthChallenge?: string;
   constructor(public config: McpServerConfig, options: McpClientOptions = {}) {
     super();
     this.opts = {
@@ -103,6 +107,9 @@ export class McpClient extends EventEmitter {
   }
   getServerName(): string {
     return this.config.name;
+  }
+  getLastAuthChallenge(): string | undefined {
+    return this.lastAuthChallenge;
   }
   getStatus(): McpClientStatus {
     return this.status;
@@ -253,8 +260,10 @@ export class McpClient extends EventEmitter {
   }
   private async challengeAuth(wwwAuthenticate?: string): Promise<string | undefined> {
     const t = this.config.transport;
-    if (t.type === "stdio" || t.auth !== "oauth") return undefined;
+    if (t.type === "stdio") return undefined;
+    if (t.auth !== "oauth" && !isBearerChallenge(wwwAuthenticate)) return undefined;
     if (!this.onAuthRequired || this.oauthPrompted) return undefined;
+    if (wwwAuthenticate) this.lastAuthChallenge = wwwAuthenticate;
     this.oauthPrompted = true;
     this.traffic("out", "oauth authorization required");
     try {

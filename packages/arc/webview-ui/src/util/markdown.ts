@@ -1,6 +1,6 @@
 import { renderMath, esc as escape } from "./math";
 const FILE_REF_RE = /(?<![\w./\\-])([A-Za-z0-9_@][\w./\\-]*\.[A-Za-z0-9]{1,8}):(\d+)(?:-(\d+))?(?![\d-])/g;
-const FILE_REF_FULL = /(?<![\w./\\-])([A-Za-z0-9_@][\w./\\-]*\.[A-Za-z0-9]{1,8}):(\d+)(?:-(\d+))?(?![\d-])/;
+const FILE_REF_FULL = new RegExp(FILE_REF_RE.source);
 function renderInline(s: string): string {  const mathBlocks: string[] = [];
   s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, latex: string) => {
     mathBlocks.push(renderMath(latex, true));
@@ -258,16 +258,11 @@ function renderBlock(s: string): string {
       );
       continue;
     }
-    html.push(renderBlockDispatch0(lines, i));
-    i = renderBlockDispatch1(lines, i);
+    const [htmlOut, next] = renderBlockLines(lines, i);
+    html.push(htmlOut);
+    i = next;
   }
   return html.join("");
-}
-function renderBlockDispatch0(lines: string[], i: number): string {
-  return renderBlockLines(lines, i)[0];
-}
-function renderBlockDispatch1(lines: string[], i: number): number {
-  return renderBlockLines(lines, i)[1];
 }
 function renderBlockLines(lines: string[], start: number): [string, number] {
   let i = start;
@@ -306,12 +301,10 @@ function renderBlockLines(lines: string[], start: number): [string, number] {
     return [`<table class="arc-md-table"><thead>${headHtml}</thead><tbody>${bodyRows.join("")}</tbody></table>`, i];
     }
   }
-
   if (isListLine(line)) {
     const [html, nextI] = renderListAt(lines, i, indentOf(line));
     return [html, nextI];
   }
-
   const buf: string[] = [line];
   i++;
   while (

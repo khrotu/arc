@@ -1,8 +1,8 @@
 {
   "name": "arc-code",
   "displayName": "Arc",
-  "description": "0.27 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
-  "version": "0.7.2",
+  "description": "0.28 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
+  "version": "0.7.3",
   "publisher": "khrotu",
   "license": "Apache-2.0",
   "repository": {

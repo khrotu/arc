@@ -42,7 +42,7 @@ export interface McpRoot { uri: string; name?: string }
 export type McpSamplingHandler = (serverName: string, params: unknown) => Promise<unknown>;
 export interface McpAuthDelegate {
   tokenProvider: McpTokenProvider;
-  onAuthRequired: () => Promise<McpOAuthTokens | undefined>;
+  onAuthRequired: (wwwAuthenticate?: string) => Promise<McpOAuthTokens | undefined>;
   onTokenRefreshed?: (tokens: McpOAuthTokens) => void;
 }
 export class McpAggregator {
@@ -68,7 +68,7 @@ export class McpAggregator {
     if (!entry || !entry.client) return false;
     const delegate = this.authDelegate?.(entry.config.name);
     if (!delegate) return false;
-    const tokens = await delegate.onAuthRequired();
+    const tokens = await delegate.onAuthRequired(entry.client.getLastAuthChallenge());
     if (!tokens) return false;
     delegate.onTokenRefreshed?.(tokens);
     await entry.client.stop();
@@ -78,6 +78,17 @@ export class McpAggregator {
     entry.prompts = [];
     if (entry.config.enabled) await this.startServer(entry);
     this.notify();
+    return true;
+  }
+  async setTransportAuthOAuth(server: string): Promise<boolean> {
+    const entry = this.resolveServer(server);
+    if (!entry) return false;
+    const t = entry.config.transport;
+    if (t.type !== "http" && t.type !== "sse") return false;
+    if (t.auth === "oauth") return true;
+    entry.config.transport = { ...t, auth: "oauth" };
+    this.notify();
+    await this.persistNow();
     return true;
   }
   setRoots(roots: McpRoot[]): void {
@@ -259,8 +270,8 @@ export class McpAggregator {
       ...this.clientOptions,
       trafficSink: this.trafficSinkFor(entry.config.name),
       tokenProvider: delegate?.tokenProvider,
-      onAuthRequired: delegate ? async () => {
-        const tokens = await delegate.onAuthRequired();
+      onAuthRequired: delegate ? async (challenge) => {
+        const tokens = await delegate.onAuthRequired(challenge);
         if (!tokens) return undefined;
         delegate.onTokenRefreshed?.(tokens);
         return tokens.accessToken;

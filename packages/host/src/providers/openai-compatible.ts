@@ -4,6 +4,7 @@ import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent
 import { caps } from "./capability-tracker.js";
 import { withRetry, policyFor } from "./retry.js";
 import { attributionHeaders, opencodeSessionHeader } from "./attribution.js";
+import { getCopilotBearerToken, copilotRequestHeaders, isAgentCall, hasImageContent } from "./github-copilot.js";
 import { readBodyLimited } from "../security/network.js";
 import { redactSecrets } from "../security/redact.js";
 import { safeParseJson } from "../util/json.js";
@@ -96,6 +97,14 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (req.provider.apiKey) headers.authorization = `Bearer ${req.provider.apiKey}`;
   Object.assign(headers, attributionHeaders(req.provider.kind));
+  if (req.provider.kind === "github-copilot") {
+    const bearer = await getCopilotBearerToken(req.provider.apiKey, { proxyUrl: req.proxyUrl });
+    headers.authorization = `Bearer ${bearer}`;
+    Object.assign(
+      headers,
+      copilotRequestHeaders({ vision: hasImageContent(req.messages), agentCall: isAgentCall(req.messages) }),
+    );
+  }
   Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId));
   const MAX_ATTEMPTS = 3;
   const policy = policyFor(req.provider.kind);
@@ -428,6 +437,14 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (req.provider.apiKey) headers.authorization = `Bearer ${req.provider.apiKey}`;
   Object.assign(headers, attributionHeaders(req.provider.kind));
+  if (req.provider.kind === "github-copilot") {
+    const bearer = await getCopilotBearerToken(req.provider.apiKey, { proxyUrl: req.proxyUrl });
+    headers.authorization = `Bearer ${bearer}`;
+    Object.assign(
+      headers,
+      copilotRequestHeaders({ vision: hasImageContent(req.messages), agentCall: isAgentCall(req.messages) }),
+    );
+  }
   Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId));
   const MAX_ATTEMPTS = 2;
   const policy = policyFor(req.provider.kind);
