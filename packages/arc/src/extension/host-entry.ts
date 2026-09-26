@@ -16,10 +16,10 @@ import {
   generateDependencyGraph, formatDepGraph,
   RuleRegistry, loadMemory, deleteMemory, loadNotes,
   type ChatSnapshot, type ChatMessage, type BrowserAdapter,
-  type HostMsg, type WebviewMsg, type ModelDescriptor, type ProviderConfig, type ProcessStep, type ApprovalsConfig,
+  type HostMsg, type WebviewMsg, type ModelDescriptor, type ProviderConfig, type ProcessStep, type ApprovalsConfig, type ArcPrefs,
   Indexer, HashEmbeddingBackend, OllamaEmbeddingBackend, OpenAIEmbeddingBackend, DEFAULT_EMBEDDING_MODELS,
   pickProvider, transportFor, withProviderOverrides,
-  registerTransport,
+  registerTransport, setRuntimePrefs,
   type IndexProgress, type EmbeddingBackend,
   IndexWatcher,
   FileContextTracker,
@@ -90,6 +90,7 @@ let lastImportSummaries: ImportAgentSummary[] = [];
 let log: vscode.OutputChannel;
 let ctxRef: vscode.ExtensionContext;
 let registry: ModelRegistry;
+let currentPrefs: ArcPrefs = {};
 let store: CheckpointStore;
 let lsp: LspBridge;
 let mcp: McpAggregator;
@@ -336,8 +337,8 @@ function scoreMcpServer(item: unknown, ql: string): number {
   if (hasRemote) score += 8;
   return score;
 }
-async function loadRegistry(ctx: vscode.ExtensionContext): Promise<{ models: ModelDescriptor[]; providers: ProviderConfig[]; currentModelId?: string }> {
-  const fallback = ctx.globalState.get<{ models: ModelDescriptor[]; providers: ProviderConfig[]; currentModelId?: string }>("arc.registry", { models: [], providers: [] });
+async function loadRegistry(ctx: vscode.ExtensionContext): Promise<{ models: ModelDescriptor[]; providers: ProviderConfig[]; currentModelId?: string; prefs?: ArcPrefs }> {
+  const fallback = ctx.globalState.get<{ models: ModelDescriptor[]; providers: ProviderConfig[]; currentModelId?: string; prefs?: ArcPrefs }>("arc.registry", { models: [], providers: [] });
   let snapshot: typeof fallback;
   try {
     const raw = await fs.readFile(path.join(ctx.globalStorageUri.fsPath, "arc.registry.json"), "utf8");
@@ -640,7 +641,7 @@ function registerViewsAndCommands(context: vscode.ExtensionContext) {
     thread.comments = [...thread.comments, userComment, pendingComment];
     let session = inlineChatSessions.get(thread);
     if (!session) {
-      session = { id: `inline-${Date.now()}-${Math.random().toString(36).slice(2)}`, agent: undefined as unknown as Agent, steps: [], messages: [] };
+      session = { id: `inline-${Date.now()}-${randomUUID()}`, agent: undefined as unknown as Agent, steps: [], messages: [] };
       inlineChatSessions.set(thread, session);
     }
     await initReady;
@@ -763,6 +764,8 @@ async function initializeAsync(context: vscode.ExtensionContext) {
     if (nonEmpty.length) { p.apiKeys = nonEmpty; p.apiKey = nonEmpty[0]; }
   }));
   registry.load(stored);
+  currentPrefs = { ...(stored.prefs ?? {}) };
+  setRuntimePrefs(currentPrefs);
   loadRouterTau();
   chatHistory = new ChatHistory();
   const workspaceRootForChats = currentWorkspaceRoot();
@@ -815,6 +818,7 @@ async function initializeAsync(context: vscode.ExtensionContext) {
       models: registry.list(),
       providers: registry.listProviders().map(({ apiKey, apiKeys, ...rest }) => ({ ...rest, apiKeyCount: apiKeys?.length ?? (apiKey ? 1 : 0) })),
       currentModelId: registry.getCurrent()?.id,
+      prefs: currentPrefs,
     };
     void context.globalState.update("arc.registry", snapshot);
     void context.workspaceState.update("arc.chats", { chats: chatHistory.list(), currentId: chatHistory.current() });
@@ -1193,7 +1197,7 @@ function findDiffTab(beforeUri: vscode.Uri, afterUri: vscode.Uri): vscode.Tab | 
   return undefined;
 }
 function createDiffPreviewUri(filePath: string, content: string): vscode.Uri {
-  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = `${Date.now()}-${randomUUID()}`;
   diffPreviewContents.set(id, content);
   while (diffPreviewContents.size > 64) {
     const oldest = diffPreviewContents.keys().next().value as string | undefined;
@@ -1616,6 +1620,8 @@ async function createAgent(session: Session): Promise<Agent | undefined> {
     proxyUrl: resolveProxy("url"),
     proxyWeb: resolveProxy("webUrl"),
     proxyShell: resolveProxy("shellUrl"),
+    webSearchBackend: secureSetting<string>("arc.websearch.backend", "builtin"),
+    webSearchApiKey: secureSetting<string>("arc.websearch.apiKey", "") || undefined,
     sandboxProfile: (vscode.workspace.getConfiguration().get<string>("arc.sandbox.profile", "off") ?? "off") as import("@arc/host").SandboxProfile,
     shellSurface: (cfg.get<string>("arc.shell.surface", "arc-handled") === "integrated" ? "integrated" : "arc-handled") as "arc-handled" | "integrated",
     runInVsCodeTerminal: (command: string, cwd: string) => runInArcTerminal(ctxRef!, command, cwd),
@@ -1805,7 +1811,10 @@ async function createAgent(session: Session): Promise<Agent | undefined> {
       broadcast(session, { type: "session/handoff", fromModel, toModel, reason });
     },
     todo: (items) => broadcast(session, { type: "todo/update", items: items as { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" }[] }),
-    clarification: (id, question, options) => broadcast(session, { type: "session/clarification", id, question, options }),
+    clarification: (id, question, options) => {
+      notify("awaiting", question.length > 140 ? question.slice(0, 139) + "…" : question);
+      broadcast(session, { type: "session/clarification", id, question, options });
+    },
     done: () => {
       notify("done", "Task complete");
       if (chatHistory) {
@@ -1871,7 +1880,9 @@ async function createAgent(session: Session): Promise<Agent | undefined> {
     },
     autoSessionNotes: vscode.workspace.getConfiguration().get<boolean>("arc.memory.autoNotes", true),
     approveShell: async (description, meta) => {
+      const short = description.length > 120 ? description.slice(0, 119) + "…" : description;
       if (!session.view && !session.panel) {
+        notify("awaiting", "Permission needed: " + short);
         const choice = await vscode.window.showWarningMessage(description, { modal: true }, "Allow");
         return choice === "Allow";
       }
@@ -1889,6 +1900,7 @@ async function createAgent(session: Session): Promise<Agent | undefined> {
       if (meta?.command) msg.command = meta.command;
       if (session.view) session.view.webview.postMessage(msg);
       if (session.panel) session.panel.webview.postMessage(msg);
+      notify("awaiting", "Permission needed: " + short);
       return promise;
     },
     askUser: async (question, options) => {
@@ -2521,6 +2533,7 @@ const WEBVIEW_CONFIG_KEYS = new Set([
   "arc.diffView.autoOpen",
   "arc.reasoning.effort",
   "arc.promptPolish",
+  "arc.websearch.backend", "arc.websearch.apiKey",
   "arc.router.quality",
   "arc.router.autoRoute",
   "arc.tools.disabled",
@@ -2559,6 +2572,7 @@ const WEBVIEW_MESSAGE_KEYS: Record<string, readonly string[]> = {
   "hooks/list": ["type"], "diff/accept": ["type", "stepId", "filePath"], "diff/reject": ["type", "stepId", "filePath", "hunks"],
   "provider/list": ["type"], "provider/setupInternal": ["type"], "provider/startServer": ["type", "providerId"], "provider/stopServer": ["type", "providerId"],
   "import/scan": ["type"], "import/credentials": ["type", "agent", "keys"], "import/chats": ["type", "agent"],
+  "prefs/get": ["type"], "prefs/set": ["type", "prefs"], "data/delete": ["type", "targets"],
   "suggestions/list": ["type"], "suggestions/unload": ["type", "kind", "id"], "suggestions/dismiss": ["type", "kind", "id"],
   "attention/sound": ["type", "event"],
 };
@@ -2612,6 +2626,51 @@ function wireWebview(webview: vscode.Webview, session: Session) {
         broadcastAll({ type: "provider/serverState", providerId: p.id, running: true, pid: proc.pid });
       }
     }
+  };
+  const deleteUserData = async (targets: { chats?: boolean; keys?: boolean; checkpoints?: boolean; agentState?: boolean }): Promise<string[]> => {
+    const deleted: string[] = [];
+    const ctx = ctxRef;
+    if (!ctx) return deleted;
+    const forget = async (v: Thenable<unknown>): Promise<void> => { try { await v; } catch {} };
+    if (targets.chats) {
+      for (const c of chatHistory.list()) {
+        chatHistory.remove(c.id);
+        chatTotals.delete(c.id);
+      }
+      for (const [, s] of fullscreenSessions) settleSession(s);
+      settleSession(sidebarSession);
+      persist?.();
+      broadcastChatListAll();
+      await fs.rm(path.join(ctx.globalStorageUri.fsPath, "chats"), { recursive: true, force: true }).catch(() => {});
+      deleted.push("chats");
+    }
+    if (targets.keys) {
+      for (const p of registry.listProviders()) {
+        const count = Math.max(p.apiKeys?.length ?? (p.apiKey ? 1 : 0), 1);
+        for (let i = 0; i < count; i++) await forget(ctx.secrets.delete(`${SECRET_PREFIX}${p.id}.${i}`));
+        await forget(ctx.secrets.delete(`${SECRET_PREFIX}${p.id}`));
+        p.apiKey = undefined;
+        p.apiKeys = undefined;
+      }
+      try {
+        const root = currentWorkspaceRoot();
+        for (const s of mcp.listServers()) await forget(ctx.secrets.delete(mcpSecretKey(root, s.name)));
+      } catch {}
+      persist?.();
+      sendProviders();
+      deleted.push("keys");
+    }
+    if (targets.checkpoints) {
+      await fs.rm(path.join(ctx.globalStorageUri.fsPath, "checkpoints"), { recursive: true, force: true }).catch(() => {});
+      deleted.push("checkpoints");
+    }
+    if (targets.agentState) {
+      await fs.rm(path.join(ctx.globalStorageUri.fsPath, "agentState"), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(ctx.globalStorageUri.fsPath, "arc.agentState.json"), { force: true }).catch(() => {});
+      await ctx.globalState.update("arc.agentState", undefined);
+      deleted.push("agent-state");
+    }
+    return deleted;
   };
   webview.onDidReceiveMessage(async (raw: unknown) => {
     if (!isWebviewMessage(raw)) {
@@ -3069,6 +3128,27 @@ function wireWebview(webview: vscode.Webview, session: Session) {
         }
         case "provider/list": {
           sendProviders();
+          break;
+        }
+        case "prefs/get": {
+          webview.postMessage({ type: "prefs/state", prefs: currentPrefs });
+          break;
+        }
+        case "prefs/set": {
+          const incoming = (msg.prefs ?? {}) as ArcPrefs;
+          const next: ArcPrefs = {};
+          if (typeof incoming.backendDebugOverride === "boolean") next.backendDebugOverride = incoming.backendDebugOverride;
+          if (typeof incoming.backendDebugAgreedAt === "string" && incoming.backendDebugAgreedAt.length <= 64) next.backendDebugAgreedAt = incoming.backendDebugAgreedAt;
+          currentPrefs = { ...currentPrefs, ...next };
+          if (!currentPrefs.backendDebugOverride) currentPrefs.backendDebugAgreedAt = undefined;
+          setRuntimePrefs(currentPrefs);
+          persist();
+          webview.postMessage({ type: "prefs/state", prefs: currentPrefs });
+          break;
+        }
+        case "data/delete": {
+          const deleted = await deleteUserData(msg.targets ?? {});
+          webview.postMessage({ type: "data/deleteResult", deleted });
           break;
         }
         case "provider/add": {

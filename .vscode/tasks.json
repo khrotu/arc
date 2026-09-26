@@ -30,6 +30,26 @@
       "problemMatcher": ["$tsc"]
     },
     {
+      "label": "start:arc-debug-host",
+      "type": "process",
+      "command": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+      "args": [
+        "-NoProfile",
+        "-Command",
+        "$probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 5874); $available = $true; try { $probe.Start() } catch { $available = $false } finally { $probe.Stop() }; if (-not $available) { throw 'Port 5874 is in use; close the previous Arc Extension Development Host before relaunching.' }; $codeArgs = @('--new-window', '--inspect-extensions', '5874', '--extensionDevelopmentPath=${workspaceFolder}\\packages\\arc', '${workspaceFolder}\\playground'); $startInfo = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:LOCALAPPDATA 'Programs\\Microsoft VS Code\\Code.exe')); foreach ($arg in $codeArgs) { [void]$startInfo.ArgumentList.Add($arg) }; [void][Diagnostics.Process]::Start($startInfo)"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "presentation": { "reveal": "silent", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "build:ext + start:arc-debug-host",
+      "dependsOn": ["build:ext (process)", "start:arc-debug-host"],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
       "label": "build:webview",
       "type": "shell",
       "command": "pnpm",

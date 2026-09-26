@@ -109,6 +109,9 @@ async function verify(path, src) {
   }
 }
 const target = process.argv[2];
+if (typeof target !== "string" || !target.endsWith(".vsix") || target.includes("\0") || /[<>:"|?*]/.test(target.split(/[\\/]/).pop() ?? "")) {
+  throw new Error("usage: repack-vsix.mjs <package.vsix>");
+}
 const TEXT_EXTS = new Set([".md", ".json", ".xml", ".txt", ".js", ".cjs", ".mjs", ".css", ".svg", ".html", ".vsixmanifest", ".tokens"]);
 const before = statSync(target).size;
 const src = (await readEntries(target))

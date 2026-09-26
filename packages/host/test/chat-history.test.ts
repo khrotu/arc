@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ChatHistory } from "../src/chat/history";
+import { ChatHistory } from "../src/chat/chat";
 describe("ChatHistory", () => {
   it("creates a chat on demand and tracks the current id", () => {
     const h = new ChatHistory();

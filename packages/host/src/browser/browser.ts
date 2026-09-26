@@ -229,11 +229,14 @@ export async function createBrowser(kind: BrowserKind = "chromium", headless = t
       if (!tab) return { ok: false, output: `Unknown tab '${tabId}'.` };
       try {
         if (selector) {
+          if (typeof selector !== "string" || !selector || selector.length > 1000) {
+            return { ok: false, output: "Scroll failed: selector must be a non-empty string up to 1000 chars" };
+          }
           await tab.page.evaluate(`(function(){const el=document.querySelector(${JSON.stringify(selector)});if(el)el.scrollIntoView({behavior:"smooth",block:"center"});})()`);
           return { ok: true, output: `Scrolled to ${selector}` };
         }
-        await tab.page.evaluate(`window.scrollBy(0, ${pixels ?? 300})`);
-        return { ok: true, output: `Scrolled by ${pixels ?? 300}px` };
+        await tab.page.evaluate(`window.scrollBy(0, ${Number.isFinite(pixels) ? pixels : 300})`);
+        return { ok: true, output: `Scrolled by ${Number.isFinite(pixels) ? pixels : 300}px` };
       } catch (e) { return { ok: false, output: `Scroll failed: ${(e as Error).message}` }; }
     },
     async waitFor(selector, urlPattern, state, tabId) {

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Trash2, Plug, X, Check, Info, Play, RefreshCw, CircleDot, AlertTriangle, Pencil, ChevronDown, ChevronRight } from "./icons";
 import { Expand, RotateArrow } from "./anim";
 import { ImportSection } from "./ImportSection";
+import { DeleteDataSection } from "./DeleteDataSection";
+import { ExperimentalSection } from "./ExperimentalSection";
 import type { RpcClient, HostEvent } from "../rpc";
 import type { ModelCatalogEntry, ModelDescriptor, ModelTier, ProviderKind, ProviderSummary } from "@arc/host/protocol";
 import { UI_FONT_OPTIONS, MONO_FONT_OPTIONS, applyFonts } from "../fonts";
@@ -1491,6 +1493,7 @@ function ToolsTab({ client, toolCatalog, onUseChat }: { client: RpcClient; toolC
         <ToolTogglesSection client={client} toolCatalog={toolCatalog} />
         <ShellSection client={client} />
         <SemanticSearchSection client={client} />
+        <WebSearchSection client={client} />
       </Section>
       <McpCategory client={client} />
       <HooksSection client={client} onUseChat={onUseChat} />
@@ -1819,6 +1822,46 @@ function SemanticSearchSection({ client }: { client: RpcClient }) {
     </Section>
   );
 }
+const WEB_SEARCH_BACKENDS = [
+  { id: "builtin", label: "built-in (free)", keyUrl: "" },
+  { id: "exa", label: "exa", keyUrl: "https://dashboard.exa.ai/api-keys" },
+  { id: "firecrawl", label: "firecrawl", keyUrl: "https://www.firecrawl.dev/app/api-keys" },
+  { id: "parallel", label: "parallel", keyUrl: "https://platform.parallel.ai/api-keys" },
+  { id: "tavily", label: "tavily", keyUrl: "https://app.tavily.com/home" },
+] as const;
+type WebSearchBackendId = typeof WEB_SEARCH_BACKENDS[number]["id"];
+function WebSearchSection({ client }: { client: RpcClient }) {
+  const [backend, setBackend] = useState<WebSearchBackendId>("builtin");
+  const [apiKey, setApiKey] = useState("");
+  useEffect(() => {
+    void client.request("arc.websearch.backend").then((v) => {
+      setBackend(WEB_SEARCH_BACKENDS.some((b) => b.id === v) ? (v as WebSearchBackendId) : "builtin");
+    });
+    void client.request("arc.websearch.apiKey").then((v) => setApiKey(typeof v === "string" ? v : ""));
+  }, [client]);
+  const meta = WEB_SEARCH_BACKENDS.find((b) => b.id === backend)!;
+  return (
+    <Section collapsible nested title="Web search" description="API used by the web.search tool. Applies to new chats.">
+      <ul className="arc-rows">
+        <li className="arc-row"><div className="arc-row-main">
+          <span className="arc-row-label">Backend</span>
+          <span className="arc-spacer" />
+          <select className="arc-input arc-input-sm" value={backend} onChange={(e) => { const v = e.target.value as WebSearchBackendId; setBackend(v); client.send({ type: SET, key: "arc.websearch.backend", value: v }); }}>
+            {WEB_SEARCH_BACKENDS.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+          </select>
+        </div></li>
+        {backend !== "builtin" && (
+          <li className="arc-row"><div className="arc-row-main">
+            <span className="arc-row-label">API key</span>
+            <span className="arc-row-meta">{meta.keyUrl ? <a href="#" onClick={(e) => { e.preventDefault(); client.send({ type: "ui/openExternal", url: meta.keyUrl }); }}>get a {meta.label} key</a> : "no key needed"}</span>
+            <span className="arc-spacer" />
+            <input className="arc-input arc-input-sm" type="password" placeholder={`${meta.label} API key`} value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={() => client.send({ type: SET, key: "arc.websearch.apiKey", value: apiKey.trim() })} style={{ width: 280 }} />
+          </div></li>
+        )}
+      </ul>
+    </Section>
+  );
+}
 interface CustomModeEntry { slug: string; roleDefinition: string; allowedTools: string[]; writeGlob?: string; description: string; whenToUse: string; model?: string; source: "builtin" | "workspace" | "global" }
 function emptyModeEntry(): CustomModeEntry {
   return { slug: "", roleDefinition: "", allowedTools: [], writeGlob: "", description: "", whenToUse: "", model: "", source: "workspace" };
@@ -2121,13 +2164,15 @@ function AboutSection({ logoTextUri, version, client }: { logoTextUri: string; v
   return (
     <div className="arc-about" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "clamp(8px, 1.5vw, 16px)", padding: "clamp(24px, 4vw, 56px) 0" }}>
       <img className="arc-about-logo-text" src={logoTextUri} alt="Arc" style={{ width: "100%", maxWidth: 560, height: "auto" }} />
-      <p className="arc-about-version" style={{ margin: 0, fontSize: "clamp(12px, 1.5vw, 17px)", fontWeight: 600 }}>v{version} <a href="#" onClick={(e) => { e.preventDefault(); client.send({ type: "ui/openExternal", url: `https://khrotu.org/blogs/arc-v${version.replace(/\./g, "-")}-release` }); }} style={{ fontWeight: 400, fontSize: "clamp(10px, 1.1vw, 13px)" }}>(Update Log)</a></p>
+      <p className="arc-about-version" style={{ margin: 0, fontSize: "clamp(12px, 1.5vw, 17px)", fontWeight: 600 }}>v{version} <a href="#" onClick={(e) => { e.preventDefault(); const tag = version.replace(/[^0-9a-zA-Z.]/g, "").slice(0, 24); if (tag) client.send({ type: "ui/openExternal", url: `https://khrotu.org/blogs/arc-v${tag.replace(/\./g, "-")}-release` }); }} style={{ fontWeight: 400, fontSize: "clamp(10px, 1.1vw, 13px)" }}>(Update Log)</a></p>
       <p className="arc-about-alpha" style={{ display: "flex", gap: "clamp(4px, 0.8vw, 10px)", alignItems: "flex-start", fontSize: "clamp(11px, 1.2vw, 13px)", color: "var(--vscode-descriptionForeground)", margin: 0, maxWidth: 560 }}>
         <Info size={16} style={{ flexShrink: 0, marginTop: 1, width: "clamp(12px, 1.6vw, 18px)", height: "clamp(12px, 1.6vw, 18px)" }} />
         <span>This extension is in <strong style={{ color: "var(--vscode-foreground)" }}>beta testing</strong>. Features, APIs, and configuration formats may change without notice.</span>
       </p>
       <div style={{ width: "100%", maxWidth: 560, marginTop: "clamp(16px, 3vw, 32px)" }}>
         <ImportSection client={client} />
+        <DeleteDataSection client={client} />
+        <ExperimentalSection client={client} />
       </div>
     </div>
   );

@@ -3,8 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import { scanAgentImports, importAgentChats, importAgentCredentials, credentialTarget, maskKey } from "../src/import/agent-import";
-import type { ImportedChat } from "../src/import/agent-import";
+import { scanAgentImports, importAgentChats, importAgentCredentials, credentialTarget, maskKey } from "../src/import/import";
+import type { ImportedChat } from "../src/import/import";
 let home: string;
 let chats: ImportedChat[];
 function makeSqlite(dbPath: string) {

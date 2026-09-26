@@ -65,6 +65,22 @@ export interface UrlPolicy {
   allowHttpLoopback?: boolean;
   sameOrigin?: string;
 }
+export function normalizeProviderBaseUrl(raw: string): string {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) throw new Error("Provider base URL is empty.");
+  if (/[\s<>\"'\\]/.test(trimmed)) throw new Error("Provider base URL contains invalid characters.");
+  const withScheme = /:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`;
+  let url: URL;
+  try {
+    url = new URL(withScheme);
+  } catch {
+    throw new Error("Provider base URL is not a valid URL.");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error(`Provider URL scheme '${url.protocol}' is not allowed.`);
+  if (url.username || url.password) throw new Error("Provider URL userinfo is not allowed.");
+  if (!url.hostname) throw new Error("Provider base URL is missing a hostname.");
+  return withScheme.replace(/\/+$/, "");
+}
 export async function assertSafeUrl(raw: string | URL, policy: UrlPolicy = {}): Promise<URL> {
   const url = raw instanceof URL ? new URL(raw.toString()) : new URL(raw);
   await resolveAndCheck(url, policy);

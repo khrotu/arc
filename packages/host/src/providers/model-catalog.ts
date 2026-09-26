@@ -5,7 +5,7 @@ import { attributionHeaders } from "./attribution.js";
 import { getCopilotBearerToken } from "./github-copilot.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { getOrBackEntries, type OrBackEntry } from "./or-back.js";
-import { readBodyLimited } from "../security/network.js";
+import { readBodyLimited, normalizeProviderBaseUrl } from "../security/network.js";
 export interface ProviderModelEntry {
   slug: string;
   providerId: string;
@@ -314,8 +314,12 @@ export function aliasKeyForSlug(slug: string): string {
 const SLUG_LIST_MAX_BYTES = 12 * 1024 * 1024;
 export async function listOpenAICompatibleModels(baseUrl: string | undefined, kind: string, apiKey?: string, proxyUrl?: string): Promise<string[] | undefined> {
   const spec = getProviderSpec(kind as never);
-  const base = (baseUrl || spec?.defaultBaseUrl || "").replace(/\/$/, "");
-  if (!base) return undefined;
+  let base: string;
+  try {
+    base = normalizeProviderBaseUrl(baseUrl || spec?.defaultBaseUrl || "");
+  } catch {
+    return undefined;
+  }
   const isAnthropic = kind === "anthropic";
   const isOllama = kind === "ollama";
   const isCopilot = kind === "github-copilot";

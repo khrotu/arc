@@ -1,6 +1,6 @@
 import { lazy, Suspense, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
-import { Settings, Plus, Trash2, Pencil, FoldVertical, PanelLeftClose, PanelLeft, ShieldCheck, ShieldOff, ShieldHalf, Search, ArrowLeft, Undo2, X, ListChecks } from "./icons";
+import { Settings, Plus, Trash2, Pencil, FoldVertical, PanelLeftClose, PanelLeft, ShieldCheck, ShieldOff, ShieldHalf, Search, ArrowLeft, Undo2, X, ListChecks, ChevronDown, Paperclip } from "./icons";
 import { TodoList, type TodoItemUI } from "./TodoList";
 import { FadeSlideIn } from "./anim";
 import ArcProcessUI, { type ProcessStep } from "./AgentProcess";
@@ -398,7 +398,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     setPendingAttachment(null);
     const localId = `local-${Date.now()}-${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
     pendingLocal.current.push(localId);
-    setMessages((prev) => [...prev, { id: localId, role: "user", content: text, ts: Date.now() }]);
+    setMessages((prev) => [...prev, { id: localId, role: "user", content: text, ts: Date.now(), ...(attachments?.length ? { attachments } : {}) }]);
     client.send({ type: "chat/send", text, attachments, images, ...(modelId ? { modelId } : {}), ...(autoRouted ? { autoRouted: true } : {}) });
   };
   const route = (text: string, attachments?: { uri: string; preview?: string }[], images?: string[]) => {
@@ -1088,11 +1088,33 @@ function compactionStepFor(message: ChatMessage): ProcessStep {
     noMark: true,
   };
 }
+const USER_COLLAPSE_LINES = 4;
+const USER_COLLAPSE_CHARS = 600;
+function UserBubbleText({ content, edited, expanded, onToggle }: { content: string; edited: boolean; expanded: boolean; onToggle: () => void }) {
+  const long = content.split("\n").length > USER_COLLAPSE_LINES || content.length > USER_COLLAPSE_CHARS;
+  if (!long) {
+    return (
+      <div className="arc-bubble-text">{content}{edited && (
+        <span className="arc-msg-edited" title="Edited after sending"> (edited)</span>
+      )}</div>
+    );
+  }
+  return (
+    <div className={`arc-bubble-text is-collapsible${expanded ? "" : " is-collapsed"}`}>{content}{edited && (
+      <span className="arc-msg-edited" title="Edited after sending"> (edited)</span>
+    )}
+      <button className="arc-bubble-expand" aria-expanded={expanded} title={expanded ? "Collapse message" : "Expand message"} aria-label={expanded ? "Collapse message" : "Expand message"} onClick={onToggle}>
+        <ChevronDown size={13} className={expanded ? "is-open" : ""} />
+      </button>
+    </div>
+  );
+}
 const MessageBubble = memo(function MessageBubble({ message, client }: { message: ChatMessage; client?: RpcClient }) {
   const isUser = message.role === "user";
   const isTool = message.role === "tool";
   const [enlarged, setEnlarged] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [msgExpanded, setMsgExpanded] = useState(false);
   const editRef = useRef<HTMLTextAreaElement>(null);
   if (isTool) {
     return (
@@ -1103,6 +1125,17 @@ const MessageBubble = memo(function MessageBubble({ message, client }: { message
     );
   }
   const userImages = (message as any).images as { image_url: { url: string } }[] | undefined;
+  const userAttachments = (message as { attachments?: { uri: string; preview?: string }[] }).attachments;
+  const attachPills = isUser && userAttachments?.length ? (
+    <div className="arc-bubble-attachments">
+      {userAttachments.map((a) => (
+        <span key={a.uri} className="arc-attach-pill" title={a.uri}>
+          <Paperclip size={11} />
+          <span className="arc-attach-pill-text">{a.preview ?? a.uri}</span>
+        </span>
+      ))}
+    </div>
+  ) : null;
   const imgs = userImages?.length ? (
     <div className="arc-bubble-images">
       {userImages.map((img, i) => (
@@ -1112,7 +1145,8 @@ const MessageBubble = memo(function MessageBubble({ message, client }: { message
   ) : null;
   return (
     <>
-      <div className={`arc-bubble ${isUser ? "arc-bubble-user" : "arc-bubble-assistant"}`}>
+      <div className={`arc-bubble ${isUser ? "arc-bubble-user" : "arc-bubble-assistant"}${isUser && editing ? " is-editing" : ""}`}>
+        {isUser && attachPills}
         {isUser && imgs}
         {isUser ? (
           editing ? (
@@ -1132,15 +1166,13 @@ const MessageBubble = memo(function MessageBubble({ message, client }: { message
                     setEditing(false);
                   }
                 }}
-                style={{ width: "100%", minHeight: 40, background: "var(--vscode-input-background)", color: "var(--vscode-input-foreground)", border: "1px solid var(--vscode-input-border)", borderRadius: "var(--arc-radius)", padding: "6px 8px", font: "inherit", fontSize: 13, resize: "none", outline: "none", lineHeight: 1.5 }}
-                rows={2}
+                style={{ width: "100%", minHeight: 120, maxHeight: "50vh", overflowY: "auto", background: "var(--vscode-input-background)", color: "var(--vscode-input-foreground)", border: "1px solid var(--vscode-input-border)", borderRadius: "var(--arc-radius)", padding: "8px 10px", font: "inherit", fontSize: 13, resize: "none", outline: "none", lineHeight: 1.5 }}
+                rows={Math.min(24, Math.max(8, message.content.split("\n").length))}
               />
             </div>
           ) : (
             <div style={{ display: "flex", alignItems: "flex-start", gap: 4, flexDirection: "row-reverse" }}>
-              <div className="arc-bubble-text">{message.content}{(message as unknown as { editedOriginal?: string }).editedOriginal !== undefined && (
-                <span className="arc-msg-edited" title="Edited after sending"> (edited)</span>
-              )}</div>
+              <UserBubbleText content={message.content} edited={((message as unknown as { editedOriginal?: string }).editedOriginal !== undefined)} expanded={msgExpanded} onToggle={() => setMsgExpanded((v) => !v)} />
               {client && (
                 <span style={{ display: "flex", gap: 2, opacity: 0, transition: "opacity 0.18s", flexShrink: 0, alignSelf: "flex-start", marginTop: 2 }} className="arc-msg-actions">
                   <button className="arc-iconbtn" style={{ width: 22, height: 22 }} title="Revert to here" onClick={() => { client.send({ type: "chat/revertToMessage", messageId: message.id, content: message.content, restoreFiles: true, loadToComposer: true }); }}>

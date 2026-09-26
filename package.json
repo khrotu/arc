@@ -1,7 +1,7 @@
 {
   "name": "arc-workspace",
   "private": true,
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Arc monorepo root",
   "packageManager": "pnpm@11.22.0",
   "engines": {

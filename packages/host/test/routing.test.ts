@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { ModelRegistry } from "../src/routing/registry";
-import { pickProvider, routeWithFailover, routeStream, recordFailure, recordSuccess, resetFailures, StallError, withProviderOverrides, estimateCost } from "../src/routing/router";
+import { pickProvider, routeWithFailover, routeStream, recordFailure, recordSuccess, resetFailures, resetAffinity, StallError, withProviderOverrides, estimateCost } from "../src/routing/router";
 import { perf } from "../src/routing/performance";
 import { AsyncEventQueue } from "../src/util/stream";
 import type { ModelDescriptor, ProviderConfig } from "../src/protocol/protocol";
@@ -27,7 +27,7 @@ function makeStream(events: StreamEvent[]): StreamHandle {
   })();
   return { events: q, abort: () => q.close() };
 }
-beforeEach(() => { perf.resetAll(); });
+beforeEach(() => { perf.resetAll(); resetAffinity(); });
 describe("ModelRegistry", () => {
   it("returns current model and falls back to a tier default", () => {
     const r = new ModelRegistry();
@@ -156,6 +156,73 @@ describe("routeStream", () => {
     expect(evs.some((e) => e.type === "error")).toBe(false);
     expect(evs.some((e) => e.type === "tool_call")).toBe(true);
     expect(evs.some((e) => e.type === "ping")).toBe(false);
+  });
+});
+describe("provider affinity", () => {
+  it("prefers the explicit provider over priority order", () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" }), makeProvider({ id: "p3" })] });
+    expect(pickProvider(r, r.get("m1")!, { preferProviderId: "p2" })?.provider.id).toBe("p2");
+  });
+  it("ignores unknown preferred providers", () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    expect(pickProvider(r, r.get("m1")!, { preferProviderId: "nope" })?.provider.id).toBe("p1");
+  });
+  it("falls back when the preferred provider circuit is open", () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    recordFailure("m1", "p2");
+    expect(pickProvider(r, r.get("m1")!, { preferProviderId: "p2", promptTokens: 100_000 })?.provider.id).toBe("p1");
+  });
+  it("sticks at long context despite worse performance", () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    perf.recordSuccess("p1", "m1", 50); perf.recordSuccess("p1", "m1", 50); perf.recordSuccess("p1", "m1", 50);
+    for (let i = 0; i < 5; i++) perf.recordStall("p2", "m1");
+    expect(perf.score("p2", "m1")).toBeLessThan(perf.score("p1", "m1") - 25);
+    expect(pickProvider(r, r.get("m1")!, { rerank: true, preferProviderId: "p2", promptTokens: 50_000 })?.provider.id).toBe("p2");
+  });
+  it("yields to a much better provider at short context", () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    perf.recordSuccess("p1", "m1", 50); perf.recordSuccess("p1", "m1", 50); perf.recordSuccess("p1", "m1", 50);
+    for (let i = 0; i < 5; i++) perf.recordStall("p2", "m1");
+    expect(pickProvider(r, r.get("m1")!, { rerank: true, preferProviderId: "p2", promptTokens: 100 })?.provider.id).toBe("p1");
+  });
+  it("routeStream tries the preferred provider first and records affinity", async () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    const order: string[] = [];
+    const h = await routeStream(r, r.get("m1")!, async (d) => {
+      order.push(d.provider.id);
+      if (d.provider.id !== "p2") throw new Error("skip");
+      return makeStream([{ type: "text", delta: "ok" }, { type: "done" }]);
+    }, { preferProviderId: "p2" });
+    for await (const e of h.events) { if (e.type === "done") break; }
+    expect(order).toEqual(["p2"]);
+    expect(pickProvider(r, r.get("m1")!)?.provider.id).toBe("p2");
+  });
+  it("routeStream fails over past a failing preferred provider", async () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    const order: string[] = [];
+    const h = await routeStream(r, r.get("m1")!, async (d) => {
+      order.push(d.provider.id);
+      if (d.provider.id === "p2") throw new Error("p2 down");
+      return makeStream([{ type: "text", delta: "ok" }, { type: "done" }]);
+    }, { preferProviderId: "p2" });
+    const evs: StreamEvent[] = [];
+    for await (const e of h.events) evs.push(e);
+    expect(order).toEqual(["p2", "p1"]);
+    expect(evs.some((e) => e.type === "text")).toBe(true);
+    expect(pickProvider(r, r.get("m1")!)?.provider.id).toBe("p1");
+  });
+  it("routeWithFailover honors the preferred provider", async () => {
+    const r = new ModelRegistry();
+    r.load({ models: [makeModel()], providers: [makeProvider({ id: "p1" }), makeProvider({ id: "p2" })] });
+    const used = await routeWithFailover(r, r.get("m1")!, async (d) => d.provider.id, { preferProviderId: "p2" });
+    expect(used).toBe("p2");
   });
 });
 describe("recordFailure / recordSuccess", () => {

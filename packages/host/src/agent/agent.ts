@@ -14,6 +14,7 @@ import { generateDependencyGraph, formatDepGraph } from "../util/dep-graph.js";
 import { tools as builtinTools, type ToolContext, killActiveProcesses, checkWriteGlob } from "./tools.js";
 import { markUsed } from "../util/suggestions.js";
 import { buildToolSpecs, isMcpToolSpec, parseMcpToolSpec } from "./tool-specs.js";
+import { compatAliasReverse, applyCompatAliases } from "../providers/tool-alias.js";
 import { SubagentRunner } from "./subagent.js";
 import { runHooks } from "../hooks/hooks.js";
 import { hostWarn, hostError } from "../log/logger.js";
@@ -74,7 +75,7 @@ export interface AgentOptions {
   proxyProvider?: string;
   proxyWeb?: string;
   proxyShell?: string;
-  fileContextTracker?: import("../context/tracker.js").FileContextTracker;
+  fileContextTracker?: import("../context/context.js").FileContextTracker;
   verifyMode?: "none" | "default" | "custom";
   verifyMaxRetries?: number;
   condensingPrompt?: string;
@@ -92,6 +93,7 @@ export class Agent {
   private usageByModel: Record<string, TurnUsage> = {};
   private tracker = new CompactionTracker();
   private lastPromptTokens = 0;
+  private lastProviderByModel = new Map<string, string>();
   private handoffs: HandoffRecord[] = [];
   private todoItems: TodoItem[] = [];
   private abortController?: AbortController;
@@ -110,6 +112,7 @@ export class Agent {
   private lastTodoUpdate = 0;
   private pendingChain: { toolName: string; args: Record<string, unknown>; resultText: string; displayTitle: string } | null = null;
   private mcpReverse: Map<string, { server: string; tool: string }> = new Map();
+  private compatAliasReverse: Map<string, string> = new Map();
   private toolMeta = new Map<string, { name: string; args: Record<string, unknown> }>();
   private toolAcc = new Map<string, { name: string; argsJson: string }>();
   private toolAccPrevContent = new Map<string, string>();
@@ -394,6 +397,9 @@ export class Agent {
       this.sink.message(planMsg);
     }
     const userMsg: ChatMessage = { id: randomUUID(), role: "user", content, ts: Date.now() };
+    if (attachments?.length) {
+      userMsg.attachments = attachments.slice(0, 20).map((a) => ({ uri: a.uri, preview: (a.preview ?? a.uri).slice(0, 120) }));
+    }
     if (images?.length) {
       const MAX_SEND_IMAGES = 8;
       const MAX_SEND_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -557,9 +563,15 @@ export class Agent {
       const modeDef = this.opts.modeRegistry.get(this.currentMode);
       const modeAllowed = modeDef ? new Set(modeDef.allowedTools) : this.opts.enabledTools;
       const effectiveTools = new Set([...this.opts.enabledTools].filter((t) => modeAllowed.has(t)));
-      const { specs: toolSpecs, mcpReverse } = buildToolSpecs(effectiveTools, this.opts.toolContext.mcp?.listTools());
+      let { specs: toolSpecs, mcpReverse } = buildToolSpecs(effectiveTools, this.opts.toolContext.mcp?.listTools());
       this.mcpReverse = mcpReverse;
+      this.compatAliasReverse = new Map();
       if (current) {
+        const compatReverse = compatAliasReverse(current, this.registry.listProviders(), effectiveTools);
+        if (compatReverse) {
+          toolSpecs = applyCompatAliases(toolSpecs, compatReverse);
+          this.compatAliasReverse = compatReverse;
+        }
         const cfg = { ...defaultCompactionConfig, ...(this.opts.compactionConfig ?? {}) };
         const dec = decideCompaction(this.messages, withProviderOverrides(current, this.registry.providersFor(current.id)[0]), this.tracker, cfg, this.lastPromptTokens, toolSpecs);
         if (dec.shouldCompact) {
@@ -632,8 +644,10 @@ export class Agent {
           proxyUrl: this.resolveProviderProxy(),
           reasoningEffort: this.opts.reasoningEffort,
           conversationId: this.conversationId,
+          workspaceRoot: this.opts.workspaceRoot,
         });
-      }, { rerank: true, ...(this.opts.reasoningEffort !== "none" ? { stallMs: 180_000, firstByteMs: 180_000 } : {}) });
+      }, { rerank: true, preferProviderId: this.lastProviderByModel.get(model.id), promptTokens: this.lastPromptTokens, ...(this.opts.reasoningEffort !== "none" ? { stallMs: 180_000, firstByteMs: 180_000 } : {}) });
+      if (usedProvider) this.lastProviderByModel.set(model.id, usedProvider.id);
       let text = "";
       let thinking = "";
       const toolCalls: ToolCall[] = [];
@@ -943,6 +957,8 @@ export class Agent {
     }
   }
   private async executeToolCall(tc: ToolCall, turnId: string) {
+    const compatReal = this.compatAliasReverse.get(tc.name);
+    if (compatReal) tc = { ...tc, name: compatReal };
     try {
       markUsed("tool", tc.name);
       if (tc.name === "mcp.call" && typeof tc.args?.server === "string") markUsed("mcp", String(tc.args.server));
@@ -1683,6 +1699,7 @@ export class Agent {
           signal: AbortSignal.timeout(10_000),
           proxyUrl: this.resolveProviderProxy(),
           conversationId: this.conversationId,
+          workspaceRoot: this.opts.workspaceRoot,
         });
       let text = "";
       for await (const ev of stream.events) {
@@ -1763,6 +1780,7 @@ Rules: terse bullets; no pleasantries; never invent facts; preserve exact identi
         signal: AbortSignal.timeout(60_000),
         proxyUrl: this.resolveProviderProxy(),
         conversationId: this.conversationId,
+        workspaceRoot: this.opts.workspaceRoot,
       });
       let text = "";
       for await (const ev of stream.events) {

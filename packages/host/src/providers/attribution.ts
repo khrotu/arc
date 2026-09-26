@@ -1,4 +1,5 @@
 import type { ProviderKind } from "../protocol/protocol.js";
+import { createHash, randomBytes } from "node:crypto";
 export interface AppIdentity {
   url: string;
   title: string;
@@ -28,14 +29,14 @@ const OR_DIALECT = new Set<ProviderKind>([
   "unorouter",
 ]);
 const OPENCODE_HOSTS = new Set(["opencode.ai"]);
-export const OPENCODE_VER_DEFAULT = "1.18.31";
+export const OPENCODE_VER_DEFAULT = "2.0.15";
 export let OPENCODE_VER = OPENCODE_VER_DEFAULT;
-export let OPENCODE_UA = `opencode/${OPENCODE_VER}`;
+export let OPENCODE_UA = `opencode/latest/${OPENCODE_VER}/cli`;
 export const OPENCODE_CLIENT = "cli";
 export function setOpencodeVer(ver: string): void {
   if (!ver) return;
   OPENCODE_VER = ver;
-  OPENCODE_UA = `opencode/${ver}`;
+  OPENCODE_UA = `opencode/latest/${ver}/cli`;
 }
 export function isOpencodeEndpoint(baseUrl: string | undefined, kind: ProviderKind): boolean {
   if (kind === "opencode" || kind === "opencode-go") return true;
@@ -52,21 +53,62 @@ export function isOpencodeEndpoint(baseUrl: string | undefined, kind: ProviderKi
     return lower.includes("opencode.ai") || lower.includes("/zen/") || lower.includes("/go/v1");
   }
 }
-function newOpencodeRequestId(): string {
-  try {
-    const g = globalThis as { crypto?: { randomUUID?: () => string } };
-    if (g.crypto?.randomUUID) return g.crypto.randomUUID();
-  } catch {}
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const OPENCODE_ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let opencodeIdCounter = 0;
+let opencodeIdLastTs = 0;
+function opencodeRandomSuffix(digest: Uint8Array, offset: number): string {
+  let suffix = "";
+  for (let i = 0; i < 14; i++) suffix += OPENCODE_ID_CHARS[digest[offset + i] % 62];
+  return suffix;
 }
-export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined, requestId?: string): Record<string, string> {
+const opencodeSessionIds = new Map<string, string>();
+function nextOpencodeCounter(now: number): number {
+  if (now !== opencodeIdLastTs) {
+    opencodeIdLastTs = now;
+    opencodeIdCounter = 0;
+  }
+  opencodeIdCounter++;
+  return opencodeIdCounter;
+}
+function opencodeTimeHex(now: number, counter: number): string {
+  const n = BigInt(now) * BigInt(0x1000) + BigInt(counter);
+  const timeBytes = Buffer.alloc(6);
+  for (let i = 0; i < 6; i++) timeBytes[i] = Number((n >> BigInt(40 - 8 * i)) & BigInt(0xff));
+  return timeBytes.toString("hex");
+}
+export function opencodeMessageId(now: number = Date.now()): string {
+  return `msg_${opencodeTimeHex(now, nextOpencodeCounter(now))}${opencodeRandomSuffix(randomBytes(14), 0)}`;
+}
+export function opencodeSessionId(conversationId: string): string {
+  const cached = opencodeSessionIds.get(conversationId);
+  if (cached) return cached;
+  const now = Date.now();
+  const id = `ses_${opencodeTimeHex(now, nextOpencodeCounter(now))}${opencodeRandomSuffix(randomBytes(14), 0)}`;
+  if (opencodeSessionIds.size >= 500) {
+    const oldest = opencodeSessionIds.keys().next().value as string | undefined;
+    if (oldest !== undefined) opencodeSessionIds.delete(oldest);
+  }
+  opencodeSessionIds.set(conversationId, id);
+  return id;
+}
+export function opencodeProjectId(workspaceRoot: string): string {
+  const digest = createHash("sha256").update(`arc-opencode-project:${workspaceRoot}`).digest();
+  return `${digest.subarray(0, 6).toString("hex")}${opencodeRandomSuffix(digest, 6)}`;
+}
+export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined, requestId?: string, projectRoot?: string): Record<string, string> {
   if (!isOpencodeEndpoint(baseUrl, kind)) return {};
   const out: Record<string, string> = {
     "user-agent": OPENCODE_UA,
     "x-opencode-client": OPENCODE_CLIENT,
   };
-  if (conversationId) out["x-opencode-session"] = conversationId;
-  out["x-opencode-request"] = requestId || newOpencodeRequestId();
+  if (projectRoot) out["x-opencode-project"] = opencodeProjectId(projectRoot);
+  if (conversationId) {
+    const session = opencodeSessionId(conversationId);
+    out["x-opencode-session"] = session;
+    out["x-session-affinity"] = session;
+    out["x-session-id"] = session;
+  }
+  out["x-opencode-request"] = requestId || opencodeMessageId();
   return out;
 }
 export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Record<string, string> {

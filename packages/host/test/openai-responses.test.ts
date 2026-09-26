@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { openAICompatibleTransport, toResponsesInput, isFormatMismatch } from "../src/providers/openai-compatible";
+import { openAICompatibleTransport, toResponsesInput, isFormatMismatch, providerFailure } from "../src/providers/openai-compatible";
 import { caps } from "../src/providers/capability-tracker";
 import type { StreamEvent, StreamRequest } from "../src/providers/transport";
 import type { ChatMessage, ModelDescriptor, ProviderConfig } from "../src/protocol/protocol";
@@ -221,7 +221,9 @@ describe("x-opencode-session header", () => {
     const events = await collect(await openAICompatibleTransport.stream(req));
     expect(events.some((e) => e.type === "text")).toBe(true);
     expect(fetchMock.mock.calls[0][0]).toContain("/chat/completions");
-    expect(headersOf(fetchMock.mock.calls[0])["x-opencode-session"]).toBe("conv-1");
+    expect(headersOf(fetchMock.mock.calls[0])["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(headersOf(fetchMock.mock.calls[0])["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(headersOf(fetchMock.mock.calls[0])["user-agent"]).toMatch(/^opencode\/latest\//);
   });
   it("sends the header on the responses path and for custom endpoints pointed at opencode.ai", async () => {
     const fetchMock = vi.fn(() => Promise.resolve(sseResponse([
@@ -235,7 +237,17 @@ describe("x-opencode-session header", () => {
     const events = await collect(await openAICompatibleTransport.stream(req));
     expect(events.some((e) => e.type === "text")).toBe(true);
     expect(fetchMock.mock.calls[0][0]).toContain("/responses");
-    expect(headersOf(fetchMock.mock.calls[0])["x-opencode-session"]).toBe("conv-9");
+    expect(headersOf(fetchMock.mock.calls[0])["x-opencode-session"]).toMatch(/^ses_/);
+  });
+  it("maps FreeTierError to actionable guidance", async () => {
+    const providerId = `p-ft-${Date.now()}`;
+    const model: ModelDescriptor = { id: "m", label: "M", tier: "default", contextWindow: 1, costPer1mIn: 0, costPer1mOut: 0, providers: [{ id: providerId, kind: "opencode", priority: 0 }] };
+    const provider: ProviderConfig = { id: providerId, kind: "opencode", label: "P", enabled: true };
+    const req: StreamRequest = { model, provider, messages: [msg("1", "user", "hi")] };
+    const err = providerFailure(req, "https://opencode.ai/zen/v1", 403, `{"type":"error","error":{"type":"FreeTierError"}}`);
+    expect(err.message).toContain("backend debugging override");
+    const plain = providerFailure(req, "https://opencode.ai/zen/v1", 500, "boom");
+    expect(plain.message).toContain("returned 500");
   });
   it("omits the header without a conversation id and for other hosts", async () => {
     const fetchMock = vi.fn(() => Promise.resolve(chatSse("hi")));

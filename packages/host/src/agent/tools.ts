@@ -8,6 +8,7 @@ import { findOnPath, minimalEnvironment, PROCESS_OUTPUT_LIMIT, proxyEnvironment,
 import { readBodyLimited, safeFetch } from "../security/network.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { parseNotebook, serializeNotebook, listCells, readCell, editCellSource, addCell, deleteCell } from "../notebook/notebook.js";
+import { normalizeWebSearchBackend, searchWithApiBackend, WEB_SEARCH_BACKEND_LABELS } from "../websearch/websearch.js";
 import type { SandboxProfile } from "../sandbox/sandbox.js";
 import type { DiffHunk } from "../protocol/process.js";
 import { loadArcIgnore } from "../util/arcignore.js";
@@ -229,7 +230,7 @@ async function runSingleCommand(
 import type { ApprovalsConfig, SessionApprovals, ApproveShellMeta } from "../approvals/index.js";
 import type { SkillRegistry } from "../skills/index.js";
 import type { RuleRegistry } from "../rules/index.js";
-import type { FileContextTracker } from "../context/tracker.js";
+import type { FileContextTracker } from "../context/context.js";
 export interface ToolContext {
   root: string;
   approvalsConfig: ApprovalsConfig;
@@ -241,8 +242,8 @@ export interface ToolContext {
   sandboxProfile?: SandboxProfile;
   shellSurface?: "arc-handled" | "integrated";
   runInVsCodeTerminal?: (command: string, cwd: string) => Promise<{ ok: boolean; output: string }>;
-  problems?: () => Promise<import("../lsp/bridge.js").DiagnosticLite[]>;
-  problemsFor?: (file: string) => Promise<import("../lsp/bridge.js").DiagnosticLite[]>;
+  problems?: () => Promise<import("../lsp/lsp.js").DiagnosticLite[]>;
+  problemsFor?: (file: string) => Promise<import("../lsp/lsp.js").DiagnosticLite[]>;
   summaryForFiles?: (files: string[]) => Promise<{ hasErrors: boolean; hasWarnings: boolean; text: string }>;
   grep?: (pattern: string, include?: string) => Promise<{ file: string; line: number; column: number; text: string }[]>;
   glob?: (pattern: string) => Promise<string[]>;
@@ -255,6 +256,8 @@ export interface ToolContext {
   proxyProvider?: string;
   proxyWeb?: string;
   proxyShell?: string;
+  webSearchBackend?: string;
+  webSearchApiKey?: string;
   semanticSearch?: (query: string, k?: number) => Promise<{ file: string; start: number; end: number; score: number; snippet: string }[]>;
   describeImage?: (dataUrl: string) => Promise<string | undefined>;
   fileContextTracker?: FileContextTracker;
@@ -804,6 +807,26 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
         const n = Number(args.count);
         const count = Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 20) : 10;
         const dispatcher = ctx.proxyWeb || ctx.proxyUrl ? makeProxyDispatcher(ctx.proxyWeb || ctx.proxyUrl!) : undefined;
+        const backend = normalizeWebSearchBackend(ctx.webSearchBackend);
+        if (backend !== "builtin") {
+          const apiKey = (ctx.webSearchApiKey ?? "").trim();
+          if (!apiKey) {
+            const meta = WEB_SEARCH_BACKEND_LABELS[backend];
+            return { ok: false, output: `No API key configured for ${meta.label}. Add one in Arc settings under Tools > Web search, or switch the backend back to Built-in.` };
+          }
+          try {
+            const apiResults = await searchWithApiBackend(backend, rawQuery, count, { apiKey, signal: ctx.signal, dispatcher });
+            if (apiResults.length > 0) {
+              return { ok: true, output: apiResults.map((r, i) => `${i + 1}. **${r.title}**\n   ${r.snippet}\n   ${r.url}`).join("\n\n") };
+            }
+          } catch {
+            const fallback = await searchWeb(rawQuery, count, dispatcher, ctx.signal);
+            if (fallback.length > 0) {
+              return { ok: true, output: fallback.map((r, i) => `${i + 1}. **${r.title}**\n   ${r.snippet}\n   ${r.url}`).join("\n\n") };
+            }
+            return { ok: false, output: `Search failed: ${WEB_SEARCH_BACKEND_LABELS[backend].label} returned an error and the built-in fallback found nothing. Check the API key in Arc settings under Tools > Web search, or retry shortly.` };
+          }
+        }
         const results = await searchWeb(rawQuery, count, dispatcher, ctx.signal);
         const out = results.length > 0
           ? results.map((r, i) => `${i + 1}. **${r.title}**\n   ${r.snippet}\n   ${r.url}`).join("\n\n")
@@ -1727,7 +1750,8 @@ function extractUddgUrl(raw: string): string {
   return m ? decodeURIComponent(m[1]) : raw;
 }
 export function decodeHtml(s: string): string {
-  return s
+  const input = s.length > 500_000 ? s.slice(0, 500_000) : s;
+  return input
     .replace(/<[^>]*>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -1759,7 +1783,12 @@ function searchHref(attrs: string): string | undefined {
 function isUsableResultUrl(url: string): boolean {
   return /^https?:\/\/[^/]+\.[^/]+/i.test(url);
 }
+const MAX_PARSE_HTML_CHARS = 2_000_000;
+function boundParseHtml(html: string): string {
+  return html.length > MAX_PARSE_HTML_CHARS ? html.slice(0, MAX_PARSE_HTML_CHARS) : html;
+}
 export function parseHtmlResults(html: string, max: number): SearchResult[] {
+  html = boundParseHtml(html);
   if (hasCaptcha(html)) return [];
   const links: { href: string; title: string }[] = [];
   const anchorRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
@@ -1790,6 +1819,7 @@ function extractYahooTarget(href: string): string | undefined {
   }
 }
 export function parseYahooResults(html: string, max: number): SearchResult[] {
+  html = boundParseHtml(html);
   const links: { href: string; title: string }[] = [];
   const anchorRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
   let m: RegExpExecArray | null;

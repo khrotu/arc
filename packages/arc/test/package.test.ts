@@ -103,7 +103,7 @@ describe("arc extension package", () => {
       "src/compaction/compaction.ts",
       "src/mcp/mcp.ts",
       "src/browser/browser.ts",
-      "src/lsp/bridge.ts",
+      "src/lsp/lsp.ts",
       "src/prompts/prompts.ts",
       "src/providers/catalog.ts",
     ]) {

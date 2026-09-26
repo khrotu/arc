@@ -207,7 +207,7 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     }, ["url"]),
   },
   "web.search": {
-    description: "Search the web using DuckDuckGo and return the top results.",
+    description: "Search the web and return the top results.",
     parameters: obj({
       query: str("Search query string."),
       count: num("Maximum number of results to return (default 10, max 20)."),

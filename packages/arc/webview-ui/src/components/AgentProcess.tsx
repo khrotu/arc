@@ -473,15 +473,45 @@ const GroupNode = memo(({ step, onOpenFile, onOpenFullscreenDiff, toolTreeMode, 
 });
 GroupNode.displayName = "GroupNode";
 const ThoughtNode = memo(({ step }: { step: ProcessStep }) => {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => !!step.pending);
+  const userToggledRef = useRef(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const secs = ((step.durationMs ?? 0) / 1000).toFixed(1);
   const hasContent = !!step.content;
-  const showBody = hasContent && (open || !!step.pending);
+  const showBody = hasContent && open;
+  useEffect(() => {
+    if (step.pending && hasContent && !userToggledRef.current) {
+      setOpen(true);
+    }
+  }, [step.pending, hasContent]);
+  useEffect(() => {
+    if (!step.pending && !userToggledRef.current) {
+      setOpen(false);
+    }
+  }, [step.pending]);
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !showBody || !step.pending) return;
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [step.content, showBody, step.pending]);
+  const handleScroll = useCallback(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 32;
+  }, []);
+  const handleToggle = useCallback(() => {
+    userToggledRef.current = true;
+    stickToBottomRef.current = true;
+    setOpen((o) => !o);
+  }, []);
   return (
     <FadeSlideIn className="arc-proc-node arc-proc-node-thought">
       <button
         className="arc-proc-row"
-        onClick={() => hasContent && setOpen((o) => !o)}
+        onClick={() => hasContent && handleToggle()}
         disabled={!hasContent}
         aria-expanded={hasContent ? showBody : undefined}
       >
@@ -489,14 +519,14 @@ const ThoughtNode = memo(({ step }: { step: ProcessStep }) => {
         <span className="arc-proc-title arc-proc-title-thought">
           {step.pending ? <>Thinking<span className="arc-working-dots" /></> : `Thought for ${secs} seconds`}
         </span>
-        {hasContent && !step.pending && (
-          <RotateArrow open={open} />
+        {hasContent && (
+          <RotateArrow open={showBody} />
         )}
       </button>
       <Expand open={showBody}>
         <div className="arc-proc-children">
           <span className="arc-proc-treeline" />
-          <div className="arc-proc-text is-thought">{step.content}</div>
+          <div ref={bodyRef} onScroll={handleScroll} className="arc-proc-text is-thought arc-proc-thought-body">{step.content}</div>
         </div>
       </Expand>
     </FadeSlideIn>

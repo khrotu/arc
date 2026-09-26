@@ -17,7 +17,7 @@ describe("versions cache", () => {
     const fetchImpl = (async () => new Response(JSON.stringify({ tag_name: "v9.9.9" }), { status: 200 })) as typeof fetch;
     const ver = await refreshOpencodeVer({ fetchImpl, cachePath, ttlMs: 60_000 });
     expect(ver).toBe("9.9.9");
-    expect(OPENCODE_UA).toBe("opencode/9.9.9");
+    expect(OPENCODE_UA).toBe("opencode/latest/9.9.9/cli");
     const cached = await refreshOpencodeVer({ fetchImpl: (async () => { throw new Error("no network"); }) as typeof fetch, cachePath, ttlMs: 60_000 });
     expect(cached).toBe("9.9.9");
     setOpencodeVer(OPENCODE_VER_DEFAULT);

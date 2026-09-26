@@ -6,6 +6,83 @@ import EffortPicker, { type Effort } from "./EffortPicker";
 import { TodoList, type TodoItemUI } from "./TodoList";
 import type { ModelDescriptor } from "@arc/host/protocol";
 type Attachment = { uri: string; preview?: string };
+type PasteBlock = { id: number; name: string; text: string; expanded: boolean };
+const PASTE_COLLAPSE_CHARS = 1000;
+const pasteMarker = (name: string) => `[${name}]`;
+const PASTE_MARKER_RE = /\[Pasted content \d+\]/g;
+function knownMarkers(pastes: PasteBlock[]): Set<string> {
+  return new Set(pastes.map((p) => pasteMarker(p.name)));
+}
+function makeMarkerSpan(marker: string): HTMLSpanElement {
+  const s = document.createElement("span");
+  s.className = "arc-paste-inline";
+  s.contentEditable = "false";
+  s.dataset.marker = marker;
+  s.textContent = marker;
+  return s;
+}
+function renderEditable(el: HTMLDivElement, value: string, markers: Set<string>) {
+  el.textContent = "";
+  const frag = document.createDocumentFragment();
+  let last = 0;
+  PASTE_MARKER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PASTE_MARKER_RE.exec(value))) {
+    if (m.index > last) frag.appendChild(document.createTextNode(value.slice(last, m.index)));
+    if (markers.has(m[0])) frag.appendChild(makeMarkerSpan(m[0]));
+    else frag.appendChild(document.createTextNode(m[0]));
+    last = m.index + m[0].length;
+  }
+  if (last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+  if (!frag.textContent) frag.appendChild(document.createElement("br"));
+  el.appendChild(frag);
+}
+function readEditable(el: HTMLDivElement): string {
+  let out = "";
+  el.childNodes.forEach((n) => {
+    out += n.nodeName === "BR" ? "\n" : (n.textContent ?? "");
+  });
+  return out.replace(/\n$/, "");
+}
+function insertNodesAtCaret(el: HTMLDivElement, nodes: Node[]) {
+  el.focus();
+  const sel = window.getSelection();
+  const placeEnd = () => {
+    for (const n of nodes) el.appendChild(n);
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const fresh = window.getSelection();
+    fresh?.removeAllRanges();
+    fresh?.addRange(range);
+  };
+  if (!sel || !sel.rangeCount) {
+    placeEnd();
+    return;
+  }
+  const range = sel.getRangeAt(0);
+  if (!el.contains(range.commonAncestorContainer)) {
+    placeEnd();
+    return;
+  }
+  range.deleteContents();
+  const last = nodes[nodes.length - 1];
+  for (const n of nodes) range.insertNode(n);
+  range.setStartAfter(last);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+function insertPlainAtCaret(el: HTMLDivElement, plain: string) {
+  const nodes: Node[] = [];
+  const parts = plain.split("\n");
+  parts.forEach((part, i) => {
+    if (i > 0) nodes.push(document.createElement("br"));
+    if (part) nodes.push(document.createTextNode(part));
+  });
+  if (!nodes.length) nodes.push(document.createElement("br"));
+  insertNodesAtCaret(el, nodes);
+}
 function AttachParent({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const [flip, setFlip] = useState(false);
@@ -92,11 +169,21 @@ export default function Composer({
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [images, setImages] = useState<string[]>([]);
+  const [pastes, setPastes] = useState<PasteBlock[]>([]);
   const [enlarged, setEnlarged] = useState<string | null>(null);
   const [actionsOpen, setActionsOpen] = useState(false);
-  const ref = useRef<HTMLTextAreaElement>(null);
+  const pasteIdRef = useRef(0);
+  const ref = useRef<HTMLDivElement>(null);
+  const textRef = useRef("");
   const actionsRef = useRef<HTMLDivElement>(null);
   useEffect(() => { if (autoFocus) ref.current?.focus(); }, [autoFocus]);
+  const syncFromDom = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const v = readEditable(el);
+    textRef.current = v;
+    setText(v);
+  }, []);
   useLayoutEffect(() => {
     if (prefillText !== undefined && prefillText !== null) {
       setText(prefillText);
@@ -109,9 +196,11 @@ export default function Composer({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    el.style.height = "0px";
-    el.style.height = Math.min(el.scrollHeight, 200) + "px";
-  }, [text]);
+    if (textRef.current !== text) {
+      renderEditable(el, text, knownMarkers(pastes));
+      textRef.current = text;
+    }
+  });
   useEffect(() => {
     if (!actionsOpen) return;
     const handler = (e: MouseEvent) => {
@@ -131,8 +220,27 @@ export default function Composer({
     }
   }, [pendingAttachment]);
   const routeActive = !!routing || !!routePending;
+  const fullText = useCallback(() => {
+    let out = text;
+    for (const p of pastes) {
+      const marker = pasteMarker(p.name);
+      if (out.includes(marker)) out = out.split(marker).join(p.text.trim());
+    }
+    return out.trim();
+  }, [text, pastes]);
+  const removePaste = useCallback((id: number, name: string) => {
+    setPastes((prev) => prev.filter((x) => x.id !== id));
+    const marker = pasteMarker(name);
+    setText((t) => t.includes(marker) ? t.split(marker).join("") : t);
+  }, []);
+  const clearInputs = useCallback(() => {
+    setText("");
+    setAttachments([]);
+    setImages([]);
+    setPastes([]);
+  }, []);
   const submit = useCallback(() => {
-    const t = text.trim();
+    const t = fullText();
     if (!t || disabled) return;
     if (routeActive) return;
     if (polishLevel && polishLevel !== "off" && !polishing && !polishPending && onPolish) {
@@ -141,16 +249,12 @@ export default function Composer({
     }
     onSend(t, attachments.length ? attachments : undefined, images.length ? images : undefined);
     if (!autoMode) {
-      setText("");
-      setAttachments([]);
-      setImages([]);
+      clearInputs();
     }
-  }, [text, disabled, streaming, attachments, images, onSend, polishLevel, polishing, polishPending, onPolish, autoMode, routeActive]);
+  }, [fullText, disabled, streaming, attachments, images, onSend, polishLevel, polishing, polishPending, onPolish, autoMode, routeActive, clearInputs]);
   const acceptRoute = () => {
     onAcceptRouted?.();
-    setText("");
-    setAttachments([]);
-    setImages([]);
+    clearInputs();
   };
   const rejectRoute = () => {
     onRejectRouted?.();
@@ -457,36 +561,83 @@ export default function Composer({
           ))}
         </div>
       )}
-      <textarea
+      {pastes.length > 0 && (
+        <div className="arc-composer-pastes">
+          {pastes.map((p) => {
+            const lines = p.text.split("\n").length;
+            return (
+              <div key={p.id} className="arc-paste">
+                <span className="arc-attach-pill is-paste">
+                  <button className="arc-paste-pill" onClick={() => setPastes((prev) => prev.map((x) => x.id === p.id ? { ...x, expanded: !x.expanded } : x))} aria-expanded={p.expanded} title={p.expanded ? "Collapse pasted content" : "Expand and edit pasted content"}>
+                    <span className="arc-attach-pill-text">{p.name} · {lines} {lines === 1 ? "line" : "lines"}</span>
+                    <ChevronDown size={11} className={p.expanded ? "is-open" : ""} />
+                  </button>
+                  <button className="arc-attach-pill-x" onClick={() => removePaste(p.id, p.name)} aria-label="Remove pasted content">
+                    <X size={11} />
+                  </button>
+                </span>
+                {p.expanded && (
+                  <textarea
+                    className="arc-paste-editor"
+                    value={p.text}
+                    onChange={(e) => setPastes((prev) => prev.map((x) => x.id === p.id ? { ...x, text: e.target.value } : x))}
+                    rows={Math.min(10, Math.max(3, p.text.split("\n").length))}
+                    aria-label="Edit pasted content"
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div
         ref={ref}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
+        className={`arc-composer-editable${text ? "" : " is-empty"}${disabled || polishing || routeActive ? " is-disabled" : ""}`}
+        contentEditable={!disabled && !polishing && !routeActive}
+        role="textbox"
+        aria-multiline="true"
+        aria-label={placeholder ?? "Ask Arc anything..."}
+        data-placeholder={placeholder ?? "Ask Arc anything..."}
+        suppressContentEditableWarning
+        onInput={syncFromDom}
         onPaste={(e) => {
           const items = e.clipboardData?.items;
-          if (!items) return;
-          for (let i = 0; i < items.length; i++) {
-            if (items[i].type.startsWith("image/")) {
-              const blob = items[i].getAsFile();
-              if (!blob) continue;
-              const reader = new FileReader();
-              reader.onload = () => setImages((prev) => [...prev, reader.result as string]);
-              reader.readAsDataURL(blob);
-              e.preventDefault();
+          if (items) {
+            for (let i = 0; i < items.length; i++) {
+              if (items[i].type.startsWith("image/")) {
+                const blob = items[i].getAsFile();
+                if (!blob) continue;
+                const reader = new FileReader();
+                reader.onload = () => setImages((prev) => [...prev, reader.result as string]);
+                reader.readAsDataURL(blob);
+                e.preventDefault();
+              }
             }
           }
+          const plain = e.clipboardData?.getData("text/plain") ?? "";
+          if (!plain) return;
+          e.preventDefault();
+          const el = ref.current;
+          if (!el) return;
+          if (plain.length >= PASTE_COLLAPSE_CHARS) {
+            const id = ++pasteIdRef.current;
+            const name = `Pasted content ${id}`;
+            setPastes((prev) => [...prev, { id, name, text: plain, expanded: false }]);
+            insertNodesAtCaret(el, [makeMarkerSpan(pasteMarker(name))]);
+          } else {
+            insertPlainAtCaret(el, plain);
+          }
+          syncFromDom();
         }}
         onKeyDown={(e) => {
           if (e.key === "Enter" && e.ctrlKey && onGuidance) {
             e.preventDefault();
-            const t = text.trim();
-            if (t) { onGuidance(t); setText(""); }
+            const t = fullText();
+            if (t) { onGuidance(t); clearInputs(); }
           } else if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault(); submit();
           }
         }}
-        rows={1}
-        disabled={disabled || !!polishing || routeActive}
-        placeholder={placeholder ?? "Ask Arc anything..."}
       />
       <div className="arc-composer-bar">
         <div className="arc-composer-pickers">
@@ -530,7 +681,7 @@ export default function Composer({
             <button className="arc-composer-send is-stop" onClick={onStop} title="Stop">
               <Square size={12} strokeWidth={2.5} />
             </button>
-            {text.trim() ? (
+            {fullText() ? (
               <>
                 <span className="arc-send-sep" />
                 <button className="arc-composer-send" onClick={submit} title="Send (queues after current turn)">
@@ -542,10 +693,10 @@ export default function Composer({
                 </button>
                 {actionsOpen && (
                   <div className="arc-send-dropdown">
-                    <button className="arc-send-dropdown-item" onClick={() => { setActionsOpen(false); if (text.trim() && onGuidance) { onGuidance(text.trim()); setText(""); } }} disabled={!text.trim()}>
+                    <button className="arc-send-dropdown-item" onClick={() => { setActionsOpen(false); const t = fullText(); if (t && onGuidance) { onGuidance(t); clearInputs(); } }} disabled={!fullText()}>
                       Steer
                     </button>
-                    <button className="arc-send-dropdown-item" onClick={() => { setActionsOpen(false); if (text.trim()) { onSend(text.trim(), attachments.length ? attachments : undefined, images.length ? images : undefined); setText(""); setAttachments([]); setImages([]); } }} disabled={!text.trim()}>
+                    <button className="arc-send-dropdown-item" onClick={() => { setActionsOpen(false); const t = fullText(); if (t) { onSend(t, attachments.length ? attachments : undefined, images.length ? images : undefined); clearInputs(); } }} disabled={!fullText()}>
                       Queue
                     </button>
                   </div>
@@ -554,7 +705,7 @@ export default function Composer({
             ) : null}
           </div>
         ) : (
-          <button className="arc-composer-send" onClick={submit} disabled={disabled || polishing || routeActive || !text.trim()} title="Send (Enter)">
+          <button className="arc-composer-send" onClick={submit} disabled={disabled || polishing || routeActive || !fullText()} title="Send (Enter)">
             <ArrowUp size={15} strokeWidth={2.5} />
           </button>
         )}

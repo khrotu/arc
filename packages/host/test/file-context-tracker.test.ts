@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import { FileContextTracker } from "../src/context/tracker";
+import { FileContextTracker } from "../src/context/context";
 describe("FileContextTracker", () => {
   let root: string;
   let dbPath: string;

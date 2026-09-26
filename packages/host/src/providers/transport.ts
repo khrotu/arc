@@ -106,6 +106,7 @@ export interface StreamRequest {
   proxyUrl?: string;
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   conversationId?: string;
+  workspaceRoot?: string;
 }
 export interface StreamHandle {
   events: AsyncIterable<StreamEvent>;

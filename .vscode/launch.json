@@ -2,48 +2,49 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run Arc Extension (no preLaunch)",
-      "type": "extensionHost",
-      "request": "launch",
-      "folder": "${workspaceFolder}/playground",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/packages/arc"
-      ],
+      "name": "Run Arc Extension (no build)",
+      "type": "node",
+      "request": "attach",
+      "timeout": 30000,
+      "address": "127.0.0.1",
+      "port": 5874,
+      "restart": false,
       "outFiles": [
         "${workspaceFolder}/packages/arc/dist/**/*.js"
       ],
+      "preLaunchTask": "start:arc-debug-host",
       "presentation": {
         "reveal": "auto"
       }
     },
     {
       "name": "Run Arc Extension",
-      "type": "extensionHost",
-      "request": "launch",
-      "folder": "${workspaceFolder}/playground",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/packages/arc"
-      ],
+      "type": "node",
+      "request": "attach",
+      "timeout": 30000,
+      "address": "127.0.0.1",
+      "port": 5874,
+      "restart": false,
       "outFiles": [
         "${workspaceFolder}/packages/arc/dist/**/*.js"
       ],
-      "preLaunchTask": "build:ext (process)",
+      "preLaunchTask": "build:ext + start:arc-debug-host",
       "presentation": {
         "reveal": "auto"
       }
     },
     {
       "name": "Run Arc Extension (watch + reload)",
-      "type": "extensionHost",
-      "request": "launch",
-      "folder": "${workspaceFolder}/playground",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/packages/arc"
-      ],
+      "type": "node",
+      "request": "attach",
+      "timeout": 30000,
+      "address": "127.0.0.1",
+      "port": 5874,
+      "restart": false,
       "outFiles": [
         "${workspaceFolder}/packages/arc/dist/**/*.js"
       ],
-      "preLaunchTask": "build:ext (process)",
+      "preLaunchTask": "build:ext + start:arc-debug-host",
       "presentation": {
         "reveal": "auto"
       }
@@ -90,7 +91,6 @@
   "compounds": [
     {
       "name": "Arc: Build + Launch",
-      "preLaunchTask": "build:ext (process)",
       "configurations": ["Run Arc Extension"]
     }
   ]

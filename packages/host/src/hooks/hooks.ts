@@ -6,6 +6,18 @@ import { globToRegExpSource } from "../util/glob.js";
 import type { SandboxProfile } from "../sandbox/sandbox.js";
 const ANSI_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 function stripAnsi(s: string): string { return s.replace(ANSI_RE, ""); }
+const MAX_USER_PATTERN_LENGTH = 500;
+function compileUserPattern(pattern: unknown): RegExp | undefined {
+  if (typeof pattern !== "string" || !pattern || pattern.length > MAX_USER_PATTERN_LENGTH) return undefined;
+  try {
+    const re = new RegExp(pattern, "gm");
+    re.test("");
+    re.lastIndex = 0;
+    return re;
+  } catch {
+    return undefined;
+  }
+}
 export type HookEvent =
   | "session.start"
   | "user.submit"
@@ -164,7 +176,14 @@ export async function runPreWriteHooks(filePath: string, content: string, worksp
   for (const hook of hooks) {
     if (hook.type === "secret-scan" || (!hook.type && !hook.command)) {
       const patterns = hook.pattern
-        ? [{ pattern: new RegExp(hook.pattern, "gm"), label: "custom pattern" }]
+        ? (() => {
+            const compiled = compileUserPattern(hook.pattern);
+            if (!compiled) {
+              warnings.push("Invalid custom secret-scan pattern (invalid regex / >500 chars); skipped");
+              return [] as { pattern: RegExp; label: string }[];
+            }
+            return [{ pattern: compiled, label: "custom pattern" }];
+          })()
         : SECRET_PATTERNS;
       for (const p of patterns) {
         const matches = content.match(p.pattern);
@@ -204,7 +223,14 @@ export async function runPostEditHooks(filePath: string, root: string, sandboxPr
     if (hook.type !== "command" || !hook.command) continue;
     if (hook.glob) {
       const rel = path.relative(root, filePath).replace(/\\/g, "/");
-      const globRe = new RegExp("^" + globToRegExpSource(hook.glob) + "$");
+      let globSource: string;
+      try {
+        globSource = globToRegExpSource(hook.glob);
+      } catch {
+        errors.push(`Invalid post-edit hook glob; hook skipped`);
+        continue;
+      }
+      const globRe = new RegExp("^" + globSource + "$");
       if (!globRe.test(rel)) continue;
     }
     try {

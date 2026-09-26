@@ -1,7 +1,11 @@
 import type { DiffHunk, ProcessStep } from "./process.js";
-import type { ImportAgentSummaryPreview } from "../import/agent-import.js";
+import type { ImportAgentSummaryPreview } from "../import/import.js";
 export type Role = "system" | "user" | "assistant" | "tool" | "developer";
 export type ModelTier = "free" | "light" | "default" | "heavy";
+export interface ArcPrefs {
+  backendDebugOverride?: boolean;
+  backendDebugAgreedAt?: string;
+}
 export interface ModelDescriptor {
   id: string;
   label: string;
@@ -330,6 +334,7 @@ export interface ChatMessage {
   meta?: { modelId: string; providerId: string; tier: ModelTier };
   editedOriginal?: string;
   images?: { type: string; image_url: { url: string } }[];
+  attachments?: { uri: string; preview?: string }[];
   noCompact?: boolean;
   hidden?: boolean;
 }
@@ -414,7 +419,9 @@ export type HostMsg =
   | { type: "import/scanResult"; agents: ImportAgentSummaryPreview[] }
   | { type: "import/chatProgress"; agent: string; done: number; total: number }
   | { type: "import/chatDone"; agent: string; chats: number; messages: number; error?: string }
-  | { type: "suggestions/list"; items: { kind: string; id: string; label: string; detail?: string; tokens: number; idleMs?: number }[] };
+  | { type: "suggestions/list"; items: { kind: string; id: string; label: string; detail?: string; tokens: number; idleMs?: number }[] }
+  | { type: "prefs/state"; prefs: ArcPrefs }
+  | { type: "data/deleteResult"; deleted: string[]; error?: string };
 export type WebviewMsg =
   | { type: "chat/send"; text: string; attachments?: { uri: string; preview?: string }[]; images?: string[]; modelId?: string; autoRouted?: boolean }
   | { type: "chat/route"; text: string; attachments?: { uri: string; preview?: string }[]; images?: string[] }
@@ -494,6 +501,9 @@ export type WebviewMsg =
   | { type: "import/scan" }
   | { type: "import/credentials"; agent: string; keys: string[] }
   | { type: "import/chats"; agent: string }
+  | { type: "prefs/get" }
+  | { type: "prefs/set"; prefs: ArcPrefs }
+  | { type: "data/delete"; targets: { chats?: boolean; keys?: boolean; checkpoints?: boolean; agentState?: boolean } }
   | { type: "suggestions/list" }
   | { type: "suggestions/unload"; kind: string; id: string }
   | { type: "suggestions/dismiss"; kind: string; id: string };

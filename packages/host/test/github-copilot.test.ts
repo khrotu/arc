@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { randomBytes } from "node:crypto";
 import {
   getCopilotBearerToken,
   copilotRequestHeaders,
@@ -30,9 +31,9 @@ describe("getCopilotBearerToken", () => {
     const fetchMock = vi.fn(() => Promise.resolve(tokenResponse("unused", 9999999999)));
     vi.stubGlobal("fetch", fetchMock);
     await expect(getCopilotBearerToken("tid:abc123")).resolves.toBe("tid:abc123");
-    await expect(
-      getCopilotBearerToken("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"),
-    ).resolves.toContain("eyJ");
+    const segment = (): string => randomBytes(16).toString("base64url");
+    const jwtLike = `${segment()}.${segment()}.${segment()}`;
+    await expect(getCopilotBearerToken(jwtLike)).resolves.toBe(jwtLike);
     expect(fetchMock).not.toHaveBeenCalled();
   });
   it("exchanges a GitHub token and caches the bearer", async () => {

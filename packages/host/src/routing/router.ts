@@ -20,6 +20,31 @@ export interface RoutingDecision {
   ref: ProviderRef;
   attempt: number;
 }
+export interface AffinityOptions {
+  preferProviderId?: string;
+  promptTokens?: number;
+}
+const STICKY_CONTEXT_TOKENS = 10_000;
+const STICKY_SCORE_MARGIN = 25;
+const affinityByModel = new Map<string, string>();
+export function resetAffinity(): void { affinityByModel.clear(); }
+function stickyRef(refs: ProviderRef[], modelId: string, opts?: AffinityOptions): ProviderRef | undefined {
+  const id = opts?.preferProviderId ?? affinityByModel.get(modelId);
+  if (!id) return undefined;
+  const ref = refs.find((r) => r.id === id);
+  if (!ref || perf.isOpen(ref.id, modelId)) return undefined;
+  const tokens = opts?.promptTokens;
+  if (tokens === undefined || tokens >= STICKY_CONTEXT_TOKENS) return ref;
+  let best = 0;
+  for (const r of refs) {
+    if (r.id !== ref.id) {
+      const s = perf.score(r.id, modelId);
+      if (s > best) best = s;
+    }
+  }
+  if (perf.score(ref.id, modelId) >= best - STICKY_SCORE_MARGIN) return ref;
+  return undefined;
+}
 export function withProviderOverrides(model: ModelDescriptor, ref?: ProviderRef): ModelDescriptor {
   if (!ref) return model;
   return {
@@ -46,30 +71,36 @@ export function pickForTier(
 export function pickProvider(
   registry: ModelRegistry,
   model: ModelDescriptor,
-  opts?: { rerank?: boolean },
+  opts?: { rerank?: boolean } & AffinityOptions,
 ): { provider: ProviderConfig; ref: ProviderRef } | undefined {
-  let refs = registry.providersFor(model.id);
+  const refs = registry.providersFor(model.id);
   const len = refs.length;
   if (!len) return undefined;
   if (len === 1) {
     const pr = registry.resolveProvider(refs[0]);
     return pr ? { provider: pr, ref: refs[0] } : undefined;
   }
+  const sticky = stickyRef(refs, model.id, opts);
+  if (sticky) {
+    const pr = registry.resolveProvider(sticky);
+    if (pr) return { provider: pr, ref: sticky };
+  }
+  let ranked = refs;
   if (opts?.rerank) {
-    refs = [...refs].sort((a, b) => {
+    ranked = [...refs].sort((a, b) => {
       const d = perf.score(b.id, model.id) - perf.score(a.id, model.id);
       return d !== 0 ? d : a.priority - b.priority;
     });
   }
-  const tw = refs.reduce((s, r) => s + (r.weight ?? 0), 0);
+  const tw = ranked.reduce((s, r) => s + (r.weight ?? 0), 0);
   if (tw > 0) {
     const ok: ProviderRef[] = [];
     let okWeight = 0;
-    for (let i = 0; i < refs.length; i++) {
-      const r = refs[i];
+    for (let i = 0; i < ranked.length; i++) {
+      const r = ranked[i];
       if (!perf.isOpen(r.id, model.id)) { ok.push(r); okWeight += r.weight ?? 0; }
     }
-    const pool = ok.length ? ok : refs;
+    const pool = ok.length ? ok : ranked;
     const w = ok.length ? okWeight : tw;
     let p = Math.random() * w;
     for (let i = 0; i < pool.length; i++) {
@@ -78,14 +109,14 @@ export function pickProvider(
       if (p <= 0) { const pr = registry.resolveProvider(r); if (pr) return { provider: pr, ref: r }; }
     }
   }
-  for (let i = 0; i < refs.length; i++) {
-    const r = refs[i];
+  for (let i = 0; i < ranked.length; i++) {
+    const r = ranked[i];
     if (perf.isOpen(r.id, model.id)) continue;
     const pr = registry.resolveProvider(r);
     if (pr) return { provider: pr, ref: r };
   }
-  const pr = registry.resolveProvider(refs[0]);
-  return pr ? { provider: pr, ref: refs[0] } : undefined;
+  const pr = registry.resolveProvider(ranked[0]);
+  return pr ? { provider: pr, ref: ranked[0] } : undefined;
 }
 export function recordFailure(modelId: string, providerId: string): void {
   perf.recordFailure(providerId, modelId);
@@ -97,22 +128,30 @@ export function recordStall(modelId: string, providerId: string): void {
   perf.recordStall(providerId, modelId);
 }
 export function resetFailures(): void { perf.clearCircuitBreakers(); }
-function* orderedRefs(registry: ModelRegistry, model: ModelDescriptor, rerank?: boolean): Generator<ProviderRef> {
+function* orderedRefs(registry: ModelRegistry, model: ModelDescriptor, opts?: { rerank?: boolean } & AffinityOptions): Generator<ProviderRef> {
   const refs = registry.providersFor(model.id);
   if (!refs.length) return;
-  const sorted = rerank
+  const sorted = opts?.rerank
     ? [...refs].sort((a, b) => {
         const d = perf.score(b.id, model.id) - perf.score(a.id, model.id);
         return d !== 0 ? d : a.priority - b.priority;
       })
     : refs;
+  const sticky = stickyRef(refs, model.id, opts);
+  if (sticky) {
+    yield sticky;
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i].id !== sticky.id) yield sorted[i];
+    }
+    return;
+  }
   for (let i = 0; i < sorted.length; i++) yield sorted[i];
 }
 async function tryEach<T>(
   registry: ModelRegistry,
   model: ModelDescriptor,
   fn: (ref: ProviderRef, prov: ProviderConfig, attempt: number) => Promise<T>,
-  opts?: { rerank?: boolean },
+  opts?: { rerank?: boolean } & AffinityOptions,
 ): Promise<T> {
   const MAX_RETRIES = 4;
   const authFails = new Map<string, number>();
@@ -120,7 +159,7 @@ async function tryEach<T>(
     let lastErr: unknown;
     let attempt = 0;
     let anyRateLimited = false;
-    for (const ref of orderedRefs(registry, model, opts?.rerank)) {
+    for (const ref of orderedRefs(registry, model, opts)) {
       const prov = registry.resolveProvider(ref);
       if (!prov) continue;
       const keys = prov.apiKeys?.length ? prov.apiKeys : prov.apiKey ? [prov.apiKey] : [];
@@ -132,6 +171,7 @@ async function tryEach<T>(
         try {
           const out = await fn(ref, effProv, attempt++);
           perf.recordSuccess(ref.id, model.id, Date.now() - t0);
+          affinityByModel.set(model.id, ref.id);
           return out;
         } catch (e) {
           lastErr = e;
@@ -166,10 +206,11 @@ export async function routeWithFailover<T>(
   registry: ModelRegistry,
   model: ModelDescriptor,
   invoke: (d: RoutingDecision) => Promise<T>,
+  opts?: { rerank?: boolean } & AffinityOptions,
 ): Promise<T> {
-  return tryEach(registry, model, (r, p, n) => invoke({ model, provider: p, ref: r, attempt: n }));
+  return tryEach(registry, model, (r, p, n) => invoke({ model, provider: p, ref: r, attempt: n }), opts);
 }
-export interface ResilientOptions {
+export interface ResilientOptions extends AffinityOptions {
   stallMs?: number;
   firstByteMs?: number;
   rerank?: boolean;
@@ -254,7 +295,7 @@ export async function routeStream(
     const raw = await create({ model, provider: prov, ref, attempt: n });
     const primed = await primeFirstEvent(raw, ref.id, model.id, fbMs);
     return wrapStall(primed, ref.id, stallMs, fbMs, true);
-  }, { rerank: opts?.rerank });
+  }, { rerank: opts?.rerank, preferProviderId: opts?.preferProviderId, promptTokens: opts?.promptTokens });
 }
 async function primeFirstEvent(raw: StreamHandle, pid: string, mid: string, firstByteMs: number): Promise<StreamHandle> {
   const iter = raw.events[Symbol.asyncIterator]();

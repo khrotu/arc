@@ -2,7 +2,7 @@
   "name": "arc-code",
   "displayName": "Arc",
   "description": "0.28 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "publisher": "khrotu",
   "license": "Apache-2.0",
   "repository": {
@@ -553,6 +553,23 @@
           ],
           "default": "off",
           "description": "Periodically trigger a full workspace reindex on a schedule, in addition to the live IndexWatcher."
+        },
+        "arc.websearch.backend": {
+          "type": "string",
+          "enum": [
+            "builtin",
+            "exa",
+            "firecrawl",
+            "parallel",
+            "tavily"
+          ],
+          "default": "builtin",
+          "description": "Web search API used by the web.search tool. Built-in scrapes free sources; the others need an API key."
+        },
+        "arc.websearch.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the selected web search backend (Exa, Firecrawl, Parallel, or Tavily)."
         },
         "arc.titleGeneration.method": {
           "type": "string",

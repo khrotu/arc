@@ -142,7 +142,7 @@ export const anthropicTransport: Transport = {
           "anthropic-beta": "prompt-caching-2024-07-31",
           "anthropic-dangerous-direct-browser-access": "true",
           ...attributionHeaders(req.provider.kind),
-          ...opencodeSessionHeader(base, req.provider.kind, req.conversationId),
+          ...opencodeSessionHeader(base, req.provider.kind, req.conversationId, undefined, req.workspaceRoot),
         },
         body: JSON.stringify(cachedBody),
         signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000),

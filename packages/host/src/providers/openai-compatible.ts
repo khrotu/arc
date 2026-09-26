@@ -3,9 +3,9 @@ import { makeProxyDispatcher } from "../util/proxy.js";
 import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
 import { caps } from "./capability-tracker.js";
 import { withRetry, policyFor } from "./retry.js";
-import { attributionHeaders, opencodeSessionHeader } from "./attribution.js";
+import { attributionHeaders, opencodeSessionHeader, isOpencodeEndpoint } from "./attribution.js";
 import { getCopilotBearerToken, copilotRequestHeaders, isAgentCall, hasImageContent } from "./github-copilot.js";
-import { readBodyLimited } from "../security/network.js";
+import { readBodyLimited, normalizeProviderBaseUrl } from "../security/network.js";
 import { redactSecrets } from "../security/redact.js";
 import { safeParseJson } from "../util/json.js";
 import { hostWarn } from "../log/logger.js";
@@ -14,6 +14,12 @@ const ENDPOINT_MISSING_RE = /returned 40[45]\b|no such endpoint|unknown endpoint
 const CHAT_REJECTED_RE = /does not support (?:the )?chat|chat.?completions (?:is )?not support|only supports? (?:the )?responses/i;
 const RESPONSES_REJECTED_RE = /does not support (?:the )?responses|responses(?: api)? (?:is )?not support|only supports? (?:the )?chat/i;
 const PERSISTENT_5XX_RE = /returned 5\d\d:/;
+export function providerFailure(req: StreamRequest, base: string, status: number, body: string): Error {
+  if (status === 403 && body.includes("FreeTierError") && isOpencodeEndpoint(base, req.provider.kind)) {
+    return new Error(`OpenCode rejected this request. Use a paid model, or enable the backend debugging override in Settings > About > Experimental. Upstream: ${redactSecrets(body, [req.provider.apiKey])}`);
+  }
+  return new Error(`Provider ${req.provider.kind} returned ${status}: ${redactSecrets(body, [req.provider.apiKey])}`);
+}
 export type OpenAiApiFormat = "chat" | "responses";
 export function isFormatMismatch(errorMessage: string, fmt: OpenAiApiFormat): boolean {
   if (PERSISTENT_5XX_RE.test(errorMessage)) return true;
@@ -30,7 +36,7 @@ export const openAICompatibleTransport: Transport & { withBase: (base: string) =
   },
 };
 async function streamWithBase(req: StreamRequest, baseOverride: string): Promise<StreamHandle> {
-  const base = baseOverride || req.provider.baseUrl || "https://api.openai.com/v1";
+  const base = normalizeProviderBaseUrl(baseOverride || req.provider.baseUrl || "https://api.openai.com/v1");
   const remoteModel = req.model.providers.find((p) => p.id === req.provider.id)?.remoteModel ?? req.model.id;
   const modelKey = `${req.provider.id}:${remoteModel}`;
   const first: OpenAiApiFormat = caps.isSupported(modelKey, "chat") ? "chat" : "responses";
@@ -105,7 +111,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
       copilotRequestHeaders({ vision: hasImageContent(req.messages), agentCall: isAgentCall(req.messages) }),
     );
   }
-  Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId));
+  Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId, undefined, req.workspaceRoot));
   const MAX_ATTEMPTS = 3;
   const policy = policyFor(req.provider.kind);
   let res!: Response;
@@ -149,10 +155,10 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
       skipReasoning = true;
       continue;
     }
-    if (!res.ok) throw new Error(`Provider ${req.provider.kind} returned ${res.status}: ${redactSecrets(lastText, [req.provider.apiKey])}`);
+    if (!res.ok) throw providerFailure(req, base, res.status, lastText);
   }
   if (!res!.ok || !res!.body) {
-    throw new Error(`Provider ${req.provider.kind} returned ${res!.status}: ${redactSecrets(lastText, [req.provider.apiKey])}`);
+    throw providerFailure(req, base, res!.status, lastText);
   }
   const q = new AsyncEventQueue<StreamEvent>();
   let aborted = false;
@@ -445,7 +451,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
       copilotRequestHeaders({ vision: hasImageContent(req.messages), agentCall: isAgentCall(req.messages) }),
     );
   }
-  Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId));
+  Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId, undefined, req.workspaceRoot));
   const MAX_ATTEMPTS = 2;
   const policy = policyFor(req.provider.kind);
   let res!: Response;
@@ -478,10 +484,10 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
         continue;
       }
     }
-    if (!res.ok) throw new Error(`Provider ${req.provider.kind} returned ${res.status}: ${redactSecrets(lastText, [req.provider.apiKey])}`);
+    if (!res.ok) throw providerFailure(req, base, res.status, lastText);
   }
   if (!res!.ok || !res!.body) {
-    throw new Error(`Provider ${req.provider.kind} returned ${res!.status}: ${redactSecrets(lastText, [req.provider.apiKey])}`);
+    throw providerFailure(req, base, res!.status, lastText);
   }
   const q = new AsyncEventQueue<StreamEvent>();
   let aborted = false;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { pickLogo } from "../src/branding/logo";
+import { pickLogo } from "../src/branding/branding";
 describe("pickLogo", () => {
   it("returns 'mono' in January", () => {
     const d = new Date(Date.UTC(2026, 0, 15, 12)); 
