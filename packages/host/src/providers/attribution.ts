@@ -1,5 +1,6 @@
 import type { ProviderKind } from "../protocol/protocol.js";
 import { createHash, randomBytes } from "node:crypto";
+import { debugOverrideActive } from "../runtime-prefs.js";
 export interface AppIdentity {
   url: string;
   title: string;
@@ -58,7 +59,14 @@ let opencodeIdCounter = 0;
 let opencodeIdLastTs = 0;
 function opencodeRandomSuffix(digest: Uint8Array, offset: number): string {
   let suffix = "";
-  for (let i = 0; i < 14; i++) suffix += OPENCODE_ID_CHARS[digest[offset + i] % 62];
+  for (let i = offset; i < digest.length && suffix.length < 14; i++) {
+    const v = digest[i];
+    if (v < 248) suffix += OPENCODE_ID_CHARS[v % 62];
+  }
+  while (suffix.length < 14) {
+    const v = randomBytes(1)[0];
+    if (v < 248) suffix += OPENCODE_ID_CHARS[v % 62];
+  }
   return suffix;
 }
 const opencodeSessionIds = new Map<string, string>();
@@ -95,12 +103,12 @@ export function opencodeProjectId(workspaceRoot: string): string {
   const digest = createHash("sha256").update(`arc-opencode-project:${workspaceRoot}`).digest();
   return `${digest.subarray(0, 6).toString("hex")}${opencodeRandomSuffix(digest, 6)}`;
 }
-export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined, requestId?: string, projectRoot?: string): Record<string, string> {
+export function opencodeSessionHeader(baseUrl: string | undefined, kind: ProviderKind, conversationId: string | undefined, requestId?: string, projectRoot?: string, a: AppIdentity = APP): Record<string, string> {
   if (!isOpencodeEndpoint(baseUrl, kind)) return {};
-  const out: Record<string, string> = {
-    "user-agent": OPENCODE_UA,
-    "x-opencode-client": OPENCODE_CLIENT,
-  };
+  const out: Record<string, string> = { ...UA(a) };
+  if (!debugOverrideActive()) return out;
+  out["user-agent"] = OPENCODE_UA;
+  out["x-opencode-client"] = OPENCODE_CLIENT;
   if (projectRoot) out["x-opencode-project"] = opencodeProjectId(projectRoot);
   if (conversationId) {
     const session = opencodeSessionId(conversationId);
@@ -157,7 +165,8 @@ export function attributionHeaders(kind: ProviderKind, a: AppIdentity = APP): Re
       return { ...UA(a), ...OR(a) };
     case "opencode":
     case "opencode-go":
-      return { "user-agent": OPENCODE_UA };
+      if (debugOverrideActive()) return { "user-agent": OPENCODE_UA };
+      return UA(a);
     default:
       if (OR_DIALECT.has(kind)) return { ...UA(a), ...OR(a) };
       if (kind === "anthropic") return UA(a);

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useLayoutEffect, type ReactNode } from "react";
-import { ArrowUp, Paperclip, Square, X, ChevronDown } from "./icons";
+import { ArrowUp, Paperclip, Square, X, Check, ChevronDown } from "./icons";
 import ModelPicker from "./ModelPicker";
 import ModePicker from "./ModePicker";
 import EffortPicker, { type Effort } from "./EffortPicker";
@@ -116,10 +116,15 @@ type Props = {
   onAttach?: () => void;
   placeholder?: string;
   autoFocus?: boolean;
-  queuedText?: string | null;
+  queued?: { text: string; mode: "queued" | "now"; attachmentCount: number; attachmentNames: string[] } | null;
   onCancelQueue?: () => void;
+  onRevertQueue?: () => void;
+  onUpdateQueue?: (text: string) => void;
+  onQueueModeChange?: (mode: "queued" | "now") => void;
   prefillText?: string | null;
   prefillSeq?: number;
+  prefillAttachments?: { uri: string; preview?: string }[] | null;
+  prefillImages?: string[] | null;
   todos?: TodoItemUI[] | null;
   todosOpen?: boolean;
   onToggleTodos?: () => void;
@@ -147,6 +152,10 @@ type Props = {
   onToggleSuggestions?: () => void;
   onUnloadSuggestion?: (kind: string, id: string) => void;
   onDismissSuggestion?: (kind: string, id: string) => void;
+  diffs?: { filePath: string; added: number; removed: number }[] | null;
+  onResolveDiff?: (filePath: string, action: "accept" | "reject") => void;
+  onResolveAllDiffs?: (action: "accept" | "reject") => void;
+  onOpenFile?: (path: string) => void;
   variant: "sidebar" | "fullscreen";
   models: ModelDescriptor[];
   currentModelId: string;
@@ -157,13 +166,99 @@ type Props = {
   effort: Effort;
   onSelectEffort: (effort: Effort) => void;
 };
+type DiffRow = { filePath: string; added: number; removed: number };
+function DiffStat({ added, removed }: { added: number; removed: number }) {
+  return (
+    <span className="arc-composer-diffs-stat">
+      <span className="is-add">+{added}</span>
+      <span className="is-rem">−{removed}</span>
+    </span>
+  );
+}
+function DiffReview({ diffs, open, onToggle, onResolveDiff, onResolveAllDiffs, onOpenFile }: {
+  diffs: DiffRow[];
+  open: boolean;
+  onToggle: () => void;
+  onResolveDiff?: (filePath: string, action: "accept" | "reject") => void;
+  onResolveAllDiffs?: (action: "accept" | "reject") => void;
+  onOpenFile?: (path: string) => void;
+}) {
+  const n = diffs.length;
+  const added = diffs.reduce((s, d) => s + d.added, 0);
+  const removed = diffs.reduce((s, d) => s + d.removed, 0);
+  return (
+    <div className={`arc-composer-diffs ${open ? "is-open" : ""}`}>
+      <div className="arc-composer-diffs-head">
+        <button className="arc-composer-diffs-title" onClick={onToggle} aria-expanded={open}>
+          Review {n} {n === 1 ? "edit" : "edits"}
+        </button>
+        <DiffStat added={added} removed={removed} />
+        <button
+          className="arc-btn-ghost"
+          onClick={() => onResolveAllDiffs?.("reject")}
+          title={`Revert all ${n} ${n === 1 ? "edit" : "edits"}`}
+        >
+          Reject
+        </button>
+        <button
+          className="arc-btn"
+          onClick={() => onResolveAllDiffs?.("accept")}
+          title={`Keep all ${n} ${n === 1 ? "edit" : "edits"}`}
+        >
+          Accept
+        </button>
+        <button
+          className="arc-iconbtn"
+          onClick={onToggle}
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          <ChevronDown size={13} className={open ? "is-open" : ""} />
+        </button>
+      </div>
+      {open && (
+        <div className="arc-composer-diffs-body">
+          {diffs.map((d) => (
+            <div key={d.filePath} className="arc-composer-diffs-row">
+              <button
+                className="arc-composer-diffs-path"
+                title={`Open ${d.filePath}`}
+                onClick={() => onOpenFile?.(d.filePath)}
+              >
+                {d.filePath}
+              </button>
+              <DiffStat added={d.added} removed={d.removed} />
+              <button
+                className="arc-iconbtn is-reject"
+                title={`Revert the edit to ${d.filePath}`}
+                aria-label={`Revert the edit to ${d.filePath}`}
+                onClick={() => onResolveDiff?.(d.filePath, "reject")}
+              >
+                <X size={13} />
+              </button>
+              <button
+                className="arc-iconbtn is-accept"
+                title={`Keep the edit to ${d.filePath}`}
+                aria-label={`Keep the edit to ${d.filePath}`}
+                onClick={() => onResolveDiff?.(d.filePath, "accept")}
+              >
+                <Check size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 export default function Composer({
-  onSend, onStop, onGuidance, streaming, disabled, pendingAttachment, onAttach, placeholder, autoFocus = true, queuedText, onCancelQueue, prefillText, prefillSeq,
+  onSend, onStop, onGuidance, streaming, disabled, pendingAttachment, onAttach, placeholder, autoFocus = true, queued, onCancelQueue, onRevertQueue, onUpdateQueue, onQueueModeChange, prefillText, prefillSeq, prefillAttachments, prefillImages,
   todos, todosOpen, onToggleTodos, polishing, polishPending, onRejectPolished, polishLevel, onPolish,
   autoMode, routing, routePending, onAcceptRouted, onRejectRouted,
   approval, approvalMenuOpen, onToggleApprovalMenu, onRespondApproval, approvalCommand, approvalPrefix,
   clarification, onAnswerClarification, onDismissClarification,
   suggestions, suggestionsOpen, onToggleSuggestions, onUnloadSuggestion, onDismissSuggestion,
+  diffs, onResolveDiff, onResolveAllDiffs, onOpenFile,
   variant, models, currentModelId, onSelectModel, modes, currentMode, onSelectMode, effort, onSelectEffort,
 }: Props) {
   const [text, setText] = useState("");
@@ -172,6 +267,10 @@ export default function Composer({
   const [pastes, setPastes] = useState<PasteBlock[]>([]);
   const [enlarged, setEnlarged] = useState<string | null>(null);
   const [actionsOpen, setActionsOpen] = useState(false);
+  const [diffsOpen, setDiffsOpen] = useState(true);
+  const [editingQueue, setEditingQueue] = useState(false);
+  const [queueDraft, setQueueDraft] = useState("");
+  const queueLocked = !!queued;
   const pasteIdRef = useRef(0);
   const ref = useRef<HTMLDivElement>(null);
   const textRef = useRef("");
@@ -187,6 +286,18 @@ export default function Composer({
   useLayoutEffect(() => {
     if (prefillText !== undefined && prefillText !== null) {
       setText(prefillText);
+      if (prefillAttachments) {
+        setAttachments((prev) => {
+          const uris = new Set(prev.map((a) => a.uri));
+          return [...prev, ...prefillAttachments.filter((a) => !uris.has(a.uri))];
+        });
+      }
+      if (prefillImages) {
+        setImages((prev) => {
+          const seen = new Set(prev);
+          return [...prev, ...prefillImages.filter((i) => !seen.has(i))];
+        });
+      }
       ref.current?.focus();
     }
   }, [prefillText, prefillSeq]);
@@ -357,21 +468,48 @@ export default function Composer({
     const el = planBodyRef.current.querySelector<HTMLElement>(".arc-todo-sidebar-item-in_progress");
     el?.scrollIntoView({ block: "center" });
   }, [todosOpen, todos]);
-  if (queuedText) {
-    return (
-      <div className="arc-composer is-queued">
-        <div className="arc-composer-queued">
-          <span className="arc-composer-queued-label">Queued message:</span>
-          <span className="arc-composer-queued-text">{queuedText}</span>
-          <button className="arc-composer-send is-stop" onClick={onCancelQueue} title="Cancel queued message">
-            <X size={12} strokeWidth={2.5} />
-          </button>
-        </div>
+  const queuePanel = queued ? (
+    <div className="arc-composer-queue">
+      <div className="arc-composer-queue-bar">
+        <span className="arc-composer-queue-text is-dim">{queued.text}</span>
+        {queued.attachmentCount > 0 && (
+          <span className="arc-composer-qattach" title={queued.attachmentNames.join("\n")}>
+            <Paperclip size={11} />
+            <span>{queued.attachmentCount}</span>
+          </span>
+        )}
+        <button
+          className="arc-btn"
+          onClick={() => onQueueModeChange?.(queued.mode === "now" ? "queued" : "now")}
+          title={queued.mode === "now" ? "Keep queued: send after this turn" : "Stop the current turn and send immediately"}
+        >
+          {queued.mode === "now" ? "Queued" : "Send now"}
+        </button>
+        <button className="arc-btn-ghost" onClick={() => { setQueueDraft(queued.text); setEditingQueue(true); }} title="Edit queued message">Edit</button>
+        <button className="arc-btn-ghost" onClick={onRevertQueue} title="Revert to composer">Revert</button>
+        <button className="arc-iconbtn" onClick={onCancelQueue} title="Delete queued message" aria-label="Delete queued message">
+          <X size={13} />
+        </button>
       </div>
-    );
-  }
+      {editingQueue && (
+        <div className="arc-composer-qedit">
+          <textarea value={queueDraft} onChange={(e) => setQueueDraft(e.target.value)} aria-label="Edit queued message" />
+          <div className="arc-composer-qedit-actions">
+            <button className="arc-btn-ghost" onClick={() => setEditingQueue(false)}>Cancel</button>
+            <button
+              className="arc-btn"
+              onClick={() => { const v = queueDraft.trim(); if (!v) return; onUpdateQueue?.(v); setEditingQueue(false); }}
+            >
+              Requeue
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  ) : null;
   return (
     <div className={`arc-composer ${disabled ? "is-disabled" : ""} ${streaming ? "is-busy" : ""} ${polishing ? "is-polishing" : ""} ${routing ? "is-routing" : ""}`}>
+      {queuePanel}
       {polishPending && (
         <div className="arc-composer-polish">
           <div className="arc-composer-polish-actions">
@@ -483,6 +621,16 @@ export default function Composer({
           </div>
         </div>
       )}
+      {diffs && diffs.length > 0 && (
+        <DiffReview
+          diffs={diffs}
+          open={diffsOpen}
+          onToggle={() => setDiffsOpen((o) => !o)}
+          onResolveDiff={onResolveDiff}
+          onResolveAllDiffs={onResolveAllDiffs}
+          onOpenFile={onOpenFile}
+        />
+      )}
       {todos && todos.length > 0 && (
         <div className={`arc-composer-plan ${todosOpen ? "is-open" : ""}`}>
           <button className="arc-composer-plan-head" onClick={onToggleTodos}>
@@ -592,8 +740,8 @@ export default function Composer({
       )}
       <div
         ref={ref}
-        className={`arc-composer-editable${text ? "" : " is-empty"}${disabled || polishing || routeActive ? " is-disabled" : ""}`}
-        contentEditable={!disabled && !polishing && !routeActive}
+        className={`arc-composer-editable${text ? "" : " is-empty"}${disabled || polishing || routeActive || queueLocked ? " is-disabled" : ""}`}
+        contentEditable={!disabled && !polishing && !routeActive && !queueLocked}
         role="textbox"
         aria-multiline="true"
         aria-label={placeholder ?? "Ask Arc anything..."}
@@ -705,7 +853,7 @@ export default function Composer({
             ) : null}
           </div>
         ) : (
-          <button className="arc-composer-send" onClick={submit} disabled={disabled || polishing || routeActive || !fullText()} title="Send (Enter)">
+          <button className="arc-composer-send" onClick={submit} disabled={disabled || polishing || routeActive || queueLocked || !fullText()} title="Send (Enter)">
             <ArrowUp size={15} strokeWidth={2.5} />
           </button>
         )}

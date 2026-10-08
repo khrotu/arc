@@ -11,74 +11,45 @@ const ctx = {
   proxyUrl: undefined,
   requestApproval: async () => true,
 } as any;
-describe("wait tools", () => {
-  it("wait.for sleeps for the requested duration", async () => {
-    const start = Date.now();
-    const r = await tools["wait.for"].fn({ seconds: 0.15 }, ctx);
-    expect(r.ok).toBe(true);
-    expect(Date.now() - start).toBeGreaterThanOrEqual(140);
-    expect(r.output).toContain("Waited");
-  });
-  it("wait.for rejects missing or invalid seconds", async () => {
-    const r = await tools["wait.for"].fn({}, ctx);
-    expect(r.ok).toBe(false);
-    const r2 = await tools["wait.for"].fn({ seconds: -1 }, ctx);
-    expect(r2.ok).toBe(false);
-  });
-  it("wait.until returns immediately for a past time", async () => {
-    const r = await tools["wait.until"].fn({ time: "2020-01-01T00:00:00Z" }, ctx);
-    expect(r.ok).toBe(true);
-    expect(r.output).toContain("already passed");
-  });
-  it("wait.until rejects malformed times", async () => {
-    const r = await tools["wait.until"].fn({ time: "not-a-time" }, ctx);
-    expect(r.ok).toBe(false);
-  });
-  it("wait.until accepts an ISO time slightly in the future", async () => {
-    const future = new Date(Date.now() + 2000).toISOString();
-    const r = await tools["wait.until"].fn({ time: future }, ctx);
-    expect(r.ok).toBe(true);
-    expect(r.output).toMatch(/Waited until/);
-    expect(r.output).toMatch(/2\.\ds/);
-  });
-  it("wait.forProcess waits for a background process exit", async () => {
+describe("shell wait flags", () => {
+  it("shell.check with waitForExit waits for a background process exit", async () => {
     const started = await tools["shell.backgroundRun"].fn({ command: "node -e \"setTimeout(()=>{}, 150)\"" }, ctx);
     expect(started.ok).toBe(true);
     const id = String(started.output.match(/\(id: (\d+)\)/)?.[1]);
-    const r = await tools["wait.forProcess"].fn({ id, timeout: 10 }, ctx);
+    const r = await tools["shell.check"].fn({ id, waitForExit: true, timeout: 10 }, ctx);
     expect(r.ok).toBe(true);
     expect(r.output).toContain("exited");
   });
-  it("wait.forProcess rejects an unknown id", async () => {
-    const r = await tools["wait.forProcess"].fn({ id: "nope" }, ctx);
+  it("shell.check rejects an unknown id", async () => {
+    const r = await tools["shell.check"].fn({ id: "nope" }, ctx);
     expect(r.ok).toBe(false);
   });
-  it("wait.forCommand succeeds when the command succeeds", async () => {
-    const r = await tools["wait.forCommand"].fn({ command: "node -e \"process.exit(0)\"", interval: 0.25, timeout: 10 }, ctx);
+  it("shell.run with untilSuccess succeeds when the command succeeds", async () => {
+    const r = await tools["shell.run"].fn({ command: "node -e \"process.exit(0)\"", untilSuccess: true, interval: 0.25, timeout: 10 }, ctx);
     expect(r.ok).toBe(true);
     expect(r.output).toContain("succeeded");
   });
-  it("wait.forCommand times out when the command keeps failing", async () => {
-    const r = await tools["wait.forCommand"].fn({ command: "node -e \"process.exit(1)\"", interval: 0.25, timeout: 1 }, ctx);
+  it("shell.run with untilSuccess times out when the command keeps failing", async () => {
+    const r = await tools["shell.run"].fn({ command: "node -e \"process.exit(1)\"", untilSuccess: true, interval: 0.25, timeout: 1 }, ctx);
     expect(r.ok).toBe(false);
-    expect(r.output).toContain("did not succeed");
+    expect(r.output).toContain("still failing");
   });
-  it("wait.forCommand requires approval", async () => {
+  it("shell.run with untilSuccess requires approval", async () => {
     let asked = false;
     const denied = {
       ...ctx,
       requestApproval: async () => { asked = true; return false; },
     };
-    const r = await tools["wait.forCommand"].fn({ command: "echo hi" }, denied);
+    const r = await tools["shell.run"].fn({ command: "echo hi", untilSuccess: true }, denied);
     expect(asked).toBe(true);
     expect(r.ok).toBe(false);
     expect(r.output).toContain("denied");
   });
-  it("wait tools abort on signal", async () => {
+  it("shell wait aborts on signal", async () => {
     const ac = new AbortController();
     const abortedCtx = { ...ctx, signal: ac.signal };
-    const p = tools["wait.for"].fn({ seconds: 5 }, abortedCtx);
-    ac.abort();
+    const p = tools["shell.run"].fn({ command: "node -e \"process.exit(1)\"", untilSuccess: true, interval: 0.25, timeout: 30 }, abortedCtx);
+    setTimeout(() => ac.abort(), 100);
     const r = await p;
     expect(r.ok).toBe(false);
     expect(r.output).toContain("interrupted");

@@ -13,7 +13,8 @@ import { defaultPolicy, nextModelForHandoff, type HandoffRecord } from "../routi
 import { generateDependencyGraph, formatDepGraph } from "../util/dep-graph.js";
 import { tools as builtinTools, type ToolContext, killActiveProcesses, checkWriteGlob } from "./tools.js";
 import { markUsed } from "../util/suggestions.js";
-import { buildToolSpecs, isMcpToolSpec, parseMcpToolSpec } from "./tool-specs.js";
+import { buildToolSpecs, isMcpToolSpec, parseMcpToolSpec, TOOL_PARAM_SPECS, mcpToolSpecName } from "./tool-specs.js";
+import { coreToolNames, scoreDiscoveryPool, SEARCH_TOOL_NAME, DISCOVERY_EXCLUDED, type DiscoverableTool } from "./tool-discovery.js";
 import { compatAliasReverse, applyCompatAliases } from "../providers/tool-alias.js";
 import { SubagentRunner } from "./subagent.js";
 import { runHooks } from "../hooks/hooks.js";
@@ -28,12 +29,12 @@ import type { ModeRegistry } from "../modes/index.js";
 import { type ApprovalsConfig, type SessionApprovals, type ApproveShellMeta, DEFAULT_APPROVALS, initSession, resolveApproval } from "../approvals/index.js";
 import type { ChatMessage, ModelDescriptor, ToolCall, TurnUsage, ExecutionEvent } from "../protocol/protocol.js";
 import type { ProcessStep, TodoItem } from "../protocol/process.js";
-const PSEUDO_TOOLS = new Set(["handoff", "subagent.spawn", "subagent.askParent", "clarification.askUser", "checkpoint.revert", "checkpoint.list", "checkpoint.compare", "mode.switch", "skill.use", "memory.add", "memory.note", "session.exportTrace"]);
+const PSEUDO_TOOLS = new Set(["handoff", "subagent.spawn", "subagent.askParent", "clarification.askUser", "checkpoint.revert", "checkpoint.list", "checkpoint.compare", "mode.switch", "skill", "memory", "session.exportTrace", "tool.search"]);
 const TOOL_OUTPUT_MAX_CHARS = 8000;
-const MODE_FREE_TOOLS = new Set(["mode.switch", "clarification.askUser", "subagent.askParent"]);
-const HOOKED_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.customRun", "shell.editCustomRun", "shell.runCustomRun", "browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "web.fetch", "web.search", "mcp.call", "file.edit", "file.write", "file.read", "subagent.spawn", "handoff", "notebook.editCell", "notebook.addCell", "notebook.deleteCell", "notebook.execute", "test.run", "git.stage", "git.commit", "git.push", "git.branch", "git.pr", "hooks.create", "hooks.update", "hooks.delete", "rule.create", "skill.use", "mode.switch", "checkpoint.revert", "todo.write", "wait.forCommand", "context.retrieve", "memory.add", "memory.note"]);
+const MODE_FREE_TOOLS = new Set(["mode.switch", "clarification.askUser", "subagent.askParent", "tool.search"]);
+const HOOKED_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.kill", "browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "web.fetch", "web.search", "mcp.call", "file.edit", "file.write", "file.read", "subagent.spawn", "handoff", "notebook.editCell", "notebook.addCell", "notebook.deleteCell", "notebook.execute", "hooks.create", "hooks.update", "hooks.delete", "skill", "mode.switch", "checkpoint.revert", "todo.write", "context.retrieve", "memory"]);
 const REMOTE_OUT = /^web\.|^mcp\.(?:call|resources|prompts)|browser\.read(?:Page|Dom)/;
-export const LOCAL_OUT = /^(?:shell\.|file\.read|file\.grep|file\.semanticSearch|syms\.context|context\.retrieve|subagent\.spawn|handoff)/;
+export const LOCAL_OUT = /^(?:shell\.|file\.read|file\.grep|syms\.context|context\.retrieve|subagent\.spawn|handoff)/;
 export interface AgentEventSink {
   message(m: ChatMessage): void;
   assistantDelta?(id: string, text: string): void;
@@ -100,6 +101,8 @@ export class Agent {
   private active = false;
   private subagentRunner: SubagentRunner;
   private pendingClarifications = new Map<string, { resolve: (answer: string) => void; question: string; options: string[]; timer: ReturnType<typeof setTimeout> }>();
+  private editPreState = new Map<string, { rel: string; hash: string }>();
+  private static readonly EDIT_PRE_STATE_MAX = 500;
   get isActive(): boolean {
     return this.active;
   }
@@ -112,6 +115,9 @@ export class Agent {
   private lastTodoUpdate = 0;
   private pendingChain: { toolName: string; args: Record<string, unknown>; resultText: string; displayTitle: string } | null = null;
   private mcpReverse: Map<string, { server: string; tool: string }> = new Map();
+  private loadedTools: Set<string> = new Set();
+  private discoveryPool: string[] = [];
+  private discoveryMcp: { server: string; name: string; description?: string; inputSchema?: Record<string, unknown> }[] = [];
   private compatAliasReverse: Map<string, string> = new Map();
   private toolMeta = new Map<string, { name: string; args: Record<string, unknown> }>();
   private toolAcc = new Map<string, { name: string; argsJson: string }>();
@@ -248,7 +254,7 @@ export class Agent {
     this.messages.push(m);
     this.sink.message(m);
   }
-  snapshot(): { messages: ChatMessage[]; steps: ProcessStep[]; mode: string; todoItems: TodoItem[]; browserTabs?: { url: string }[]; backgroundProcesses?: { command: string }[] } {
+  snapshot(): { messages: ChatMessage[]; steps: ProcessStep[]; mode: string; todoItems: TodoItem[]; browserTabs?: { url: string }[]; backgroundProcesses?: { command: string }[]; loadedTools?: string[] } {
     const backgroundProcesses = this.opts.getBackgroundProcesses?.().map((p) => ({ command: p.command }));
     return {
       messages: this.messages.slice(),
@@ -256,6 +262,7 @@ export class Agent {
       mode: this.currentMode,
       todoItems: this.todoItems.slice(),
       ...(backgroundProcesses?.length ? { backgroundProcesses } : {}),
+      ...(this.loadedTools.size ? { loadedTools: [...this.loadedTools] } : {}),
     };
   }
   async snapshotWithBrowser(): Promise<{ messages: ChatMessage[]; steps: ProcessStep[]; mode: string; todoItems: TodoItem[]; browserTabs?: { url: string }[]; backgroundProcesses?: { command: string }[] }> {
@@ -269,11 +276,12 @@ export class Agent {
       return base;
     }
   }
-  async restore(snapshot: { messages: ChatMessage[]; steps?: ProcessStep[]; mode?: string; todoItems?: TodoItem[]; browserTabs?: { url: string }[]; backgroundProcesses?: { command: string }[] }): Promise<void> {
+  async restore(snapshot: { messages: ChatMessage[]; steps?: ProcessStep[]; mode?: string; todoItems?: TodoItem[]; browserTabs?: { url: string }[]; backgroundProcesses?: { command: string }[]; loadedTools?: string[] }): Promise<void> {
     this.messages = snapshot.messages;
     this.steps = snapshot.steps ?? [];
     this.currentMode = snapshot.mode ?? "code";
     this.todoItems = snapshot.todoItems ?? [];
+    this.loadedTools = new Set(snapshot.loadedTools ?? []);
     this.sessionStarted = true;
     if (snapshot.backgroundProcesses?.length) {
       const list = snapshot.backgroundProcesses.map((p) => `- ${p.command}`).join("\n");
@@ -458,7 +466,7 @@ export class Agent {
       this.sink.steps(this.steps);
     }
     if (snap && snap.todoItems) {
-      this.todoItems = snap.todoItems;
+      this.todoItems = snap.todoItems.map((t) => ({ id: String(t.id ?? ""), text: String(t.text ?? ""), state: t.state === "in_progress" || t.state === "done" ? t.state : "pending" as const }));
       this.sink.todo(this.todoItems);
     } else if (this.todoItems.length) {
       this.todoItems = this.todoItems.filter((t) => !t.id.startsWith("sub-"));
@@ -563,7 +571,14 @@ export class Agent {
       const modeDef = this.opts.modeRegistry.get(this.currentMode);
       const modeAllowed = modeDef ? new Set(modeDef.allowedTools) : this.opts.enabledTools;
       const effectiveTools = new Set([...this.opts.enabledTools].filter((t) => modeAllowed.has(t)));
-      let { specs: toolSpecs, mcpReverse } = buildToolSpecs(effectiveTools, this.opts.toolContext.mcp?.listTools());
+      if (!this.opts.isMain) effectiveTools.add("subagent.askParent");
+      const coreNames = coreToolNames();
+      const sentTools = new Set([...effectiveTools].filter((t) => coreNames.has(t) || this.loadedTools.has(t)));
+      const mcpTools = this.opts.toolContext.mcp?.listTools() ?? [];
+      this.discoveryPool = [...effectiveTools].filter((t) => !coreNames.has(t) && !this.loadedTools.has(t) && !DISCOVERY_EXCLUDED.has(t));
+      this.discoveryMcp = mcpTools;
+      if (this.discoveryPool.length > 0 || mcpTools.length > 0) sentTools.add(SEARCH_TOOL_NAME);
+      let { specs: toolSpecs, mcpReverse } = buildToolSpecs(sentTools, mcpTools);
       this.mcpReverse = mcpReverse;
       this.compatAliasReverse = new Map();
       if (current) {
@@ -940,6 +955,50 @@ export class Agent {
     this.appendToolOutput(tc.id, content, false);
     this.messages.push({ id: randomUUID(), role: "tool", content, toolCallId: tc.id, ts: Date.now() });
   }
+  private rememberEditPreState(stepId: string, rel: string, hash: string): void {
+    this.editPreState.delete(stepId);
+    this.editPreState.set(stepId, { rel, hash });
+    while (this.editPreState.size > Agent.EDIT_PRE_STATE_MAX) {
+      const oldest = this.editPreState.keys().next();
+      if (oldest.done) break;
+      this.editPreState.delete(oldest.value);
+    }
+  }
+  hasEditPreState(stepId: string): boolean {
+    return this.editPreState.has(stepId);
+  }
+  forgetEditPreState(stepId: string): void {
+    this.editPreState.delete(stepId);
+  }
+  private static normEditRel(rel: string): string {
+    return rel.replace(/\\/g, "/").trim();
+  }
+  private forgetEditsForFile(rel: string): void {
+    const want = Agent.normEditRel(rel);
+    for (const [id, v] of [...this.editPreState]) {
+      if (v.rel === rel || Agent.normEditRel(v.rel) === want) this.editPreState.delete(id);
+    }
+  }
+  async revertFileEdits(rel: string): Promise<{ ok: boolean; error?: string }> {
+    const want = Agent.normEditRel(rel);
+    let earliest: { rel: string; hash: string } | undefined;
+    for (const v of this.editPreState.values()) {
+      if (v.rel === rel || Agent.normEditRel(v.rel) === want) { earliest = v; break; }
+    }
+    if (!earliest) return { ok: false, error: "no pre-edit snapshot is recorded for this file" };
+    try {
+      const restoreRel = earliest.rel ?? rel;
+      const result = await this.store.restoreSingleFile(this.opts.workspaceRoot, restoreRel, earliest.hash);
+      if (result.errors?.length) return { ok: false, error: result.errors.join("; ") };
+      this.forgetEditsForFile(rel);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error)?.message ?? String(e) };
+    }
+  }
+  async acceptFileEdits(rel: string): Promise<void> {
+    this.forgetEditsForFile(rel);
+  }
   async revertFileToLastSnapshot(rel: string): Promise<{ ok: boolean; error?: string }> {
     try {
       const entries = await this.listCheckpointEntries();
@@ -962,9 +1021,8 @@ export class Agent {
     try {
       markUsed("tool", tc.name);
       if (tc.name === "mcp.call" && typeof tc.args?.server === "string") markUsed("mcp", String(tc.args.server));
-      if ((tc.name === "skill.use" || tc.name === "skill.read") && typeof tc.args?.name === "string") markUsed("skill", String(tc.args.name));
-      if (tc.name.startsWith("rule.") && typeof (tc.args as Record<string, unknown>)?.name === "string") markUsed("rule", String((tc.args as Record<string, unknown>).name));
-      if (tc.name.startsWith("memory.")) markUsed("memory", "memory");
+      if (tc.name === "skill" && typeof tc.args?.name === "string") markUsed("skill", String(tc.args.name));
+      if (tc.name === "memory") markUsed("memory", "memory");
       if (isMcpToolSpec(tc.name)) {
         const parsed = parseMcpToolSpec(tc.name);
         if (parsed) markUsed("mcp", parsed.server);
@@ -1217,8 +1275,7 @@ export class Agent {
     }
     if (tc.name === "subagent.askParent") {
       if (this.opts.isMain) {
-        this.appendToolOutput(tc.id, "The main agent cannot ask its parent (it has no parent).", false);
-        this.messages.push({ id: randomUUID(), role: "tool", content: "The main agent cannot ask its parent (it has no parent).", toolCallId: tc.id, ts: Date.now() });
+        this.denyTool(tc, "subagent.askParent is only available to subagents. Answer directly instead.");
         return;
       }
       if (!this.opts.parent) {
@@ -1454,10 +1511,10 @@ export class Agent {
       this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
       return;
     }
-    if (tc.name === "skill.use") {
+    if (tc.name === "skill") {
       const name = String(tc.args.name ?? "").trim();
       if (!name) {
-        this.denyTool(tc, "skill.use requires a `name` argument.");
+        this.denyTool(tc, "skill requires a `name` argument.");
         return;
       }
       const reg = (this.opts.toolContext as unknown as ToolContext).skillRegistry;
@@ -1487,46 +1544,130 @@ export class Agent {
       this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
       return;
     }
-    if (tc.name === "memory.add") {
-      const category = String(tc.args.category ?? "preferences");
-      const content = String(tc.args.content ?? "");
-      if (!content) {
-        this.denyTool(tc, "memory.add requires a `content` argument.");
+    if (tc.name === "memory") {
+      const action = String(tc.args.action ?? "list");
+      const { loadMemory, addMemory, editMemory, deleteMemory } = await import("../memory/store.js");
+      if (action === "list") {
+        const limitRaw = Number(tc.args.limit ?? 20);
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 20;
+        const teamStores = (this.opts.toolContext as unknown as ToolContext).teamMemoryStores;
+        const entries = await loadMemory(this.opts.workspaceRoot, undefined, teamStores);
+        const slice = entries.slice(-limit);
+        const output = slice.length ? slice.map((e, i) => `${entries.length - slice.length + i}. [${e.category}] ${e.content} (${e.createdAt})`).join("\n") : "No memories stored.";
+        this.appendToolOutput(tc.id, `Listed ${slice.length} memories.`, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
         return;
       }
-      const memScan = scanInjection(content);
-      if (memScan.verdict === "deny") {
-        this.injectionBlocked(tc, "memory.add", memScan, "Instruction-override content must not be persisted to long-term memory.");
+      if (action === "add") {
+        const category = String(tc.args.category ?? "preferences");
+        const content = String(tc.args.content ?? "");
+        if (!content) {
+          this.denyTool(tc, "memory add requires a `content` argument.");
+          return;
+        }
+        const memScan = scanInjection(content);
+        if (memScan.verdict === "deny") {
+          this.injectionBlocked(tc, "memory", memScan, "Instruction-override content must not be persisted to long-term memory.");
+          return;
+        }
+        const entry = await addMemory(this.opts.workspaceRoot, category, content);
+        const entries = await loadMemory(this.opts.workspaceRoot);
+        const idx = entries.length - 1;
+        const output = `Memory added under **${entry.category}** (index ${idx}).\n\n${entry.content}`;
+        this.appendToolOutput(tc.id, `Memory added: ${entry.content.slice(0, 80)}`, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
         return;
       }
-      const { addMemory, loadMemory } = await import("../memory/store.js");
-      const entry = await addMemory(this.opts.workspaceRoot, category, content);
-      const entries = await loadMemory(this.opts.workspaceRoot);
-      const idx = entries.length - 1;
-      const output = `Memory added under **${entry.category}** (index ${idx}).\n\n${entry.content}`;
-      this.appendToolOutput(tc.id, `Memory added: ${entry.content.slice(0, 80)}`, true);
-      this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
+      if (action === "edit") {
+        const idx = Number(tc.args.index ?? -1);
+        const content = String(tc.args.content ?? "");
+        const ok = content ? await editMemory(this.opts.workspaceRoot, idx, content) : false;
+        if (!ok) {
+          this.appendToolOutput(tc.id, `Invalid index ${tc.args.index ?? "?"} or missing content.`, false);
+          return;
+        }
+        this.appendToolOutput(tc.id, `Memory ${idx} updated.`, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: `Memory ${idx} updated.`, toolCallId: tc.id, ts: Date.now() });
+        return;
+      }
+      if (action === "delete") {
+        const idx = Number(tc.args.index ?? -1);
+        const ok = await deleteMemory(this.opts.workspaceRoot, idx);
+        if (!ok) {
+          this.appendToolOutput(tc.id, `Invalid index ${tc.args.index ?? "?"}.`, false);
+          return;
+        }
+        this.appendToolOutput(tc.id, `Memory ${idx} deleted.`, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: `Memory ${idx} deleted.`, toolCallId: tc.id, ts: Date.now() });
+        return;
+      }
+      if (action === "note") {
+        const content = String(tc.args.content ?? "");
+        if (!content) {
+          this.denyTool(tc, "memory note requires a `content` argument.");
+          return;
+        }
+        const noteScan = scanInjection(content);
+        if (noteScan.verdict === "deny") {
+          this.injectionBlocked(tc, "memory", noteScan, "Persistent notes must not contain instruction-override content.");
+          return;
+        }
+        const { appendNote } = await import("../memory/notes.js");
+        const r = await appendNote(this.opts.workspaceRoot, content.slice(0, 500));
+        if (r.index < 0) {
+          this.denyTool(tc, "memory note requires a `content` argument.");
+          return;
+        }
+        this.appendToolOutput(tc.id, `Note saved (entry ${r.index} of ${r.total}).`, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: `Note saved to workspace notes. It will be shown to future sessions in this workspace.`, toolCallId: tc.id, ts: Date.now() });
+        return;
+      }
+      this.denyTool(tc, "memory requires an `action` of list, add, edit, delete, or note.");
       return;
     }
-    if (tc.name === "memory.note") {
-      const content = String(tc.args.content ?? "");
-      if (!content) {
-        this.denyTool(tc, "memory.note requires a `content` argument.");
+    if (tc.name === "tool.search") {
+      const query = String(tc.args.query ?? "").trim();
+      if (!query) {
+        this.denyTool(tc, "tool.search requires a `query` argument.");
         return;
       }
-      const noteScan = scanInjection(content);
-      if (noteScan.verdict === "deny") {
-        this.injectionBlocked(tc, "memory.note", noteScan, "Persistent notes must not contain instruction-override content.");
+      const paramInfo = (parameters: unknown): { names: string[]; text: string } => {
+        const props = (parameters as { properties?: Record<string, { description?: string }> } | null)?.properties;
+        if (!props || typeof props !== "object") return { names: [], text: "" };
+        const names = Object.keys(props);
+        return { names, text: names.map((n) => `${n}: ${props[n]?.description ?? ""}`).join(" ") };
+      };
+      const pool: DiscoverableTool[] = [];
+      for (const name of this.discoveryPool) {
+        const def = TOOL_PARAM_SPECS[name];
+        if (!def || this.loadedTools.has(name)) continue;
+        pool.push({ name, description: def.description, params: paramInfo(def.parameters) });
+      }
+      for (const t of this.discoveryMcp) {
+        const specName = mcpToolSpecName(t.server, t.name);
+        if (this.loadedTools.has(specName)) continue;
+        pool.push({ name: specName, description: `[MCP ${t.server}] ${t.description ?? t.name}`, params: paramInfo(t.inputSchema) });
+      }
+      const matches = scoreDiscoveryPool(query, pool);
+      if (!matches.length) {
+        const output = `No further tools match '${query.slice(0, 80)}'.`;
+        this.appendToolOutput(tc.id, output, true);
+        this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
         return;
       }
-      const { appendNote } = await import("../memory/notes.js");
-      const r = await appendNote(this.opts.workspaceRoot, content.slice(0, 500));
-      if (r.index < 0) {
-        this.denyTool(tc, "memory.note requires a `content` argument.");
-        return;
+      const loaded: string[] = [];
+      const lines: string[] = [];
+      for (const m of matches) {
+        this.loadedTools.add(m.name);
+        loaded.push(m.name);
+        const def = TOOL_PARAM_SPECS[m.name];
+        const desc = def?.description ?? pool.find((p) => p.name === m.name)?.description ?? m.name;
+        const schema = def ? JSON.stringify(def.parameters) : JSON.stringify(this.discoveryMcp.find((t) => mcpToolSpecName(t.server, t.name) === m.name)?.inputSchema ?? {});
+        lines.push(`## ${m.name}\n${desc}\nparameters: ${schema}`);
       }
-      this.appendToolOutput(tc.id, `Note saved (entry ${r.index} of ${r.total}).`, true);
-      this.messages.push({ id: randomUUID(), role: "tool", content: `Note saved to workspace notes. It will be shown to future sessions in this workspace.`, toolCallId: tc.id, ts: Date.now() });
+      const output = `Matching tools (loaded for subsequent calls: ${loaded.join(", ")}):\n\n${lines.join("\n\n")}`;
+      this.appendToolOutput(tc.id, `Discovered tools: ${loaded.join(", ")}`, true);
+      this.messages.push({ id: randomUUID(), role: "tool", content: output, toolCallId: tc.id, ts: Date.now() });
       return;
     }
     if (!def) return;
@@ -1538,8 +1679,8 @@ export class Agent {
     const shouldSnapshot = target && this.opts.enabledTools.has(tc.name);
     const isShellOrBrowser = tc.name === "shell.run" || tc.name.startsWith("browser.");
     const isMcpMutation = tc.name === "mcp.create" || tc.name === "mcp.remove" || tc.name === "mcp.toggle";
-    const isOtherMutator = tc.name === "test.run" || tc.name === "wait.forCommand" || tc.name === "notebook.execute" ||
-      GIT_WRITE_TOOLS.has(tc.name) || HOOK_WRITE_TOOLS.has(tc.name) || tc.name === "rule.create" ||
+    const isOtherMutator = tc.name === "notebook.execute" ||
+      HOOK_WRITE_TOOLS.has(tc.name) ||
       tc.name === "shell.backgroundRun" || tc.name === "shell.write";
     if (shouldSnapshot || isShellOrBrowser || isMcpMutation || isOtherMutator) {
       try {
@@ -1551,7 +1692,14 @@ export class Agent {
               ? `${tc.name}: ${String(tc.args.name ?? "").slice(0, 60)}`
               : `${tc.name}: ${target}`;
         const filesToSnapshot = shouldSnapshot ? [target] : [];
-        await this.store.snapshot(turnId, this.opts.workspaceRoot, filesToSnapshot, this.todoItems, label);
+        const taken = await this.store.snapshot(turnId, this.opts.workspaceRoot, filesToSnapshot, this.todoItems, label);
+        if (shouldSnapshot) {
+          const rel = String(target);
+          const hash = taken?.files[rel];
+          if (typeof hash === "string") {
+            this.rememberEditPreState(tc.id, rel, hash);
+          }
+        }
         this.pushTimeline({ type: "checkpoint_snapshot", turnId, fileCount: filesToSnapshot.length || 1, ts: Date.now() });
       } catch (e) {
         hostError(`[arc] checkpoint snapshot failed: ${(e as Error)?.message ?? e}`);
@@ -1843,13 +1991,14 @@ Rules: terse bullets; no pleasantries; never invent facts; preserve exact identi
     const resolvedTitle = title ?? (this.toolMeta.has(id) ? prettyToolTitle(this.toolMeta.get(id)!.name, this.toolMeta.get(id)!.args, ok ? "done" : "error") : undefined);
     for (let i = this.steps.length - 1; i >= 0; i--) {
       if (this.steps[i].id === id) {
+        const keepDiff = diffHunks && diffHunks.length > 0 ? { diffHunks } : {};
         this.steps[i] = {
           ...this.steps[i],
           output,
           pending: false,
           type: ok ? this.steps[i].type : "error",
           ...(resolvedTitle ? { title: resolvedTitle } : {}),
-          ...(diffHunks ? { diffHunks } : {}),
+          ...keepDiff,
           ...(filePath !== undefined ? { filePath } : {}),
           ...(runAfterCommand ? { runAfterCommand } : {}),
           ...(runAfterOutput ? { runAfterOutput } : {}),
@@ -1998,7 +2147,7 @@ function addUsage(a: TurnUsage | undefined, b: TurnUsage): TurnUsage {
   };
 }
 function streamDiffContent(before: string, after: string): import("../protocol/process.js").DiffHunk[] {
-  return diffLines(before, after).map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value }));
+  return diffLines(before, after).map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(typeof c.count === "number" ? { count: c.count } : {}) }));
 }
 function streamEditDiffHunks(search: string, replace: string): import("../protocol/process.js").DiffHunk[] {
   const block = tryExtractDiffBlock(search);
@@ -2009,15 +2158,36 @@ function streamEditDiffHunks(search: string, replace: string): import("../protoc
 }
 function parsePartialArgs(json: string): Record<string, unknown> {
   try { return JSON.parse(json) as Record<string, unknown>; } catch {}
+  try {
+    let out = "";
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < json.length; i++) {
+      const ch = json[i];
+      const code = json.charCodeAt(i);
+      if (inString) {
+        if (escaped) { out += ch; escaped = false; continue; }
+        if (ch === "\\") { out += ch; escaped = true; continue; }
+        if (ch === '"') { out += ch; inString = false; continue; }
+        if (code <= 0x1f || code === 0x7f) { out += `\\u${code.toString(16).padStart(4, "0")}`; continue; }
+        out += ch;
+        continue;
+      }
+      if (ch === '"') { out += ch; inString = true; escaped = false; continue; }
+      out += ch;
+    }
+    return JSON.parse(out) as Record<string, unknown>;
+  } catch {}
   const result: Record<string, unknown> = {};
-  for (const key of ["path", "file", "command", "pattern", "url", "query", "name", "question", "selector", "server", "tool", "slug", "id", "content", "replace", "search"]) {
+  for (const key of ["path", "file", "command", "pattern", "url", "query", "name", "question", "selector", "server", "tool", "slug", "id", "content", "replace", "search", "input"]) {
     const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)(?:"|$)`, "g");
     let m: RegExpExecArray | null;
     let last: string | undefined;
     while ((m = re.exec(json)) !== null) { last = m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\r/g, "\r"); }
     if (last !== undefined) result[key] = last;
   }
-  for (const key of ["offset", "limit", "index", "cellIndex", "tabId", "direction"]) {
+  for (const key of ["offset", "limit", "index", "cellIndex", "tabId", "direction", "id"]) {
+    if (result[key] !== undefined) continue;
     const re = new RegExp(`"${key}"\\s*:\\s*(-?\\d+)`, "g");
     let m: RegExpExecArray | null;
     let last: number | undefined;
@@ -2053,12 +2223,10 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "shell.backgroundRun": return `Starting ${clip(String(args.command ?? ""))}`;
       case "shell.check": return `Checking process ${args.id ?? ""}`;
       case "shell.write": return `Writing to process ${args.id ?? ""}`;
-      case "shell.customRun": return `Creating custom run ${clip(String(args.name ?? ""), 40)}`;
-      case "shell.editCustomRun": return `Editing custom run ${String(args.id ?? "").slice(0, 12)}`;
-      case "shell.runCustomRun": return `Running custom run ${String(args.id ?? "").slice(0, 12)}`;
-      case "lsp.problems": return "Checking workspace problems";
-      case "lsp.problemsFor": return `Checking problems in ${path}`;
+      case "shell.kill": return `Killing process ${args.id ?? ""}`;
+      case "lsp": return args.path ? `Checking problems in ${cleanFilePath(path)}` : "Checking workspace problems";
       case "todo.write": return "Updating plan";
+      case "tool.search": return `Searching tools for ${clip(String(args.query ?? ""), 40)}`;
       case "browser.navigate": return `Navigating to ${clip(String(args.url ?? ""))}`;
       case "browser.click": return `Clicking ${clip(String(args.selector ?? ""))}`;
       case "browser.type": return `Typing into ${clip(String(args.selector ?? ""))}`;
@@ -2073,10 +2241,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "browser.hover": return `Hovering ${clip(String(args.selector ?? ""))}`;
       case "browser.scroll": return `Scrolling ${args.selector ? "to " + String(args.selector) : ""}`;
       case "browser.waitFor": return `Waiting for ${args.selector ?? args.url ?? args.state ?? "condition"}`;
-      case "browser.newTab": return `Opening new tab${args.url ? " for " + clip(String(args.url)) : ""}`;
-      case "browser.switchTab": return `Switching to tab ${args.tabId ?? ""}`;
-      case "browser.closeTab": return `Closing tab ${args.tabId ?? ""}`;
-      case "browser.listTabs": return "Listing browser tabs";
+      case "browser.tab": { const a = String(args.action ?? "list"); return a === "new" ? `Opening new tab${args.url ? " for " + clip(String(args.url)) : ""}` : a === "switch" ? `Switching to tab ${args.tabId ?? ""}` : a === "close" ? `Closing tab ${args.tabId ?? ""}` : "Listing browser tabs"; }
       case "browser.intercept": return `Intercepting ${clip(String(args.pattern ?? ""))}`;
       case "browser.unintercept": return `Stopping interception for ${clip(String(args.pattern ?? ""))}`;
       case "mcp.call": return `Calling ${args.server ?? ""}/${args.tool ?? ""}`;
@@ -2094,50 +2259,26 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "subagent.askParent": return `Asking parent: ${clip(String(args.question ?? ""), 80)}`;
       case "handoff": return `Handing off (${args.direction ?? "escalate"})`;
       case "clarification.askUser": return `Asking: ${clip(String(args.question ?? ""), 80)}`;
-      case "file.semanticSearch": return `Searching: ${clip(String(args.query ?? ""), 80)}`;
       case "syms.context": return `Building context: ${clip(String(args.query ?? ""), 80)}`;
       case "web.fetch": return `Fetching ${clip(String(args.url ?? ""))}`;
       case "web.search": return `Searching for: ${clip(String(args.query ?? ""), 60)}`;
       case "mode.switch": return `Switching to ${String(args.slug ?? "")} mode`;
-      case "skill.read": return `Reading skill ${clip(String(args.name ?? ""), 40)}`;
-      case "skill.use": return `Loading skill ${clip(String(args.name ?? ""), 40)}`;
-      case "memory.add": return `Adding memory`;
-      case "memory.list": return `Listing memories`;
-      case "memory.edit": return `Editing memory`;
-      case "memory.delete": return `Deleting memory`;
-      case "rule.list": return `Listing rules`;
-      case "rule.read": return `Reading rule ${clip(String(args.name ?? ""), 40)}`;
-      case "rule.create": return `Creating rule ${clip(String(args.name ?? ""), 40)}`;
-      case "git.diffStaged": return "Reading staged diff";
-      case "git.diffUnstaged": return "Reading unstaged diff";
-      case "git.changedFiles": return "Listing changed files";
-      case "git.branchDiff": return "Reading branch diff";
-      case "git.commitMessage": return "Generating commit message";
+      case "skill": return `Loading skill ${clip(String(args.name ?? ""), 40)}`;
+      case "memory": { const a = String(args.action ?? "list"); return a === "add" ? "Adding memory" : a === "edit" ? "Editing memory" : a === "delete" ? "Deleting memory" : a === "note" ? "Saving note" : "Listing memories"; }
       case "browser.console": return "Reading browser console";
       case "browser.network": return "Reading browser network";
       case "browser.domSnapshot": return "Reading browser snapshot";
-      case "test.run": return `Running tests${args.scope ? " (" + String(args.scope) + ")" : ""}`;
       case "session.exportTrace": return "Exporting session trace";
       case "notebook.read": return args.cellIndex !== undefined ? `Reading cell ${args.cellIndex} of ${cleanFilePath(path)}` : `Reading notebook ${cleanFilePath(path)}`;
       case "notebook.editCell": return `Editing cell ${args.cellIndex ?? ""} in ${cleanFilePath(path)}`;
       case "notebook.addCell": return `Adding a cell to ${cleanFilePath(path)}`;
       case "notebook.deleteCell": return `Deleting cell ${args.cellIndex ?? ""} from ${cleanFilePath(path)}`;
       case "notebook.execute": return `Executing cell ${args.cellIndex ?? ""} in ${cleanFilePath(path)}`;
-      case "wait.for": return `Waiting ${String(args.seconds ?? "")}s`;
-      case "wait.until": return `Waiting until ${clip(String(args.time ?? ""), 40)}`;
-      case "wait.forProcess": return `Waiting for process ${args.id ?? ""}`;
-      case "wait.forCommand": return `Waiting for: ${clip(String(args.command ?? ""))}`;
       case "context.retrieve": return `Retrieving context ${String(args.id ?? "").slice(0, 12)}`;
-      case "memory.note": return `Saving note`;
       case "hooks.list": return "Listing hooks";
       case "hooks.create": return `Creating ${String(args.event ?? "hook")} hook`;
       case "hooks.update": return `Updating hook ${args.index ?? ""}`;
       case "hooks.delete": return `Deleting hook ${args.index ?? ""}`;
-      case "git.stage": return "Staging changes";
-      case "git.commit": return "Committing changes";
-      case "git.push": return "Pushing commits";
-      case "git.branch": { const a = String(args.action ?? "list"); const n = clip(String(args.name ?? ""), 30); return a === "create" ? `Creating branch ${n}` : a === "switch" ? `Switching to branch ${n}` : a === "delete" ? `Deleting branch ${n}` : "Listing branches"; }
-      case "git.pr": { const a = String(args.action ?? "create"); return a === "create" ? "Creating pull request" : a === "view" ? "Reading pull request" : "Listing pull requests"; }
       default: return name;
     }
   }
@@ -2152,12 +2293,10 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "shell.backgroundRun": return `Background command failed: ${clip(String(args.command ?? ""))}`;
       case "shell.check": return `Failed to check process ${args.id ?? ""}`;
       case "shell.write": return `Failed to write to process ${args.id ?? ""}`;
-      case "shell.customRun": return `Failed to create custom run ${String(args.name ?? "")}`;
-      case "shell.editCustomRun": return `Failed to edit custom run ${String(args.id ?? "")}`;
-      case "shell.runCustomRun": return `Custom run ${String(args.id ?? "").slice(0, 12)} failed`;
-      case "lsp.problems": return "Failed to check problems";
-      case "lsp.problemsFor": return `Failed to check ${path}`;
+      case "shell.kill": return `Failed to kill process ${args.id ?? ""}`;
+      case "lsp": return "Failed to check problems";
       case "todo.write": return "Failed to update plan";
+      case "tool.search": return "Tool search failed";
       case "browser.navigate": return `Failed to navigate to ${clip(String(args.url ?? ""))}`;
       case "browser.click": return `Failed to click ${clip(String(args.selector ?? ""))}`;
       case "browser.type": return `Failed to type into ${clip(String(args.selector ?? ""))}`;
@@ -2172,10 +2311,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "browser.hover": return `Failed to hover ${clip(String(args.selector ?? ""))}`;
       case "browser.scroll": return `Failed to scroll ${args.selector ? "to " + String(args.selector) : ""}`;
       case "browser.waitFor": return `Wait failed for ${args.selector ?? args.url ?? args.state ?? "condition"}`;
-      case "browser.newTab": return `Failed to open new tab${args.url ? " for " + clip(String(args.url)) : ""}`;
-      case "browser.switchTab": return `Failed to switch to tab ${args.tabId ?? ""}`;
-      case "browser.closeTab": return `Failed to close tab ${args.tabId ?? ""}`;
-      case "browser.listTabs": return "Failed to list browser tabs";
+      case "browser.tab": return "Browser tab operation failed";
       case "browser.intercept": return `Failed to intercept ${clip(String(args.pattern ?? ""))}`;
       case "browser.unintercept": return `Failed to remove interception for ${clip(String(args.pattern ?? ""))}`;
       case "mcp.call": return `Failed MCP ${args.server ?? ""}/${args.tool ?? ""}`;
@@ -2193,50 +2329,26 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
       case "checkpoint.revert": return `Failed to revert to ${String(args.turnId ?? args.index ?? "")}`;
       case "checkpoint.list": return "Failed to list checkpoints";
       case "checkpoint.compare": return "Failed to compare checkpoints";
-      case "file.semanticSearch": return `Semantic search failed: ${clip(String(args.query ?? ""))}`;
       case "syms.context": return `Code context failed: ${clip(String(args.query ?? ""))}`;
       case "web.fetch": return `Failed to fetch ${clip(String(args.url ?? ""))}`;
       case "web.search": return `Search failed: ${clip(String(args.query ?? ""))}`;
       case "mode.switch": return `Failed to switch to ${String(args.slug ?? "")} mode`;
-      case "skill.read": return `Failed to read skill ${String(args.name ?? "")}`;
-      case "skill.use": return `Failed to load skill ${String(args.name ?? "")}`;
-      case "memory.add": return `Failed to add memory`;
-      case "memory.list": return `Failed to list memories`;
-      case "memory.edit": return `Failed to edit memory`;
-      case "memory.delete": return `Failed to delete memory`;
-      case "rule.list": return `Failed to list rules`;
-      case "rule.read": return `Failed to read rule ${String(args.name ?? "")}`;
-      case "rule.create": return `Failed to create rule ${String(args.name ?? "")}`;
-      case "git.diffStaged": return "Failed to read staged diff";
-      case "git.diffUnstaged": return "Failed to read unstaged diff";
-      case "git.changedFiles": return "Failed to list changed files";
-      case "git.branchDiff": return "Failed to read branch diff";
-      case "git.commitMessage": return "Failed to generate commit message";
+      case "skill": return `Failed to load skill ${String(args.name ?? "")}`;
+      case "memory": return `Memory operation failed`;
       case "browser.console": return "Failed to read browser console";
       case "browser.network": return "Failed to read browser network";
       case "browser.domSnapshot": return "Failed to read browser snapshot";
-      case "test.run": return "Tests failed";
       case "session.exportTrace": return "Failed to export trace";
       case "notebook.read": return `Failed to read notebook ${path}`;
       case "notebook.editCell": return `Failed to edit cell ${args.cellIndex ?? ""} in ${path}`;
       case "notebook.addCell": return `Failed to add cell to ${path}`;
       case "notebook.deleteCell": return `Failed to delete cell ${args.cellIndex ?? ""} from ${path}`;
       case "notebook.execute": return `Failed to execute cell ${args.cellIndex ?? ""} in ${path}`;
-      case "wait.for": return `Wait interrupted (${String(args.seconds ?? "")}s)`;
-      case "wait.until": return `Wait until ${clip(String(args.time ?? ""), 40)} interrupted`;
-      case "wait.forProcess": return `Wait for process ${args.id ?? ""} interrupted`;
-      case "wait.forCommand": return `Wait failed: ${clip(String(args.command ?? ""))}`;
       case "context.retrieve": return `Failed to retrieve context ${String(args.id ?? "").slice(0, 12)}`;
-      case "memory.note": return `Failed to save note`;
       case "hooks.list": return "Failed to list hooks";
       case "hooks.create": return `Failed to create ${String(args.event ?? "hook")} hook`;
       case "hooks.update": return `Failed to update hook ${args.index ?? ""}`;
       case "hooks.delete": return `Failed to delete hook ${args.index ?? ""}`;
-      case "git.stage": return "Failed to stage changes";
-      case "git.commit": return "Failed to commit changes";
-      case "git.push": return "Failed to push commits";
-      case "git.branch": return "Failed to update branches";
-      case "git.pr": return "Pull request operation failed";
       default: return `Failed: ${name}`;
     }
   }
@@ -2250,12 +2362,10 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
     case "shell.backgroundRun": return `Started ${clip(String(args.command ?? ""))}`;
     case "shell.check": return `Checked process ${args.id ?? ""}`;
     case "shell.write": return `Wrote to process ${args.id ?? ""}`;
-    case "shell.customRun": return `Created custom run ${clip(String(args.name ?? ""), 40)}`;
-    case "shell.editCustomRun": return `Edited custom run ${String(args.id ?? "").slice(0, 12)}`;
-    case "shell.runCustomRun": return `Ran custom run ${String(args.id ?? "").slice(0, 12)}`;
-    case "lsp.problems": return "Checked workspace problems";
-    case "lsp.problemsFor": return `Checked problems in ${path}`;
+    case "shell.kill": return `Killed process ${args.id ?? ""}`;
+    case "lsp": return args.path ? `Checked problems in ${cleanFilePath(path)}` : "Checked workspace problems";
     case "todo.write": return "Updated plan";
+    case "tool.search": return "Searched tools";
     case "browser.navigate": return `Navigated to ${clip(String(args.url ?? ""))}`;
     case "browser.click": return `Clicked ${clip(String(args.selector ?? ""))}`;
     case "browser.type": return `Typed into ${clip(String(args.selector ?? ""))}`;
@@ -2270,10 +2380,7 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
     case "browser.hover": return `Hovered ${clip(String(args.selector ?? ""))}`;
     case "browser.scroll": return `Scrolled ${args.selector ? "to " + String(args.selector) : ""}`;
     case "browser.waitFor": return `Waited for ${args.selector ?? args.url ?? args.state ?? "condition"}`;
-    case "browser.newTab": return `Opened new tab${args.url ? " for " + clip(String(args.url)) : ""}`;
-    case "browser.switchTab": return `Switched to tab ${args.tabId ?? ""}`;
-    case "browser.closeTab": return `Closed tab ${args.tabId ?? ""}`;
-    case "browser.listTabs": return "Listed browser tabs";
+    case "browser.tab": { const a = String(args.action ?? "list"); return a === "new" ? `Opened new tab${args.url ? " for " + clip(String(args.url)) : ""}` : a === "switch" ? `Switched to tab ${args.tabId ?? ""}` : a === "close" ? `Closed tab ${args.tabId ?? ""}` : "Listed browser tabs"; }
     case "browser.intercept": return `Intercepting ${clip(String(args.pattern ?? ""))}`;
     case "browser.unintercept": return `Stopped intercepting ${clip(String(args.pattern ?? ""))}`;
     case "mcp.call": return `Called ${args.server ?? ""}/${args.tool ?? ""}`;
@@ -2291,93 +2398,55 @@ export function prettyToolTitle(name: string, args: Record<string, unknown>, sta
     case "subagent.askParent": return `Asked parent: ${clip(String(args.question ?? ""), 80)}`;
     case "handoff": return `Handed off (${args.direction ?? "escalate"})`;
     case "clarification.askUser": return `Asked: ${clip(String(args.question ?? ""), 80)}`;
-    case "file.semanticSearch": return `Searched: ${clip(String(args.query ?? ""), 80)}`;
     case "syms.context": return `Built context: ${clip(String(args.query ?? ""), 80)}`;
     case "web.fetch": return `Fetched ${clip(String(args.url ?? ""))}`;
     case "web.search": return `Searched for: ${clip(String(args.query ?? ""), 60)}`;
     case "mode.switch": return `Switched to ${String(args.slug ?? "")} mode`;
-    case "skill.read": return `Read skill ${clip(String(args.name ?? ""), 40)}`;
-    case "skill.use": return `Loaded skill ${clip(String(args.name ?? ""), 40)}`;
-    case "memory.add": return `Memory added`;
-    case "memory.list": return `Listed memories`;
-    case "memory.edit": return `Edited memory`;
-    case "memory.delete": return `Deleted memory`;
-    case "rule.list": return `Listed rules`;
-    case "rule.read": return `Read rule ${clip(String(args.name ?? ""), 40)}`;
-    case "rule.create": return `Created rule ${clip(String(args.name ?? ""), 40)}`;
-    case "git.diffStaged": return "Read staged diff";
-    case "git.diffUnstaged": return "Read unstaged diff";
-    case "git.changedFiles": return "Listed changed files";
-    case "git.branchDiff": return "Read branch diff";
-    case "git.commitMessage": return "Generated commit message";
+    case "skill": return `Loaded skill ${clip(String(args.name ?? ""), 40)}`;
+    case "memory": return `Memory ${String(args.action ?? "list")}`;
     case "browser.console": return "Read browser console";
     case "browser.network": return "Read browser network";
     case "browser.domSnapshot": return "Read browser snapshot";
-    case "test.run": return `Ran tests${args.scope ? " (" + String(args.scope) + ")" : ""}`;
     case "session.exportTrace": return "Exported session trace";
     case "notebook.read": return args.cellIndex !== undefined ? `Read cell ${args.cellIndex} of ${cleanFilePath(path)}` : `Read notebook ${cleanFilePath(path)}`;
     case "notebook.editCell": return `Edited cell ${args.cellIndex ?? ""} in ${cleanFilePath(path)}`;
     case "notebook.addCell": return `Added a cell to ${cleanFilePath(path)}`;
     case "notebook.deleteCell": return `Deleted cell ${args.cellIndex ?? ""} from ${cleanFilePath(path)}`;
     case "notebook.execute": return `Executed cell ${args.cellIndex ?? ""} in ${cleanFilePath(path)}`;
-    case "wait.for": return `Waited ${String(args.seconds ?? "")}s`;
-    case "wait.until": return `Waited until ${clip(String(args.time ?? ""), 40)}`;
-    case "wait.forProcess": return `Waited for process ${args.id ?? ""}`;
-    case "wait.forCommand": return `Waited for: ${clip(String(args.command ?? ""))}`;
     case "context.retrieve": return `Retrieved context ${String(args.id ?? "").slice(0, 12)}`;
-    case "memory.note": return `Note saved`;
     case "hooks.list": return "Listed hooks";
     case "hooks.create": return `Created ${String(args.event ?? "hook")} hook`;
     case "hooks.update": return `Updated hook ${args.index ?? ""}`;
     case "hooks.delete": return `Deleted hook ${args.index ?? ""}`;
-    case "git.stage": return "Staged changes";
-    case "git.commit": return "Committed changes";
-    case "git.push": return "Pushed commits";
-    case "git.branch": { const a = String(args.action ?? "list"); const n = clip(String(args.name ?? ""), 30); return a === "create" ? `Created branch ${n}` : a === "switch" ? `Switched to branch ${n}` : a === "delete" ? `Deleted branch ${n}` : "Listed branches"; }
-    case "git.pr": { const a = String(args.action ?? "create"); return a === "create" ? "Created pull request" : a === "view" ? "Read pull request" : "Listed pull requests"; }
     default: return name;
   }
 }
-export const READ_TOOLS = new Set(["file.read", "file.grep", "file.glob", "file.semanticSearch", "syms.context", "notebook.read"]);
+export const READ_TOOLS = new Set(["file.read", "file.grep", "file.glob", "syms.context", "notebook.read"]);
 const WRITE_TOOLS = new Set(["file.edit", "file.write", "notebook.editCell", "notebook.addCell", "notebook.deleteCell"]);
-const SHELL_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.customRun", "shell.editCustomRun", "shell.runCustomRun"]);
-const BROWSER_TOOLS = new Set(["browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.close", "browser.hover", "browser.scroll", "browser.waitFor", "browser.console", "browser.network", "browser.domSnapshot", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "browser.newTab", "browser.switchTab", "browser.closeTab", "browser.listTabs", "browser.intercept", "browser.unintercept"]);
+const SHELL_TOOLS = new Set(["shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.kill"]);
+const BROWSER_TOOLS = new Set(["browser.navigate", "browser.click", "browser.type", "browser.screenshot", "browser.evaluate", "browser.readDom", "browser.close", "browser.hover", "browser.scroll", "browser.waitFor", "browser.console", "browser.network", "browser.domSnapshot", "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "browser.tab", "browser.intercept", "browser.unintercept"]);
 const MCP_TOOLS = new Set(["mcp.call", "mcp.create", "mcp.remove", "mcp.toggle", "mcp.resources/list", "mcp.resources/read", "mcp.prompts/list", "mcp.prompts/get"]);
-const GIT_TOOLS = new Set(["git.diffStaged", "git.diffUnstaged", "git.changedFiles", "git.branchDiff", "git.commitMessage"]);
-const GIT_WRITE_TOOLS = new Set(["git.stage", "git.commit", "git.push", "git.branch", "git.pr"]);
 const HOOK_WRITE_TOOLS = new Set(["hooks.create", "hooks.update", "hooks.delete"]);
-const CODE_EXECUTE_TOOLS = new Set(["test.run", "browser.runCode", "notebook.execute"]);
+const CODE_EXECUTE_TOOLS = new Set(["browser.runCode", "notebook.execute"]);
 function categoryForTool(name: string): string | undefined {
   if (READ_TOOLS.has(name)) return "read";
   if (isMcpToolSpec(name)) return "mcp";
   if (WRITE_TOOLS.has(name)) return "write.local";
   if (SHELL_TOOLS.has(name)) return "shell.other";
-  if (GIT_WRITE_TOOLS.has(name)) return "shell.other";
   if (name === "hooks.list") return "read";
   if (HOOK_WRITE_TOOLS.has(name)) return "code.execute";
   if (CODE_EXECUTE_TOOLS.has(name)) return "code.execute";
   if (name === "subagent.spawn") return "subagent";
-  if (name === "rule.create") return "write.external";
   if (name === "mcp.create" || name === "mcp.remove" || name === "mcp.toggle") return "mcp.configure";
   if (BROWSER_TOOLS.has(name)) return "browser";
   if (name === "web.fetch") return "web.fetch";
   if (name === "web.search") return "web.fetch";
   if (MCP_TOOLS.has(name)) return "mcp";
-  if (GIT_TOOLS.has(name)) return "read";
   return undefined;
-}
-function gitApprovalCommand(name: string, args: Record<string, unknown>): string {
-  if (name === "git.stage") return `git add${args.all ? " --all" : args.update ? " --update" : ` -- ${Array.isArray(args.paths) ? (args.paths as string[]).join(" ") : String(args.paths ?? "")}`}`;
-  if (name === "git.commit") return `git commit -m "${String(args.message ?? "").slice(0, 80)}"`;
-  if (name === "git.push") return `git push${args.force ? " --force-with-lease" : ""}${args.setUpstream ? " --set-upstream" : ""}${args.remote ? ` ${String(args.remote)}` : ""}${args.branch ? ` ${String(args.branch)}` : ""}`.trim();
-  if (name === "git.branch") return `git branch ${String(args.action ?? "list")}${args.name ? ` ${String(args.name)}` : ""}${args.force ? " (force)" : ""}`;
-  return `gh pr ${String(args.action ?? "create")}`;
 }
 function buildApprovalExtra(name: string, args: Record<string, unknown>, workspaceRoot: string): { toolName?: string; filePath?: string; workspaceRoot?: string; command?: string; mcpServer?: string } | undefined {
   if (WRITE_TOOLS.has(name) || name === "file.read" || name === "notebook.read" || name === "notebook.execute") return { toolName: name, filePath: String(args.path ?? ""), workspaceRoot };
-  if (name === "rule.create") return { toolName: name, filePath: path.join(getWorkspaceArcDir(workspaceRoot), "rules", `${String(args.name ?? "")}.md`), workspaceRoot };
   if (SHELL_TOOLS.has(name)) return { toolName: name, command: String(args.command ?? ""), workspaceRoot };
-  if (GIT_WRITE_TOOLS.has(name)) return { toolName: name, command: gitApprovalCommand(name, args), workspaceRoot };
   if (HOOK_WRITE_TOOLS.has(name)) {
     const m = args as { event?: unknown; tool?: unknown };
     return { toolName: name, command: `${name} ${String(m.event ?? "")}${m.tool ? ` (tool: ${String(m.tool)})` : ""}`.trim(), workspaceRoot };
@@ -2401,6 +2470,7 @@ function prettyToolSummary(name: string, args: Record<string, unknown>): string 
     case "shell.backgroundRun": return `[background] ${clip(String(args.command ?? ""))}`;
     case "shell.check": return `Check process ${args.id ?? ""}`;
     case "shell.write": return `Write to process ${args.id ?? ""}`;
+    case "shell.kill": return `Kill process ${args.id ?? ""}`;
     case "browser.navigate": return `Navigate to ${clip(String(args.url ?? ""))}`;
     case "browser.click": return `Click ${clip(String(args.selector ?? ""))}`;
     case "browser.type": return `Type into ${clip(String(args.selector ?? ""))}`;
@@ -2412,10 +2482,7 @@ function prettyToolSummary(name: string, args: Record<string, unknown>): string 
     case "browser.runCode": return `Run Playwright code:\n\n${String(args.code ?? "")}`;
     case "browser.readPage": return "Read page content";
     case "browser.close": return "Close browser";
-    case "browser.newTab": return `Open new tab${args.url ? " for " + clip(String(args.url)) : ""}`;
-    case "browser.switchTab": return `Switch to tab ${args.tabId ?? ""}`;
-    case "browser.closeTab": return `Close tab ${args.tabId ?? ""}`;
-    case "browser.listTabs": return "List browser tabs";
+    case "browser.tab": { const a = String(args.action ?? "list"); return a === "new" ? `Open new tab${args.url ? " for " + clip(String(args.url)) : ""}` : a === "switch" ? `Switch to tab ${args.tabId ?? ""}` : a === "close" ? `Close tab ${args.tabId ?? ""}` : "List browser tabs"; }
     case "browser.intercept": return `Intercept ${clip(String(args.pattern ?? ""))}`;
     case "browser.unintercept": return `Stop intercepting ${clip(String(args.pattern ?? ""))}`;
     case "web.fetch": return `Fetch ${clip(String(args.url ?? ""))}`;
@@ -2424,27 +2491,17 @@ function prettyToolSummary(name: string, args: Record<string, unknown>): string 
     case "mcp.create": return `Register MCP server ${args.name ?? ""}:\n\n${JSON.stringify(args.transport ?? {}, null, 2)}`;
     case "mcp.remove": return `Remove MCP server ${args.name ?? ""}`;
     case "mcp.toggle": return `Toggle MCP server ${args.name ?? ""}`;
-    case "git.diffStaged": return "Staged diff";
-    case "git.diffUnstaged": return "Unstaged diff";
-    case "git.changedFiles": return "Changed files";
-    case "git.branchDiff": return `Branch diff${args.base ? " vs " + String(args.base) : ""}`;
-    case "git.commitMessage": return "Commit message";
     case "browser.console": return "Browser console";
     case "browser.network": return "Browser network";
     case "browser.domSnapshot": return "Browser snapshot";
-    case "test.run": return `Run tests (${args.scope ?? "workspace"}${args.path ? `: ${args.path}` : ""})`;
     case "notebook.read": return args.cellIndex !== undefined ? `Read notebook cell ${args.cellIndex}` : "List notebook cells";
     case "notebook.editCell": return `Edit notebook cell ${args.cellIndex ?? ""}`;
     case "notebook.addCell": return "Add notebook cell";
     case "notebook.deleteCell": return `Delete notebook cell ${args.cellIndex ?? ""}`;
     case "notebook.execute": return `Execute notebook cell ${args.cellIndex ?? ""} in ${String(args.path ?? "")}`;
-    case "shell.customRun": return `Define custom run '${String(args.name ?? "")}'`;
-    case "shell.editCustomRun": return `Edit custom run ${args.id ?? ""}`;
-    case "shell.runCustomRun": return `Run custom run ${args.id ?? ""}`;
-    case "lsp.problems": return "Check workspace problems";
-    case "lsp.problemsFor": return `Check problems in ${clip(String(args.path ?? ""))}`;
+    case "lsp": return args.path ? `Check problems in ${clip(String(args.path ?? ""))}` : "Check workspace problems";
     case "todo.write": return `Update plan (${Array.isArray(args.items) ? `${args.items.length} items` : "items"})`;
-    case "file.semanticSearch": return `Semantic search for ${clip(String(args.query ?? ""), 40)}`;
+    case "tool.search": return `Search tools for ${clip(String(args.query ?? ""), 40)}`;
     case "syms.context": return `Code context for ${clip(String(args.query ?? ""), 40)}`;
     case "mcp.resources/list": return `List MCP resources on ${args.server ?? ""}`;
     case "mcp.resources/read": return `Read MCP resource ${args.uri ?? ""}`;
@@ -2459,23 +2516,11 @@ function prettyToolSummary(name: string, args: Record<string, unknown>): string 
     case "handoff": return `Hand off (${args.direction ?? "escalate"})`;
     case "clarification.askUser": return `Ask: ${clip(String(args.question ?? ""), 40)}`;
     case "mode.switch": return `Switch to mode '${String(args.slug ?? "")}'`;
-    case "skill.read": return `Read skill ${String(args.name ?? "")}`;
-    case "skill.use": return `Load skill ${String(args.name ?? "")}`;
-    case "memory.list": return "List memories";
-    case "memory.edit": return `Edit memory #${args.index ?? ""}`;
-    case "memory.delete": return `Delete memory #${args.index ?? ""}`;
-    case "memory.add": return `Add memory (${args.category ?? "general"})`;
-    case "memory.note": return "Append workspace note";
-    case "rule.list": return "List rules";
-    case "rule.read": return `Read rule ${String(args.name ?? "")}`;
-    case "rule.create": return `Create rule ${String(args.name ?? "")}`;
+    case "skill": return `Load skill ${String(args.name ?? "")}`;
+    case "memory": return `Memory ${String(args.action ?? "list")}`;
     case "browser.hover": return `Hover ${clip(String(args.selector ?? ""))}`;
     case "browser.scroll": return args.pixels !== undefined ? `Scroll ${args.pixels}px` : `Scroll to ${clip(String(args.selector ?? ""))}`;
     case "browser.waitFor": return `Wait for ${clip(String(args.selector ?? args.url ?? ""))}`;
-    case "wait.for": return `Wait ${args.seconds ?? ""}s`;
-    case "wait.until": return `Wait until ${String(args.time ?? "")}`;
-    case "wait.forProcess": return `Wait for process ${args.id ?? ""}`;
-    case "wait.forCommand": return `Wait until: ${clip(String(args.command ?? ""), 40)}`;
     case "context.retrieve": return `Restore compressed output ${args.id ?? ""}`;
     default: return name;
   }

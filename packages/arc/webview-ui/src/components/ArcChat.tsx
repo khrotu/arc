@@ -116,7 +116,9 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const [serverStates, setServerStates] = useState<Record<string, { running: boolean; pid?: number; error?: string; starting?: boolean }>>({});
   const [approvalQueue, setApprovalQueue] = useState<{ id: string; description: string; kind: string; command?: string }[]>([]);
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
-  const [queuedMessage, setQueuedMessage] = useState<{ text: string; attachments?: { uri: string; preview?: string }[]; images?: string[]; modelId?: string; autoRouted?: boolean } | null>(null);
+  const [queuedMessage, setQueuedMessage] = useState<{ text: string; mode: "queued" | "now"; attachments?: { uri: string; preview?: string }[]; images?: string[]; modelId?: string; autoRouted?: boolean } | null>(null);
+  const [revertAttachments, setRevertAttachments] = useState<{ uri: string; preview?: string }[] | null>(null);
+  const [revertImages, setRevertImages] = useState<string[] | null>(null);
   const [prefillText, setPrefillText] = useState<string | null>(null);
   const [prefillSeq, setPrefillSeq] = useState(0);
   const [polishLevel, setPolishLevel] = useState<"off" | "basic" | "polish">("off");
@@ -129,6 +131,28 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const [autoApproveMode, setAutoApproveModeState] = useState<"off" | "safe" | "allowlist" | "all">("off");
   const [reasoningEffort, setReasoningEffort] = useState<Effort>("high");
   const [resolvedDiffs, setResolvedDiffs] = useState<Record<string, "accepted" | "rejected">>({});
+  const resolvedDiffsStoreKey = "arcResolvedDiffs";
+  const readPersistedDiffs = (): Record<string, Record<string, "accepted" | "rejected">> => {
+    try {
+      const s = client.getViewState();
+      const m = (s as Record<string, unknown>)[resolvedDiffsStoreKey];
+      if (m && typeof m === "object" && !Array.isArray(m)) return m as Record<string, Record<string, "accepted" | "rejected">>;
+    } catch {
+    }
+    return {};
+  };
+  useEffect(() => {
+    try {
+      const id = sessionIdRef.current || activeId;
+      if (!id) return;
+      const prev = readPersistedDiffs();
+      const next = { ...prev };
+      if (Object.keys(resolvedDiffs).length) next[id] = resolvedDiffs;
+      else delete next[id];
+      client.setViewState({ [resolvedDiffsStoreKey]: next });
+    } catch {
+    }
+  }, [resolvedDiffs, activeId, client]);
   const [chatLoading, setChatLoading] = useState(false);
   const [renderWindow, setRenderWindow] = useState(DEFAULT_RENDER_WINDOW);
   const renderWindowRef = useRef(DEFAULT_RENDER_WINDOW);
@@ -203,6 +227,11 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
           setPolishing(false);
           setPolishPending(null);
           setApprovalQueue([]);
+          try {
+            setResolvedDiffs(readPersistedDiffs()[e.chatId] ?? {});
+          } catch {
+            setResolvedDiffs({});
+          }
           setChatLoading(true);
           setRenderWindow(DEFAULT_RENDER_WINDOW);
           break;
@@ -262,6 +291,22 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
         case "session/replaceState":
           setMessages(e.messages);
           setSteps(e.steps);
+          setResolvedDiffs((cur) => {
+            if (!Object.keys(cur).length) return cur;
+            const alive = new Set<string>();
+            const collect = (s: any): void => {
+              if (s && typeof s.id === "string") alive.add(s.id);
+              (s?.children ?? []).forEach(collect);
+            };
+            (e.steps ?? []).forEach(collect);
+            let changed = false;
+            const next: Record<string, "accepted" | "rejected"> = {};
+            for (const [k, v] of Object.entries(cur)) {
+              if (alive.has(k)) next[k] = v;
+              else changed = true;
+            }
+            return changed ? next : cur;
+          });
           setChatLoading(false);
           if (e.loadComposer) { setPrefillText(e.loadComposer); setPrefillSeq((s) => s + 1); }
           break;
@@ -382,7 +427,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   }, [steps, streaming, clarification, messages]);
   const send = (text: string, attachments?: { uri: string; preview?: string }[], images?: string[], modelId?: string, autoRouted?: boolean) => {
     if (streaming || stopping) {
-      setQueuedMessage({ text, attachments, images, modelId, autoRouted });
+      setQueuedMessage({ text, mode: "queued", attachments, images, modelId, autoRouted });
       return;
     }
     setPrefillText("");
@@ -447,6 +492,26 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   };
   const guide = (text: string) => client.send({ type: "chat/guidance", text });
   const cancelQueue = () => setQueuedMessage(null);
+  const revertQueue = () => {
+    const q = queuedMessage;
+    if (!q) return;
+    setQueuedMessage(null);
+    setRevertAttachments(q.attachments ?? null);
+    setRevertImages(q.images ?? null);
+    setPrefillText(q.text);
+    setPrefillSeq((s) => s + 1);
+  };
+  const updateQueueText = (text: string) => {
+    setQueuedMessage((q) => (q ? { ...q, text } : q));
+  };
+  const setQueueMode = (mode: "queued" | "now") => {
+    if (mode === "now") {
+      stop();
+      setQueuedMessage((q) => (q ? { ...q, mode } : q));
+      return;
+    }
+    setQueuedMessage((q) => (q ? { ...q, mode } : q));
+  };
   useEffect(() => {
     if (!streaming && !stopping && queuedMessage) {
       const q = queuedMessage;
@@ -660,17 +725,70 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
   const saveGroupTitle = useCallback((stepId: string, title: string, mode: string) => {
     client.send({ type: "chat/saveGroupTitle", stepId, title, mode });
   }, [client]);
+  const pendingDiffSteps = useRef<ProcessStep[]>([]);
+  const stepsRef = useRef<ProcessStep[]>([]);
+  stepsRef.current = steps;
+  const normDiffPath = (p: string): string => p.replace(/\\/g, "/").trim();
+  const handleResolveDiff = useCallback((filePath: string, action: "accept" | "reject") => {
+    const want = normDiffPath(filePath);
+    setResolvedDiffs((cur) => {
+      const next = { ...cur };
+      const scan = (s: ProcessStep): void => {
+        if (s.filePath && normDiffPath(s.filePath) === want) next[s.id] = action === "accept" ? "accepted" : "rejected";
+        s.children?.forEach(scan);
+      };
+      stepsRef.current.forEach(scan);
+      for (const s of pendingDiffSteps.current) {
+        if (s.filePath && normDiffPath(s.filePath) === want) next[s.id] = action === "accept" ? "accepted" : "rejected";
+      }
+      return next;
+    });
+    client.send({ type: action === "accept" ? "diff/accept" : "diff/reject", filePath });
+  }, [client]);
+  const countHunkLines = (h: { value?: string }): number => {
+    const v = h.value ?? "";
+    if (v === "") return 0;
+    const parts = v.split(/\r?\n/);
+    if (parts.length && parts[parts.length - 1] === "") parts.pop();
+    return parts.length;
+  };
+  const isReviewableDiffStep = (s: ProcessStep): boolean => {
+    return !!s.filePath && s.type !== "error" && !s.pending && !resolvedDiffs[s.id] && !!s.diffHunks && s.diffHunks.length > 0;
+  };
+  const pendingDiffs = useMemo(() => {
+    const order: string[] = [];
+    const rows = new Map<string, { added: number; removed: number; display: string }>();
+    const visit = (s: ProcessStep): void => {
+      if (isReviewableDiffStep(s)) {
+        const key = normDiffPath(s.filePath!);
+        let row = rows.get(key);
+        if (!row) { row = { added: 0, removed: 0, display: s.filePath! }; rows.set(key, row); order.push(key); }
+        for (const h of s.diffHunks!) {
+          const lines = countHunkLines(h);
+          if (h.added) row.added += lines;
+          else if (h.removed) row.removed += lines;
+        }
+      }
+      s.children?.forEach(visit);
+    };
+    steps.forEach(visit);
+    return order.map((key) => {
+      const r = rows.get(key)!;
+      return { filePath: r.display, added: r.added, removed: r.removed };
+    });
+  }, [steps, resolvedDiffs]);
+  useEffect(() => {
+    const matched: ProcessStep[] = [];
+    const visit = (s: ProcessStep): void => {
+      if (isReviewableDiffStep(s)) matched.push(s);
+      s.children?.forEach(visit);
+    };
+    steps.forEach(visit);
+    pendingDiffSteps.current = matched;
+  }, [steps, resolvedDiffs]);
   const timelineNodes = useMemo<ReactNode[]>(() => {
     const out: ReactNode[] = [];
     let run: ProcessStep[] = [];
-    const handleResolveDiff = (step: ProcessStep, action: "accept" | "reject") => {
-      setResolvedDiffs((cur) => ({ ...cur, [step.id]: action === "accept" ? "accepted" : "rejected" }));
-      if (action === "reject" && step.filePath) {
-        client.send({ type: "diff/reject", stepId: step.id, filePath: step.filePath, hunks: step.diffHunks ?? [] });
-      } else if (action === "accept" && step.filePath) {
-        client.send({ type: "diff/accept", stepId: step.id, filePath: step.filePath });
-      }
-    };
     const flush = () => {
       if (run.length) {
         out.push(
@@ -683,8 +801,6 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               client.send({ type: "ui/openFileDiff", path: payload.filePath, hunks: payload.hunks });
             }}
             toolTreeMode={toolTreeMode}
-            resolvedDiffs={resolvedDiffs}
-            onResolveDiff={handleResolveDiff}
             groupSummaryMode={groupSummaryMode}
             requestAISummary={requestAISummary}
             saveGroupTitle={saveGroupTitle}
@@ -734,8 +850,6 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               client.send({ type: "ui/openFileDiff", path: payload.filePath, hunks: payload.hunks });
             }}
             toolTreeMode={toolTreeMode}
-            resolvedDiffs={resolvedDiffs}
-            onResolveDiff={handleResolveDiff}
           />,
         );
         continue;
@@ -748,7 +862,7 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
     }
     flush();
     return out;
-  }, [timeline, toolTreeMode, variant, resolvedDiffs, client, groupSummaryMode, requestAISummary, saveGroupTitle, renderWindow]);
+  }, [timeline, toolTreeMode, variant, client, groupSummaryMode, requestAISummary, saveGroupTitle, renderWindow]);
   useLayoutEffect(() => {
     const el = transcriptRef.current;
     if (!el || !loadMoreScrollRef.current) return;
@@ -977,10 +1091,15 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               onGuidance={guide}
               streaming={!!streaming}
               pendingAttachment={pendingAttachment}
-              queuedText={queuedMessage?.text ?? null}
+              queued={queuedMessage ? { text: queuedMessage.text, mode: queuedMessage.mode, attachmentCount: (queuedMessage.attachments?.length ?? 0) + (queuedMessage.images?.length ?? 0), attachmentNames: [...(queuedMessage.attachments?.map((a) => a.preview ?? a.uri) ?? [])] } : null}
               onCancelQueue={cancelQueue}
+              onRevertQueue={revertQueue}
+              onUpdateQueue={updateQueueText}
+              onQueueModeChange={setQueueMode}
               prefillText={prefillText}
               prefillSeq={prefillSeq}
+              prefillAttachments={revertAttachments}
+              prefillImages={revertImages}
               todos={variant === "sidebar" && todosVisible ? (latestTodos as TodoItemUI[] | null) : null}
               todosOpen={todosOpen}
               onToggleTodos={() => setTodosOpen((o) => !o)}
@@ -1006,11 +1125,17 @@ export default function ArcChat({ client, monoLogo, prideLogo, monoLogoText, pri
               suggestions={suggestions.length ? suggestions : null}
               suggestionsOpen={suggestionsOpen}
               onToggleSuggestions={() => setSuggestionsOpen((o) => !o)}
+              diffs={pendingDiffs}
+              onResolveDiff={handleResolveDiff}
+              onResolveAllDiffs={(action) => {
+                for (const d of pendingDiffs) handleResolveDiff(d.filePath, action);
+              }}
               onUnloadSuggestion={(kind, id) => client.send({ type: "suggestions/unload", kind, id })}
               onDismissSuggestion={(kind, id) => {
                 setSuggestions((prev) => prev.filter((s) => !(s.kind === kind && s.id === id)));
                 client.send({ type: "suggestions/dismiss", kind, id });
               }}
+              onOpenFile={openFile}
               placeholder={currentModel === AUTO_MODEL_ID ? "Ask anything" : (currentModelLabel ? `Ask ${currentModelLabel}` : undefined)}
               variant={variant}
               models={models}

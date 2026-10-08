@@ -91,7 +91,7 @@ describe("toVscodeLmTools", () => {
   });
   it("escapes names identically to the OpenAI-compatible path", () => {
     const out = toVscodeLmTools([{ name: "file.read", description: "Read a file", parameters: { type: "object" } }]);
-    expect(out).toEqual([{ name: "file_dread", description: "Read a file", inputSchema: { type: "object" } }]);
+    expect(out).toEqual([{ name: "fileread", description: "Read a file", inputSchema: { type: "object" } }]);
   });
   it("omits empty parameter schemas", () => {
     const out = toVscodeLmTools([{ name: "x", description: "y", parameters: {} }]);

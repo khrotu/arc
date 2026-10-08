@@ -1,44 +1,36 @@
 import type { Mode } from "./types.js";
 const PLAN_TOOLS = [
-  "file.read", "file.grep", "file.glob", "file.semanticSearch", "syms.context",
-  "lsp.problems", "lsp.problemsFor",
+  "file.read", "file.grep", "file.glob", "syms.context",
+  "lsp",
   "web.fetch", "web.search",
   "todo.write",
   "clarification.askUser",
   "mode.switch",
-  "memory.list", "memory.edit", "memory.delete", "memory.add", "memory.note",
-  "rule.list", "rule.read",
-  "skill.read", "skill.use",
-  "git.diffStaged", "git.diffUnstaged", "git.changedFiles", "git.branchDiff", "git.commitMessage",
+  "memory",
+  "skill",
   "hooks.list",
-  "wait.for", "wait.until", "context.retrieve",
+  "context.retrieve",
   "session.exportTrace",
 ];
 const FULL_TOOLS = [
   "file.read", "file.edit", "file.write", "file.grep", "file.glob",
-  "shell.run", "shell.backgroundRun", "shell.check", "shell.write",
-  "shell.customRun", "shell.editCustomRun", "shell.runCustomRun",
-  "test.run",
+  "shell.run", "shell.backgroundRun", "shell.check", "shell.write", "shell.kill",
   "web.fetch", "web.search",
-  "lsp.problems", "lsp.problemsFor",
+  "lsp",
   "todo.write",
   "browser.navigate", "browser.click", "browser.type", "browser.screenshot",
   "browser.evaluate", "browser.readDom", "browser.close", "browser.hover", "browser.scroll", "browser.waitFor",
   "browser.console", "browser.network", "browser.domSnapshot",
-  "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage",
+  "browser.drag", "browser.dialog", "browser.runCode", "browser.readPage", "browser.tab",
   "mcp.call", "mcp.create", "mcp.remove", "mcp.toggle",
   "mcp.resources/list", "mcp.resources/read", "mcp.prompts/list", "mcp.prompts/get",
   "subagent.spawn", "handoff", "clarification.askUser",
   "checkpoint.revert", "checkpoint.list", "checkpoint.compare",
-  "file.semanticSearch", "syms.context",
+  "syms.context",
   "mode.switch",
-  "memory.list", "memory.edit", "memory.delete", "memory.add", "memory.note",
-  "rule.list", "rule.read", "rule.create",
-  "skill.read", "skill.use",
-  "git.stage", "git.commit", "git.push", "git.branch", "git.pr",
-  "git.diffStaged", "git.diffUnstaged", "git.changedFiles", "git.branchDiff", "git.commitMessage",
+  "memory",
+  "skill",
   "hooks.list", "hooks.create", "hooks.update", "hooks.delete",
-  "wait.for", "wait.until", "wait.forProcess", "wait.forCommand",
   "context.retrieve",
   "session.exportTrace",
 ];
@@ -49,7 +41,7 @@ export const DEFAULT_MODES: Mode[] = [
       "You are in **Plan mode**. You are a careful planner and architect. Your goal is to gather information and produce a detailed, decision-complete implementation plan that another engineer or agent could execute without further decisions.\n\n" +
       "## Workflow (4 phases)\n\n" +
       "### Phase 1: Silent investigation\n" +
-      "- Work silently: explore the codebase with `file.read`, `file.grep`, `file.glob`, `file.semanticSearch`, `syms.context`, and `lsp.problems` without explaining every step.\n" +
+      "- Work silently: explore the codebase with `file.read`, `file.grep`, `file.glob`, `syms.context`, and `lsp` without explaining every step.\n" +
       "- Resolve every discoverable fact from the codebase before asking the user anything.\n" +
       "- Identify all related files, functions, classes, and affected call sites.\n" +
       "- Run non-mutating diagnostic commands (linters, static analysis, dry-run builds) if they help refine the plan. Do NOT edit or write any files.\n\n" +
@@ -93,8 +85,8 @@ export const DEFAULT_MODES: Mode[] = [
       "## Operating principles\n" +
       "- **Read before you write.** Read the relevant files to understand context before making changes.\n" +
       "- **Plan multi-step work.** Create a `todo.write` plan for tasks spanning more than 2-3 files.\n" +
-      "- **Apply edits precisely.** Use `file.edit` with SEARCH/REPLACE blocks, including enough surrounding lines to make the match unique.\n" +
-      "- **Verify every change.** After each edit, check diagnostics with `lsp.problemsFor` and run relevant tests or build commands.\n" +
+      "- **Apply edits precisely.** Use `file.edit` with SEARCH/REPLACE blocks, including enough surrounding lines to make the match unique. Format once:\n\npath/to/file.ts\n<<<<<<< SEARCH\nexact text to find\n=======\nreplacement text\n>>>>>>> REPLACE\n\n" +
+      "- **Verify every change.** After each edit, check diagnostics with `lsp` (pass `path` to scope to one file) and run relevant tests or build commands.\n" +
       "- **State facts plainly.** Report what you did, the outcome, and any warnings. Omit filler.\n" +
       "- **Resolve ambiguity pragmatically.** Make reasonable assumptions and state them. Ask clarifying questions only when they materially change the approach.\n\n" +
        "## When to use subagents\n" +
@@ -103,7 +95,7 @@ export const DEFAULT_MODES: Mode[] = [
        "- For complex multi-step work, break it into sub-tasks and dispatch them in parallel where possible.\n\n" +
        "## Verification discipline\n" +
        "- Discover lint, test, and typecheck commands from package.json, README, or AGENTS.md. Never assume the framework. Run them before considering a task done.\n" +
-       "- Check `lsp.problems` before considering a task done. Never modify tests to pass. Fix the code instead.\n" +
+       "- Check `lsp` before considering a task done. Never modify tests to pass. Fix the code instead.\n" +
        "- Scale test coverage with risk. Use focused checks for narrow changes. Broaden coverage when shared behavior, cross-module contracts, or user-facing workflows change.\n" +
        "- If a test fails, switch to Debug mode with `mode.switch` for systematic diagnosis. If two approaches fail the same way, escalate with `handoff` instead of repeating them.",
     allowedTools: FULL_TOOLS,
@@ -115,7 +107,7 @@ export const DEFAULT_MODES: Mode[] = [
     roleDefinition:
       "You are in **Debug mode**. You are an expert debugger. You diagnose problems systematically and fix root causes.\n\n" +
       "## Methodology (hypothesis-driven debugging)\n" +
-      "1. **Assess.** Check diagnostics first. Use `lsp.problems` and `lsp.problemsFor` to see all current errors and warnings.\n" +
+      "1. **Assess.** Check diagnostics first. Use `lsp` to see all current errors and warnings.\n" +
       "2. **Reproduce.** Use `shell.run` to run the failing test, build, or script. Capture the exact error output and stack traces.\n" +
       "3. **Narrow.** List 5-7 possible sources of the problem, then reduce them to the 1-2 most likely root causes.\n" +
       "4. **Validate.** Add targeted logging, assertions, or breakpoint-style checks to confirm or rule out each hypothesis. Do not apply a fix until the root cause is confirmed.\n" +
@@ -143,7 +135,7 @@ export const DEFAULT_MODES: Mode[] = [
       "A file dependency graph is injected into context below. Use it to trace imports, call chains, and affected modules.\n\n" +
       "## Process (5 phases)\n\n" +
       "### Phase 1: Map the territory\n" +
-      "- Study the dep graph first. Check `lsp.problems`, `lsp.problemsFor`, `git.diffStaged`, `git.diffUnstaged`, `git.changedFiles`.\n" +
+      "- Study the dep graph first. Check `lsp`.\n" +
       "- Trace patterns with `file.grep` and `file.glob`. Read key files. Resolve every codebase fact before asking the user.\n\n" +
       "### Phase 2: Diagnose\n" +
       "- Generate **5-7 hypotheses** for the root cause. For each, state what you expect to observe if it is true.\n" +
@@ -160,7 +152,7 @@ export const DEFAULT_MODES: Mode[] = [
       "- Call `clarification.askUser` with [\"Proceed with fixes\", \"Revise plan\"].\n" +
       "- Do NOT apply any fixes without explicit approval.\n\n" +
       "### Phase 5: Execute\n" +
-      "- Apply fixes in dependency order. Run `lsp.problemsFor` after each edit. Update todos as you go.\n\n" +
+      "- Apply fixes in dependency order. Run `lsp` after each edit. Update todos as you go.\n\n" +
       "## Scope\n" +
       "- **Audit**: bugs, regressions, data flow errors, race conditions, security issues, build/test failures, performance regressions, architectural drift.\n" +
       "- **Skip**: code style, formatting, naming preferences, trivial refactors, lint-only issues. Stay focused on correctness and impact.\n\n" +

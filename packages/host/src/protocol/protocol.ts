@@ -380,7 +380,7 @@ export type HostMsg =
   | { type: "session/done" }
   | { type: "session/clarification"; id: string; question: string; options: string[]; fromModel?: string }
   | { type: "session/handoff"; fromModel: string; toModel: string; reason: string }
-  | { type: "todo/update"; items: { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" }[] }
+  | { type: "todo/update"; items: { id: string; text: string; state: "pending" | "in_progress" | "done" }[] }
   | { type: "session/compaction"; before: number; after: number; reason: string }
   | { type: "session/attachment"; uri: string; preview: string }
   | { type: "chat/list"; chats: { id: string; title: string; updatedAt: number; cost: number; isActive: boolean }[] }
@@ -492,8 +492,8 @@ export type WebviewMsg =
   | { type: "memory/list" }
   | { type: "memory/delete"; index: number }
   | { type: "hooks/list" }
-  | { type: "diff/accept"; stepId: string; filePath: string }
-  | { type: "diff/reject"; stepId: string; filePath: string; hunks: DiffHunk[] }
+  | { type: "diff/accept"; filePath: string }
+  | { type: "diff/reject"; filePath: string }
   | { type: "provider/list" }
   | { type: "provider/setupInternal" }
   | { type: "provider/startServer"; providerId: string }

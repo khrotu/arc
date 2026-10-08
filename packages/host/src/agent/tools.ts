@@ -2,9 +2,9 @@ import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileEditor } from "../edit/editor.js";
-import { getSkillsDir, getWorkspaceArcDir } from "../arc-dir.js";
+import { getWorkspaceArcDir } from "../arc-dir.js";
 import { runPreWriteHooks, runPostEditHooks } from "../hooks/hooks.js";
-import { findOnPath, minimalEnvironment, PROCESS_OUTPUT_LIMIT, proxyEnvironment, runGit, runProcess, runShellCommand, shellCommand, spawnBounded, terminateProcessTree } from "../util/process.js";
+import { minimalEnvironment, PROCESS_OUTPUT_LIMIT, proxyEnvironment, runShellCommand, shellCommand, spawnBounded, terminateProcessTree } from "../util/process.js";
 import { readBodyLimited, safeFetch } from "../security/network.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
 import { parseNotebook, serializeNotebook, listCells, readCell, editCellSource, addCell, deleteCell } from "../notebook/notebook.js";
@@ -46,6 +46,23 @@ interface BgProcess { proc: ChildProcess; command: string; stdout: string; stder
 const bgProcesses = new Map<string, BgProcess>();
 let bgIds = 0;
 const activeProcesses = new Set<ChildProcess>();
+export function decodeInputEscapes(s: string): string {
+  return s.replace(/\\(\\|"|n|r|t|b|f|v|0|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|')/g, (_m, e: string) => {
+    switch (e) {
+      case "\\": return "\\";
+      case '"': return '"';
+      case "'": return "'";
+      case "n": return "\n";
+      case "r": return "\r";
+      case "t": return "\t";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "v": return "\v";
+      case "0": return "\0";
+      default: return String.fromCharCode(parseInt(e.slice(1), 16));
+    }
+  });
+}
 export function listBackgroundProcesses(): { id: string; command: string; exited: boolean }[] {
   const out: { id: string; command: string; exited: boolean }[] = [];
   for (const [id, bg] of bgProcesses) {
@@ -206,30 +223,8 @@ async function enforcePreWrite(filePath: string, content: string, ctx: ToolConte
   const approved = await ctx.requestApproval?.(`Potential secret detected before writing ${filePath}:\n\n${scan.errors.join("\n")}\n\nWrite this file once anyway?`);
   if (!approved) throw new Error(scan.errors.join("\n"));
 }
-async function runSingleCommand(
-  cmd: string,
-  cwd: string,
-  _ctx: ToolContext,
-  onChunk?: (stream: "stdout" | "stderr", text: string) => void,
-): Promise<{ ok: boolean; output: string }> {
-  const proxyEnv = proxyEnvironment(_ctx.proxyShell || _ctx.proxyUrl);
-  let spawned: ChildProcess | undefined;
-  const result = await runShellCommand(cmd, {
-    cwd,
-    env: minimalEnvironment(proxyEnv),
-    maxOutputBytes: PROCESS_OUTPUT_LIMIT,
-    sandboxProfile: _ctx.sandboxProfile,
-    workspaceRoot: _ctx.workspacePath,
-    onChunk: (stream, text) => onChunk?.(stream, stripAnsi(text)),
-    onSpawn: (proc) => { spawned = proc; activeProcesses.add(proc); },
-  });
-  if (spawned) activeProcesses.delete(spawned);
-  const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "") + (result.truncated ? "\n[output limit exceeded]" : "");
-  return { ok: result.ok, output };
-}
 import type { ApprovalsConfig, SessionApprovals, ApproveShellMeta } from "../approvals/index.js";
 import type { SkillRegistry } from "../skills/index.js";
-import type { RuleRegistry } from "../rules/index.js";
 import type { FileContextTracker } from "../context/context.js";
 export interface ToolContext {
   root: string;
@@ -238,7 +233,6 @@ export interface ToolContext {
   requestApproval?: (description: string, meta?: ApproveShellMeta) => Promise<boolean>;
   addSessionCommand?: (command: string) => void;
   skillRegistry?: SkillRegistry;
-  ruleRegistry?: RuleRegistry;
   sandboxProfile?: SandboxProfile;
   shellSurface?: "arc-handled" | "integrated";
   runInVsCodeTerminal?: (command: string, cwd: string) => Promise<{ ok: boolean; output: string }>;
@@ -258,7 +252,6 @@ export interface ToolContext {
   proxyShell?: string;
   webSearchBackend?: string;
   webSearchApiKey?: string;
-  semanticSearch?: (query: string, k?: number) => Promise<{ file: string; start: number; end: number; score: number; snippet: string }[]>;
   describeImage?: (dataUrl: string) => Promise<string | undefined>;
   fileContextTracker?: FileContextTracker;
   executeNotebookCell?: (path: string, cellIndex: number) => Promise<{ ok: boolean; output: string; images?: string[] }>;
@@ -270,7 +263,7 @@ export interface ToolResult {
   ok: boolean;
   output: string;
   touchedFiles?: string[];
-  todoState?: { items: { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" | "blocked" | "failed"; children?: { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" | "blocked" | "failed" }[] }[] };
+  todoState?: { items: { id: string; text: string; state: "pending" | "in_progress" | "done" }[] };
   clarification?: { id: string; answer: string };
   diffHunks?: DiffHunk[];
   filePath?: string;
@@ -278,6 +271,9 @@ export interface ToolResult {
   images?: { type: string; image_url: { url: string } }[];
 }
 export type ToolFn = (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
+function normalizeTodoState(raw: unknown): "pending" | "in_progress" | "done" {
+  return raw === "in_progress" || raw === "done" ? raw : "pending";
+}
 export function checkWriteGlob(filePath: string, glob: string, root?: string): { allowed: boolean } {
   try {
     if (!glob.trim() || glob.includes("\0")) return { allowed: false };
@@ -324,43 +320,6 @@ async function startBackgroundProcess(cmd: string, cwd: string, ctx: ToolContext
     return { ok: true, output: `Background process started (id: ${id}). Use shell.check to poll output.` };
   } catch (e: unknown) {
     return { ok: false, output: `Failed to start background process: ${(e as Error).message}` };
-  }
-}
-async function defaultGitRemote(cwd: string): Promise<string> {
-  try {
-    const r = await runGit(["remote"], { cwd, maxOutputBytes: 4096, timeoutMs: 15_000, env: minimalEnvironment({ GIT_TERMINAL_PROMPT: "0" }) });
-    if (!r.ok) return "";
-    const names = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    return names.includes("origin") ? "origin" : (names[0] ?? "");
-  } catch {
-    return "";
-  }
-}
-async function findCustomRun(dir: string, idOrName: string): Promise<{ id: string; name: string; commands: string[] } | undefined> {
-  if (/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(idOrName)) {
-    try {
-      const parsed = JSON.parse(await fs.readFile(path.join(dir, `${idOrName}.json`), "utf-8"));
-      if (parsed && typeof parsed.name === "string" && Array.isArray(parsed.commands)) return parsed;
-    } catch {}
-  }
-  try {
-    const files = await fs.readdir(dir);
-    for (const f of files) {
-      if (!f.endsWith(".json")) continue;
-      try {
-        const skill = JSON.parse(await fs.readFile(path.join(dir, f), "utf-8"));
-        if (typeof skill?.name === "string" && skill.name === idOrName && Array.isArray(skill.commands)) return skill;
-      } catch {}
-    }
-  } catch {}
-  return undefined;
-}
-async function listCustomRunIds(dir: string): Promise<string[]> {
-  try {
-    const files = await fs.readdir(dir);
-    return files.filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, ""));
-  } catch {
-    return [];
   }
 }
 function waitTimeoutMs(raw: unknown, fallbackMs: number): number {
@@ -442,7 +401,7 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       if (r.ok) {
         runPostEditHooks(filePath, ctx.root, ctx.sandboxProfile).catch(() => {});
       }
-      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}) })) : [];
+      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}), ...(typeof c.count === "number" ? { count: c.count } : {}) })) : [];
       if (r.ok && hunks.length && ctx.onDiff) {
         await streamDiffHunks(hunks, filePath, ctx.onDiff);
       }
@@ -475,7 +434,7 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       if (r.ok) {
         runPostEditHooks(filePath, ctx.root, ctx.sandboxProfile).catch(() => {});
       }
-      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}) })) : [];
+      const hunks = r.ok ? r.diff.map((c) => ({ added: c.added ?? false, removed: c.removed ?? false, value: c.value, ...(c.oldStart !== undefined ? { oldStart: c.oldStart } : {}), ...(c.newStart !== undefined ? { newStart: c.newStart } : {}), ...(typeof c.count === "number" ? { count: c.count } : {}) })) : [];
       if (r.ok && hunks.length && ctx.onDiff) {
         await streamDiffHunks(hunks, filePath, ctx.onDiff);
       }
@@ -522,6 +481,37 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
     fn: async (args, ctx) => {
       const cmd = String(args.command);
       const cwd = (args.cwd ? String(args.cwd) : ctx.root) || ctx.root;
+      if (args.untilSuccess) {
+        if (!cmd) return { ok: false, output: "shell.run requires a `command`." };
+        const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run condition-wait command (repeats until success or timeout)?\n\n${cmd}`, { command: cmd });
+        if (!approved) return { ok: false, output: "shell.run condition wait denied by user." };
+        const intervalRaw = Number(args.interval ?? 1);
+        const intervalMs = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.max(250, Math.round(intervalRaw * 1000)) : 1000;
+        const timeoutMs = args.timeout !== undefined ? Math.max(waitTimeoutMs(args.timeout, 600_000), intervalMs) : 600_000;
+        const deadline = Date.now() + timeoutMs;
+        let attempts = 0;
+        let lastOutput = "";
+        while (true) {
+          if (ctx.signal?.aborted) return { ok: false, output: `Condition wait interrupted after ${attempts} attempt(s).` };
+          attempts++;
+          const result = await runShellCommand(cmd, {
+            cwd,
+            env: minimalEnvironment(proxyEnvironment(ctx.proxyShell || ctx.proxyUrl)),
+            timeoutMs: Math.max(intervalMs * 2, 3000),
+            maxOutputBytes: 64 * 1024,
+            sandboxProfile: ctx.sandboxProfile,
+            workspaceRoot: ctx.workspacePath,
+          });
+          lastOutput = (stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "")).trim().slice(-2000);
+          if (result.ok) {
+            return { ok: true, output: `Command succeeded on attempt ${attempts}.\n${lastOutput || "(no output)"}` };
+          }
+          if (Date.now() >= deadline) {
+            return { ok: false, output: `Command still failing after ${attempts} attempt(s) over ${timeoutMs / 1000}s.\n${lastOutput || "(no output)"}` };
+          }
+          await sleepAbortable(intervalMs, ctx.signal);
+        }
+      }
       const surface = ctx.shellSurface ?? "arc-handled";
       if (surface === "integrated") {
         if (!ctx.runInVsCodeTerminal) return { ok: false, output: "Shell surface 'integrated' is not available in this environment (requires the Arc VS Code extension)." };
@@ -550,7 +540,7 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       if (adoptedId !== undefined) {
         const output = stripAnsi(result.stdout)
           + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "")
-          + `\n[timed out after ${timeoutSec}s] Still running in the background (id: ${adoptedId}). Partial output above; do not restart the command. Poll with shell.check (id: ${adoptedId}), send stdin with shell.write, or wait for exit with wait.forProcess.`;
+          + `\n[timed out after ${timeoutSec}s] Still running in the background (id: ${adoptedId}). Partial output above; do not restart the command. Poll with shell.check (id: ${adoptedId}), send stdin with shell.write, or wait for exit with shell.check (id: ${adoptedId}, waitForExit: true).`;
         return { ok: false, output };
       }
       const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "") + (result.truncated ? "\n[output limit exceeded]" : "");
@@ -565,10 +555,22 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
     },
   },
   "shell.check": {
-    fn: async (args) => {
+    fn: async (args, ctx) => {
       const id = String(args.id ?? "");
       const bg = bgProcesses.get(id);
       if (!bg) return { ok: false, output: `No background process with id '${id}'.` };
+      if (args.waitForExit) {
+        const timeoutMs = args.timeout !== undefined ? waitTimeoutMs(args.timeout, MAX_WAIT_MS) : MAX_WAIT_MS;
+        const deadline = Date.now() + timeoutMs;
+        while (!bg.exited) {
+          if (ctx.signal?.aborted) return { ok: false, output: "shell.check interrupted." };
+          if (Date.now() >= deadline) {
+            const out = bg.stdout + (bg.stderr ? `\n[stderr]\n${bg.stderr}` : "");
+            return { ok: false, output: `Process ${id} still running after ${timeoutMs / 1000}s.\n${out}` };
+          }
+          await sleepAbortable(500, ctx.signal);
+        }
+      }
       const status = bg.exited ? `exited (code ${bg.exitCode ?? "unknown"})` : "running";
       const out = (bg.stdout + (bg.stderr ? `\n[stderr]\n${bg.stderr}` : ""));
       return { ok: true, output: `[${status}]\n${out}` };
@@ -577,7 +579,7 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
   "shell.write": {
     fn: async (args) => {
       const id = String(args.id ?? "");
-      const input = String(args.input ?? "");
+      const input = typeof args.inputEscaped === "string" && args.inputEscaped.length > 0 ? decodeInputEscapes(args.inputEscaped) : String(args.input ?? "");
       const bg = bgProcesses.get(id);
       if (!bg) return { ok: false, output: `No background process with id '${id}'.` };
       if (bg.exited) return { ok: false, output: `Process ${id} has already exited.` };
@@ -585,187 +587,46 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       try {
         const flushed = bg.proc.stdin?.write(text) ?? false;
         if (!flushed) return { ok: false, output: `Process ${id} is not accepting stdin.` };
-        return { ok: true, output: `Sent ${text.length} bytes to process ${id}.` };
+        const bytes = Buffer.byteLength(text, "utf8");
+        return { ok: true, output: `Sent ${bytes} byte${bytes === 1 ? "" : "s"} to process ${id}.` };
       } catch (e: unknown) {
         return { ok: false, output: `Failed to write to process ${id}: ${(e as Error).message}` };
       }
     },
   },
-  "shell.customRun": {
+  "shell.kill": {
     fn: async (args) => {
-      const name = String(args.name ?? "").trim();
-      if (!name) return { ok: false, output: "customRun requires a name." };
-      const commands = Array.isArray(args.commands) ? (args.commands as string[]).map(String) : [];
-      if (commands.length === 0) return { ok: false, output: "customRun requires at least one command." };
-      const safeId = name.replace(/[^a-zA-Z0-9_.-]/g, "_");
-      if (!safeId) return { ok: false, output: "customRun name must contain at least one alphanumeric character." };
-      const dir = getSkillsDir();
-      await fs.mkdir(dir, { recursive: true });
-      const filePath = path.join(dir, `${safeId}.json`);
-      let existing: { createdAt: number } | undefined;
-      try {
-        const raw = await fs.readFile(filePath, "utf-8");
-        existing = JSON.parse(raw);
-      } catch {}
-      if (existing && !args.overwrite) {
-        const kind = Array.isArray((existing as { commands?: unknown }).commands) ? "Custom run" : "Skill";
-        return { ok: false, output: `${kind} '${name}' already exists (id: ${safeId}). Use overwrite:true to replace it, or use shell.editCustomRun to update it.` };
+      const id = String(args.id ?? "");
+      const bg = bgProcesses.get(id);
+      if (!bg) return { ok: false, output: `No background process with id '${id}'.` };
+      if (bg.exited) {
+        bgProcesses.delete(id);
+        return { ok: true, output: `Process ${id} had already exited.` };
       }
-      const skill = { id: safeId, name, commands, createdAt: existing?.createdAt ?? Date.now(), updatedAt: Date.now() };
-      await fs.writeFile(filePath, JSON.stringify(skill, null, 2), "utf-8");
-      const cmdList = commands.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
-      return { ok: true, output: `Created custom run '${name}' (id: ${safeId}) with ${commands.length} command(s):\n${cmdList}` };
+      bg.exited = true;
+      try {
+        terminateProcessTree(bg.proc);
+      } catch (e: unknown) {
+        return { ok: false, output: `Failed to kill process ${id}: ${(e as Error).message}` };
+      }
+      bgProcesses.delete(id);
+      return { ok: true, output: `Killed background process ${id} (${bg.command}).` };
     },
   },
-  "shell.editCustomRun": {
-    fn: async (args) => {
-      const id = String(args.id ?? "").trim();
-      if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(id)) return { ok: false, output: "editCustomRun requires a safe id." };
-      const dir = getSkillsDir();
-      const filePath = path.join(dir, `${id}.json`);
-      let skill: { id: string; name: string; commands: string[]; createdAt: number; updatedAt: number };
-      try {
-        const raw = await fs.readFile(filePath, "utf-8");
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed.name !== "string" || !Array.isArray(parsed.commands)) {
-          return { ok: false, output: `No custom run found with id '${id}'.` };
-        }
-        skill = parsed;
-      } catch {
-        return { ok: false, output: `No custom run found with id '${id}'.` };
-      }
-      let effectiveId = id;
-      let effectivePath = filePath;
-      if (args.name !== undefined) {
-        const newName = String(args.name).trim() || skill.name;
-        const newSafeId = newName.replace(/[^a-zA-Z0-9_.-]/g, "_");
-        if (newSafeId !== id) {
-          if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(newSafeId) || !newSafeId) return { ok: false, output: `New name produces an unsafe id ('${newSafeId}').` };
-          try {
-            await fs.access(path.join(dir, `${newSafeId}.json`));
-            return { ok: false, output: `A custom run with id '${newSafeId}' already exists.` };
-          } catch {}
-          skill.name = newName;
-          skill.id = newSafeId;
-          effectiveId = newSafeId;
-          effectivePath = path.join(dir, `${newSafeId}.json`);
-        } else {
-          skill.name = newName;
-        }
-      }
-      if (args.commands !== undefined) {
-        const cmds = Array.isArray(args.commands) ? (args.commands as string[]).map(String) : [];
-        if (cmds.length === 0) return { ok: false, output: "commands must be a non-empty array." };
-        skill.commands = cmds;
-      }
-      skill.updatedAt = Date.now();
-      await fs.writeFile(effectivePath, JSON.stringify(skill, null, 2), "utf-8");
-      if (effectivePath !== filePath) await fs.unlink(filePath).catch(() => undefined);
-      const cmdList = skill.commands.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
-      return { ok: true, output: `Updated custom run '${skill.name}' (id: ${effectiveId}) with ${skill.commands.length} command(s):\n${cmdList}` };
-    },
-  },
-  "shell.runCustomRun": {
+  "lsp": {
     fn: async (args, ctx) => {
-      const id = String(args.id ?? "").trim();
-      if (!id) return { ok: false, output: "runCustomRun requires an id or name." };
-      const dir = getSkillsDir();
-      const skill = await findCustomRun(dir, id);
-      if (!skill) {
-        const available = await listCustomRunIds(dir);
-        return { ok: false, output: `No custom run found with id or name '${id}'.${available.length ? ` Available: ${available.join(", ")}` : ""}` };
-      }
-      if (!skill.commands || skill.commands.length === 0) {
-        return { ok: false, output: `Custom run '${skill.name}' has no commands.` };
-      }
-      const cwd = (args.cwd ? String(args.cwd) : ctx.workspacePath) || ctx.root;
-      const onChunk = ctx.onChunk;
-      const results: string[] = [];
-      let allOk = true;
-      for (let i = 0; i < skill.commands.length; i++) {
-        const cmd = skill.commands[i];
-        const label = `[${i + 1}/${skill.commands.length}] ${cmd}`;
-        const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run custom command?\n\n${cmd}`, { command: cmd });
-        if (!approved) { results.push(`${label}\nDENIED`); allOk = false; continue; }
-        const result = await runSingleCommand(cmd, cwd, ctx, onChunk);
-        const entry = result.ok ? `${label}\n${result.output}` : `${label}\nFAILED: ${result.output}`;
-        results.push(entry);
-        if (!result.ok) allOk = false;
-      }
-      return { ok: allOk, output: `Ran custom run '${skill.name}':\n\n${results.join("\n\n")}` };
-    },
-  },
-  "test.run": {
-    fn: async (args, ctx) => {
-      const scope = String(args.scope ?? "workspace");
-      const testPath = args.path ? String(args.path) : "";
-      let executable = "";
-      let commandArgs: string[] = [];
-      let runner = "";
-      try {
-        const pkgRaw = await fs.readFile(path.join(ctx.workspacePath, "package.json"), "utf-8");
-        const pkg = JSON.parse(pkgRaw);
-        if (pkg.scripts?.test) {
-          executable = "pnpm"; commandArgs = ["test"];
-          const script = String(pkg.scripts.test);
-          runner = script.includes("vitest") ? "vitest" : script.includes("jest") ? "jest" : script.includes("mocha") ? "mocha" : "";
-        } else if (pkg.devDependencies?.vitest || pkg.dependencies?.vitest) { executable = "npx"; commandArgs = ["vitest", "run"]; runner = "vitest"; } else if (pkg.devDependencies?.jest || pkg.dependencies?.jest) { executable = "npx"; commandArgs = ["jest"]; runner = "jest"; } else if (pkg.devDependencies?.mocha || pkg.dependencies?.mocha) { executable = "npx"; commandArgs = ["mocha"]; runner = "mocha"; }
-      } catch {}
-      if (!executable) {
-        try { await fs.access(path.join(ctx.workspacePath, "go.mod")); executable = "go"; commandArgs = ["test", "./..."]; } catch {}
-      }
-      if (!executable) {
-        try {
-          const pyFiles = await fs.readdir(ctx.workspacePath);
-          if (pyFiles.some((f) => f.startsWith("test_") && f.endsWith(".py"))) { executable = "python"; commandArgs = ["-m", "pytest"]; }
-        } catch {}
-      }
-      if (!executable) return { ok: false, output: "No test runner detected. Add a test script to package.json." };
-      const scopePath = (scope === "file" || scope === "nearest") && testPath ? testPath : "";
-      if (scope === "nearest" && !testPath) return { ok: false, output: "test.run scope 'nearest' requires a `path` to the test file." };
-      if (scopePath) {
-        if (executable === "go") {
-          const dir = path.posix.dirname(scopePath.replace(/\\/g, "/"));
-          commandArgs = ["test", dir === "" || dir === "." ? "." : `./${dir}`];
-        } else if (executable === "python") commandArgs.push(scopePath);
-        else commandArgs.push("--", scopePath);
-      }
-      if (scope === "failed" && (runner === "vitest" || runner === "jest")) commandArgs.push("--last-failed");
-      const displayCommand = [executable, ...commandArgs.map((arg) => JSON.stringify(arg))].join(" ");
-      const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run detected test command?\n\n${displayCommand}`, { command: displayCommand });
-      if (!approved) return { ok: false, output: "Test command denied by user." };
-      const testProxyEnv = proxyEnvironment(ctx.proxyShell || ctx.proxyUrl);
-      const result = await runProcess(executable, commandArgs, {
-        cwd: ctx.workspacePath,
-        env: minimalEnvironment(testProxyEnv),
-        timeoutMs: 120_000,
-        maxOutputBytes: PROCESS_OUTPUT_LIMIT,
-        sandboxProfile: ctx.sandboxProfile,
-        workspaceRoot: ctx.workspacePath,
-      });
-      const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "") + (result.truncated ? "\n[output limit exceeded]" : "");
-      return { ok: result.ok, output: output || (result.ok ? "(no output)" : "Tests failed.") };
-    },
-  },
-  "lsp.problems": {
-    fn: async (_args, ctx) => {
       if (!ctx.problems) return { ok: false, output: "LSP problems not available in this environment." };
-      const list = await ctx.problems();
-      if (list.length === 0) return { ok: true, output: "No problems in the workspace." };
-      return { ok: true, output: list.map((d) => `[${d.severity}] ${d.file}:${d.line}:${d.column}  ${d.message}${d.source ? `  (${d.source})` : ""}`).join("\n") };
-    },
-  },
-  "lsp.problemsFor": {
-    fn: async (args, ctx) => {
-      if (!ctx.problemsFor) return { ok: false, output: "LSP problems not available." };
-      const list = await ctx.problemsFor(String(args.path));
-      if (list.length === 0) return { ok: true, output: `No problems in ${args.path}.` };
-      return { ok: true, output: list.map((d) => `[${d.severity}] ${d.file}:${d.line}:${d.column}  ${d.message}`).join("\n") };
+      const p = args.path ? String(args.path) : "";
+      if (p && !ctx.problemsFor) return { ok: false, output: "LSP problems for a single file are not available." };
+      const list = p ? await ctx.problemsFor!(p) : await ctx.problems();
+      if (list.length === 0) return { ok: true, output: p ? `No problems in ${p}.` : "No problems in the workspace." };
+      return { ok: true, output: list.map((d) => `[${d.severity}] ${d.file}:${d.line}:${d.column}  ${d.message}${d.source && !p ? `  (${d.source})` : ""}`).join("\n") };
     },
   },
   "todo.write": {
     fn: async (args) => {
-      const items = Array.isArray(args.items) ? (args.items as { id: string; text: string; state: "pending" | "in_progress" | "done" | "skipped" }[]) : [];
+      const raw = Array.isArray(args.items) ? (args.items as { id: unknown; text: unknown; state: unknown }[]) : [];
+      const items = raw.filter((it) => it && typeof it === "object").map((it) => ({ id: String(it.id ?? ""), text: String(it.text ?? ""), state: normalizeTodoState(it.state) }));
       return { ok: true, output: `Todo list updated (${items.length} items).`, todoState: { items } };
     },
   },
@@ -776,10 +637,22 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
   "browser.evaluate": { description: "Run JS in the page. Args: { script, tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.evaluate(String(a.script), a.tabId ? String(a.tabId) : undefined)) },
   "browser.readDom": { description: "Read the page's accessibility tree. Args: { tabId? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.readDom(a.tabId ? String(a.tabId) : undefined)) },
   "browser.close": { description: "Close the browser. Args: {}", fn: (_a, ctx) => withBrowser(ctx, async (b) => { await b.close(); return { ok: true, output: "Browser closed." }; }) },
-  "browser.newTab": { description: "Open a new browser tab, optionally navigating to a URL. Args: { url? }", fn: (a, ctx) => withBrowser(ctx, (b) => b.newTab(a.url ? String(a.url) : undefined)) },
-  "browser.switchTab": { description: "Switch the active tab used by browser tools that omit tabId. Args: { tabId }", fn: (a, ctx) => withBrowser(ctx, (b) => b.switchTab(String(a.tabId ?? ""))) },
-  "browser.closeTab": { description: "Close a browser tab. Args: { tabId }", fn: (a, ctx) => withBrowser(ctx, (b) => b.closeTab(String(a.tabId ?? ""))) },
-  "browser.listTabs": { description: "List open browser tabs. Args: {}", fn: (_a, ctx) => withBrowser(ctx, (b) => b.listTabs()) },
+  "browser.tab": {
+    fn: async (args, ctx) => {
+      const action = String(args.action ?? "list");
+      if (action === "new") return withBrowser(ctx, (b) => b.newTab(args.url ? String(args.url) : undefined));
+      if (action === "switch") {
+        if (!args.tabId) return { ok: false, output: "browser.tab switch requires a `tabId`." };
+        return withBrowser(ctx, (b) => b.switchTab(String(args.tabId)));
+      }
+      if (action === "close") {
+        if (!args.tabId) return { ok: false, output: "browser.tab close requires a `tabId`." };
+        return withBrowser(ctx, (b) => b.closeTab(String(args.tabId)));
+      }
+      if (action !== "list") return { ok: false, output: "browser.tab requires an `action` of list, new, switch, or close." };
+      return withBrowser(ctx, (b) => b.listTabs());
+    },
+  },
   "browser.intercept": { description: "Intercept requests matching a URL glob pattern. Args: { pattern, status?, body?, contentType?, block? }", fn: (a, ctx) => withBrowser(ctx, (b) => { const pattern = String(a.pattern ?? ""); if (!pattern) return { ok: false, output: "No pattern provided." }; return b.intercept(pattern, { status: a.status ? Number(a.status) : undefined, body: a.body ? String(a.body) : undefined, contentType: a.contentType ? String(a.contentType) : undefined, block: !!a.block }); }) },
   "browser.unintercept": { description: "Stop intercepting a previously registered pattern. Args: { pattern }", fn: (a, ctx) => withBrowser(ctx, (b) => b.unintercept(String(a.pattern ?? ""))) },
   "web.fetch": {
@@ -837,37 +710,31 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       }
     },
   },
-  "file.semanticSearch": {
-    fn: async (args, ctx) => {
-      if (!ctx.semanticSearch) return { ok: false, output: "Semantic search index is not available in this environment." };
-      const query = String(args.query ?? "");
-      if (!query) return { ok: false, output: "No query provided." };
-      const k = args.k ? Number(args.k) : 10;
-      try {
-        const hits = await ctx.semanticSearch(query, k);
-        if (hits.length === 0) return { ok: true, output: `No semantic matches for '${query}'.` };
-        const out = hits.map((h) => `${h.file} [${h.start}-${h.end}] score=${h.score.toFixed(3)}: ${h.snippet.replace(/\s+/g, " ").slice(0, 200)}`).join("\n");
-        return { ok: true, output: out };
-      } catch (e: unknown) {
-        return { ok: false, output: `Semantic search failed: ${(e as Error).message}` };
-      }
-    },
-  },
   "syms.context": {
     fn: async (args, ctx) => {
       const query = String(args.query ?? "").trim().slice(0, 2000);
       if (!query) return { ok: false, output: "No query provided." };
-      const n = Number(args.maxNodes);
-      const maxNodes = Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 60) : 20;
+      const rawNodes = Number(args.maxNodes);
+      if (args.maxNodes !== undefined && (!Number.isFinite(rawNodes) || Math.floor(rawNodes) < 1)) {
+        return { ok: false, output: "maxNodes must be an integer between 1 and 60." };
+      }
+      const maxNodes = args.maxNodes === undefined ? 20 : Math.min(Math.floor(rawNodes), 60);
+      const positiveInt = (v: unknown, def: number, cap: number): number => {
+        const x = Number(v);
+        return Number.isFinite(x) && Math.floor(x) >= 1 ? Math.min(Math.floor(x), cap) : def;
+      };
+      const maxCodeBlocks = positiveInt(args.maxCodeBlocks, 5, 50);
+      const maxCodeLines = positiveInt(args.maxCodeLines, 120, 1000);
       const includeCode = args.includeCode === undefined ? true : !!args.includeCode;
       try {
         const { scanWorkspaceSymbols } = await import("../syms/scan.js");
         const { buildCodeContext, formatCodeContext } = await import("../syms/context.js");
+        const { CODE_EXTENSIONS } = await import("../syms/extract.js");
         const { resolveAuthorizedPath } = await import("../security/path-policy.js");
         const { readFile } = await import("node:fs/promises");
         const { symbols, filesScanned } = await scanWorkspaceSymbols(ctx.root, { maxFiles: Math.max(500, maxNodes * 25) });
         if (symbols.length === 0) return { ok: true, output: `No code symbols indexed (${filesScanned} files scanned).` };
-        const shape = buildCodeContext(query, symbols, () => undefined, { maxNodes, includeCode: false });
+        const shape = buildCodeContext(query, symbols, () => undefined, { maxNodes, includeCode: false, maxCodeBlocks, maxCodeLines });
         const texts = new Map<string, string>();
         let budgeted = 0;
         const queue = shape.filesTouched.slice(0, 60);
@@ -890,9 +757,10 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
           await Promise.all(queue.slice(i, i + 32).map(readOne));
         }
         const cctx = includeCode
-          ? buildCodeContext(query, symbols, (f) => texts.get(f), { maxNodes, includeCode: true })
+          ? buildCodeContext(query, symbols, (f) => texts.get(f), { maxNodes, includeCode: true, maxCodeBlocks, maxCodeLines })
           : shape;
-        let output = `${formatCodeContext(cctx)}\n\n(${filesScanned} files scanned, ${symbols.length} symbols)`;
+        const scope = [...CODE_EXTENSIONS].sort().join(" ");
+        let output = `${formatCodeContext(cctx)}\n\n(${filesScanned} files scanned, ${symbols.length} symbols; scope: ${scope})`;
         if (output.length > 24_000) {
           output = output.slice(0, 24_000);
           if ((output.match(/```/g) ?? []).length % 2 === 1) output += "\n```";
@@ -994,241 +862,6 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       return { ok: r.ok, output: typeof r.output === "string" ? r.output : JSON.stringify(r.output, null, 2) ?? String(r.output) };
     },
   },
-  "skill.read": {
-    fn: async (args, ctx) => {
-      if (!ctx.skillRegistry) return { ok: false, output: "Skill registry not available." };
-      const name = String(args.name ?? "");
-      if (!name) return { ok: false, output: "Skill name required." };
-      const meta = ctx.skillRegistry.get(name);
-      if (!meta) return { ok: false, output: `Skill '${name}' not found. Available: ${ctx.skillRegistry.list().map((s) => s.name).join(", ")}` };
-      const body = await ctx.skillRegistry.readBody(name);
-      return { ok: true, output: body ?? "(empty skill)" };
-    },
-  },
-  "memory.list": {
-    fn: async (args, ctx) => {
-      const { loadMemory } = await import("../memory/store.js");
-      const entries = await loadMemory(ctx.root, undefined, ctx.teamMemoryStores);
-      const limit = args.limit ? Number(args.limit) : 20;
-      const slice = entries.slice(-limit);
-      if (!slice.length) return { ok: true, output: "No memories stored." };
-      return { ok: true, output: slice.map((e, i) => `${entries.length - slice.length + i}. [${e.category}] ${e.content} (${e.createdAt})`).join("\n") };
-    },
-  },
-  "memory.edit": {
-    fn: async (args, ctx) => {
-      const { editMemory } = await import("../memory/store.js");
-      const idx = Number(args.index ?? -1);
-      const content = String(args.content ?? "");
-      const ok = await editMemory(ctx.root, idx, content);
-      return ok ? { ok: true, output: `Memory ${idx} updated.` } : { ok: false, output: `Invalid index ${idx}.` };
-    },
-  },
-  "memory.delete": {
-    fn: async (args, ctx) => {
-      const { deleteMemory } = await import("../memory/store.js");
-      const idx = Number(args.index ?? -1);
-      const ok = await deleteMemory(ctx.root, idx);
-      return ok ? { ok: true, output: `Memory ${idx} deleted.` } : { ok: false, output: `Invalid index ${idx}.` };
-    },
-  },
-  "rule.list": {
-    fn: async (_args, ctx) => {
-      if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
-      const rules = ctx.ruleRegistry.list();
-      if (!rules.length) return { ok: true, output: "No rules configured." };
-      return { ok: true, output: rules.map((r) => `- **${r.name}** (${r.scope}): ${r.description} [glob: ${r.glob ?? "*"}]`).join("\n") };
-    },
-  },
-  "rule.read": {
-    fn: async (args, ctx) => {
-      if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
-      const rule = ctx.ruleRegistry.get(String(args.name ?? ""));
-      if (!rule) return { ok: false, output: `Rule not found. Available: ${ctx.ruleRegistry.list().map((r) => r.name).join(", ")}` };
-      return { ok: true, output: `# ${rule.name}\n\n**Glob:** ${rule.glob ?? "*"}\n**Scope:** ${rule.scope}\n\n${rule.body}` };
-    },
-  },
-  "rule.create": {
-    fn: async (args, ctx) => {
-      if (!ctx.ruleRegistry) return { ok: false, output: "Rule registry not available." };
-      const name = String(args.name ?? "").trim();
-      if (!name) return { ok: false, output: "Rule name required." };
-      await ctx.ruleRegistry.create(name, String(args.glob ?? "*"), String(args.description ?? ""), String(args.body ?? ""));
-      return { ok: true, output: `Rule '${name}' created.` };
-    },
-  },
-  "git.diffStaged": {
-    fn: async (args, ctx) => {
-      try {
-        const gitArgs = ["diff", "--cached", ...(args.path ? ["--", String(args.path)] : [])];
-        const result = await runGit(gitArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "");
-        return { ok: result.ok, output: output || "(no staged changes)" };
-      } catch (e: unknown) {
-        return { ok: false, output: `git diffStaged failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.diffUnstaged": {
-    fn: async (args, ctx) => {
-      try {
-        const gitArgs = ["diff", ...(args.path ? ["--", String(args.path)] : [])];
-        const result = await runGit(gitArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "");
-        return { ok: result.ok, output: output || "(no unstaged changes)" };
-      } catch (e: unknown) {
-        return { ok: false, output: `git diffUnstaged failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.changedFiles": {
-    fn: async (_args, ctx) => {
-      try {
-        const result = await runGit(["status", "--porcelain"], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        if (!result.ok) return { ok: false, output: result.stderr || "git status failed" };
-        const out = stripAnsi(result.stdout);
-        if (!out.trim()) return { ok: true, output: "(no changed files)" };
-        const lines = out.trim().split("\n").map((l) => {
-          const m = l.match(/^(..) (.+)$/);
-          if (!m) return l;
-          const x = m[1][0];
-          const y = m[1][1];
-          const file = m[2].trim();
-          const staged = x !== " " && x !== "?";
-          const unstaged = y !== " ";
-          const tag = staged && unstaged ? "(staged+unstaged)" : staged ? "(staged)" : "(unstaged)";
-          return `${m[1]} ${file} ${tag}`;
-        });
-        return { ok: true, output: lines.join("\n") };
-      } catch (e: unknown) {
-        return { ok: false, output: `git changedFiles failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.branchDiff": {
-    fn: async (args, ctx) => {
-      try {
-        const base = String(args.base ?? "main");
-        if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(base) || base.includes("..") || base.includes("@{")) return { ok: false, output: "Invalid Git base ref." };
-        const mb = await runGit(["merge-base", "HEAD", base], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        const mergeBase = mb.ok ? stripAnsi(mb.stdout).trim() : "";
-        const target = mergeBase || base;
-        const result = await runGit(["diff", `${target}...HEAD`], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        const output = stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "");
-        return { ok: result.ok, output: output || "(no differences from base)" };
-      } catch (e: unknown) {
-        return { ok: false, output: `git branchDiff failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.commitMessage": {
-    fn: async (args, ctx) => {
-      const diff = args.diff ? String(args.diff) : "";
-      if (!diff) {
-        try {
-          const result = await runGit(["diff", "--cached"], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-          if (!result.ok) return { ok: false, output: result.stderr || "Failed to read staged diff." };
-          const diffOut = stripAnsi(result.stdout);
-          if (!diffOut.trim()) return { ok: true, output: "(no staged changes to generate a commit message from)" };
-          return { ok: true, output: `Staged diff (use this as input to compose a commit message):\n${diffOut}` };
-        } catch (e: unknown) {
-          return { ok: false, output: `Failed to read staged diff: ${(e as Error).message}` };
-        }
-      }
-      return { ok: true, output: `Diff provided (${diff.length} chars). Use this to compose a conventional commit message:\n${diff}` };
-    },
-  },
-  "git.stage": {
-    fn: async (args, ctx) => {
-      try {
-        const gitArgs = ["add"];
-        if (args.all) gitArgs.push("--all");
-        else if (args.update) gitArgs.push("--update");
-        const raw = args.paths;
-        const paths = (Array.isArray(raw) ? raw : raw !== undefined ? [raw] : []).map((p) => String(p).trim()).filter(Boolean);
-        if (!args.all && !args.update && paths.length === 0) return { ok: false, output: "Provide paths, or all:true, or update:true." };
-        for (const p of paths) {
-          if (p.startsWith("-") || p.includes("..")) return { ok: false, output: `Refusing to stage suspicious path: ${p}` };
-        }
-        if (paths.length) gitArgs.push("--", ...paths);
-        const r = await runGit(gitArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        if (!r.ok) return { ok: false, output: stripAnsi(r.stderr) || "git add failed" };
-        const what = args.all ? "all changes" : args.update ? "tracked modifications" : `${paths.length} path(s)`;
-        return { ok: true, output: `Staged ${what}.` };
-      } catch (e: unknown) {
-        return { ok: false, output: `git stage failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.commit": {
-    fn: async (args, ctx) => {
-      try {
-        const message = String(args.message ?? "").trim();
-        if (!message) return { ok: false, output: "Commit message required." };
-        if (message.length > 4000) return { ok: false, output: "Commit message too long (max 4000 chars)." };
-        const r = await runGit(["commit", ...(args.all ? ["-a"] : []), "-m", message], { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        if (!r.ok) return { ok: false, output: stripAnsi(r.stderr) || "git commit failed" };
-        const head = await runGit(["log", "-1", "--format=%h %s"], { cwd: ctx.workspacePath, maxOutputBytes: 4096 });
-        return { ok: true, output: `Committed: ${stripAnsi(head.ok ? head.stdout : "").trim() || message.split("\n")[0]}` };
-      } catch (e: unknown) {
-        return { ok: false, output: `git commit failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.push": {
-    fn: async (args, ctx) => {
-      try {
-        const refRe = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-        const remote = args.remote ? String(args.remote) : "";
-        const branch = args.branch ? String(args.branch) : "";
-        for (const [label, ref] of [["remote", remote], ["branch", branch]] as const) {
-          if (ref && (!refRe.test(ref) || ref.includes("..") || ref.includes("@{"))) return { ok: false, output: `Invalid git ${label} ref: ${ref}` };
-        }
-        let effectiveRemote = remote;
-        if (!effectiveRemote && branch) {
-          effectiveRemote = await defaultGitRemote(ctx.workspacePath);
-          if (!effectiveRemote) return { ok: false, output: `No git remote configured; pass remote explicitly to push branch '${branch}'.` };
-        }
-        const gitArgs = ["push"];
-        if (args.force) gitArgs.push("--force-with-lease");
-        if (args.setUpstream) gitArgs.push("--set-upstream");
-        if (effectiveRemote) gitArgs.push(effectiveRemote);
-        if (branch) gitArgs.push(branch);
-        const r = await runGit(gitArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT, timeoutMs: 120_000, env: minimalEnvironment({ GIT_TERMINAL_PROMPT: "0" }) });
-        const out = stripAnsi(r.stdout) + (r.stderr ? `\n${stripAnsi(r.stderr)}` : "");
-        return { ok: r.ok, output: out.trim() || (r.ok ? "Pushed." : "git push failed") };
-      } catch (e: unknown) {
-        return { ok: false, output: `git push failed: ${(e as Error).message}` };
-      }
-    },
-  },
-  "git.branch": {
-    fn: async (args, ctx) => {
-      try {
-        const action = String(args.action ?? "list");
-        const name = args.name ? String(args.name).trim() : "";
-        const refRe = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-        const valid = !!name && refRe.test(name) && !name.includes("..") && !name.includes("@{") && !name.endsWith(".lock") && !name.includes("//");
-        let gitArgs: string[];
-        if (action === "list") {
-          gitArgs = ["branch", "--all", "--no-color"];
-        } else {
-          if (!valid) return { ok: false, output: `Invalid branch name: ${name || "(empty)"}` };
-          if (action === "create") gitArgs = ["branch", name];
-          else if (action === "switch") gitArgs = ["switch", ...(args.force ? ["-C"] : []), name];
-          else if (action === "delete") gitArgs = ["branch", ...(args.force ? ["-D"] : ["-d"]), name];
-          else return { ok: false, output: `Unknown branch action '${action}'. Use list, create, switch, or delete.` };
-        }
-        const r = await runGit(gitArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT });
-        const out = stripAnsi(r.stdout) + (r.stderr ? `\n${stripAnsi(r.stderr)}` : "");
-        if (!r.ok) return { ok: false, output: out.trim() || "git branch failed" };
-        if (action === "list") return { ok: true, output: out.trim() || "(no branches)" };
-        return { ok: true, output: action === "create" ? `Created branch ${name}.` : action === "switch" ? `Switched to ${name}.` : `Deleted ${name}.` };
-      } catch (e: unknown) {
-        return { ok: false, output: `git branch failed: ${(e as Error).message}` };
-      }
-    },
-  },
   "hooks.list": {
     fn: async (_args, ctx) => {
       const f = await readHooksFile(ctx.workspacePath);
@@ -1266,39 +899,6 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       const [removed] = f.hooks.splice(index, 1);
       await writeHooksFile(f);
       return { ok: true, output: `Deleted hook ${index} (${String((removed as { event?: string }).event ?? "unknown")}).` };
-    },
-  },
-  "git.pr": {
-    fn: async (args, ctx) => {
-      const gh = findOnPath(process.platform === "win32" ? "gh.exe" : "gh");
-      if (!gh) return { ok: false, output: "gh CLI not found on PATH. Install the GitHub CLI (https://cli.github.com) or run gh via shell.run." };
-      try {
-        const action = String(args.action ?? "create");
-        let ghArgs: string[];
-        if (action === "create") {
-          const title = String(args.title ?? "").trim();
-          if (!title) return { ok: false, output: "PR title required." };
-          if (title.length > 400 || String(args.body ?? "").length > 8000) return { ok: false, output: "PR title/body too long." };
-          ghArgs = ["pr", "create", "--title", title, "--body", String(args.body ?? "")];
-          const base = args.base ? String(args.base) : "";
-          if (base) {
-            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(base) || base.includes("..")) return { ok: false, output: `Invalid base ref: ${base}` };
-            ghArgs.push("--base", base);
-          }
-          if (args.draft) ghArgs.push("--draft");
-        } else if (action === "view") {
-          ghArgs = ["pr", "view"];
-        } else if (action === "list") {
-          ghArgs = ["pr", "list", "--limit", "10"];
-        } else {
-          return { ok: false, output: "Unknown pr action. Use create, view, or list." };
-        }
-        const r = await runProcess(gh, ghArgs, { cwd: ctx.workspacePath, maxOutputBytes: PROCESS_OUTPUT_LIMIT, timeoutMs: 60_000, env: minimalEnvironment({ GIT_TERMINAL_PROMPT: "0" }) });
-        const out = stripAnsi(r.stdout) + (r.stderr ? `\n${stripAnsi(r.stderr)}` : "");
-        return { ok: r.ok, output: out.trim() || (r.ok ? "Done." : "gh failed") };
-      } catch (e: unknown) {
-        return { ok: false, output: `git pr failed: ${(e as Error).message}` };
-      }
     },
   },
   "browser.hover": {
@@ -1476,83 +1076,6 @@ export const tools: Record<string, { description?: string; fn: ToolFn }> = {
       return { ok: r.ok, output: r.output, touchedFiles: r.ok ? [filePath] : [], filePath };
     },
   },
-  "wait.for": {
-    fn: async (args, ctx) => {
-      const seconds = Number(args.seconds);
-      if (!Number.isFinite(seconds) || seconds <= 0) return { ok: false, output: "wait.for requires a positive `seconds` number." };
-      const ms = Math.min(Math.round(seconds * 1000), MAX_WAIT_MS);
-      const status = await sleepAbortable(ms, ctx.signal);
-      if (status === "abort") return { ok: false, output: "wait.for interrupted." };
-      return { ok: true, output: `Waited ${(ms / 1000).toFixed(1)}s.` };
-    },
-  },
-  "wait.until": {
-    fn: async (args, ctx) => {
-      const target = parseTimeSpec(String(args.time ?? ""));
-      if (target === undefined) return { ok: false, output: "wait.until requires a valid `time` (ISO timestamp, HH:MM, HH:MM:SS, or epoch ms)." };
-      const ms = Math.min(Math.max(0, target - Date.now()), MAX_WAIT_MS);
-      if (ms === 0) return { ok: true, output: "Target time has already passed." };
-      const status = await sleepAbortable(ms, ctx.signal);
-      if (status === "abort") return { ok: false, output: "wait.until interrupted." };
-      return { ok: true, output: `Waited until ${new Date(target).toISOString()} (${(ms / 1000).toFixed(1)}s).` };
-    },
-  },
-  "wait.forProcess": {
-    fn: async (args, ctx) => {
-      const id = String(args.id ?? "");
-      const bg = bgProcesses.get(id);
-      if (!bg) return { ok: false, output: `No background process with id '${id}'.` };
-      const timeoutMs = args.timeout !== undefined ? waitTimeoutMs(args.timeout, MAX_WAIT_MS) : MAX_WAIT_MS;
-      const deadline = Date.now() + timeoutMs;
-      while (!bg.exited) {
-        if (ctx.signal?.aborted) return { ok: false, output: "wait.forProcess interrupted." };
-        if (Date.now() >= deadline) {
-          const out = bg.stdout + (bg.stderr ? `\n[stderr]\n${bg.stderr}` : "");
-          return { ok: false, output: `Process ${id} still running after ${timeoutMs / 1000}s.\n${out}` };
-        }
-        await sleepAbortable(500, ctx.signal);
-      }
-      const status = `exited (code ${bg.exitCode ?? "unknown"})`;
-      const out = bg.stdout + (bg.stderr ? `\n[stderr]\n${bg.stderr}` : "");
-      return { ok: true, output: `[${status}]\n${out}` };
-    },
-  },
-  "wait.forCommand": {
-    fn: async (args, ctx) => {
-      const cmd = String(args.command ?? "");
-      if (!cmd) return { ok: false, output: "wait.forCommand requires a `command`." };
-      const approved = hailMary(ctx) ? true : await ctx.requestApproval?.(`Run condition-wait command (repeats until success or timeout)?\n\n${cmd}`, { command: cmd });
-      if (!approved) return { ok: false, output: "wait.forCommand denied by user." };
-      const intervalRaw = Number(args.interval ?? 1);
-      const intervalMs = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.max(250, Math.round(intervalRaw * 1000)) : 1000;
-      const timeoutMs = args.timeout !== undefined ? Math.max(waitTimeoutMs(args.timeout, 600_000), intervalMs) : 600_000;
-      const cwd = (args.cwd ? String(args.cwd) : ctx.root) || ctx.root;
-      const proxyEnv = proxyEnvironment(ctx.proxyShell || ctx.proxyUrl);
-      const deadline = Date.now() + timeoutMs;
-      let attempts = 0;
-      let lastOutput = "";
-      while (true) {
-        if (ctx.signal?.aborted) return { ok: false, output: `wait.forCommand interrupted after ${attempts} attempt(s).` };
-        attempts++;
-        const result = await runShellCommand(cmd, {
-          cwd,
-          env: minimalEnvironment(proxyEnv),
-          timeoutMs: Math.max(intervalMs * 2, 3000),
-          maxOutputBytes: 64 * 1024,
-          sandboxProfile: ctx.sandboxProfile,
-          workspaceRoot: ctx.workspacePath,
-        });
-        lastOutput = (stripAnsi(result.stdout) + (result.stderr ? `\n[stderr]\n${stripAnsi(result.stderr)}` : "")).trim().slice(-2000);
-        if (result.ok) {
-          return { ok: true, output: `Command succeeded on attempt ${attempts}.\n${lastOutput || "(no output)"}` };
-        }
-        if (Date.now() >= deadline) {
-          return { ok: false, output: `Command did not succeed within ${timeoutMs / 1000}s (${attempts} attempt(s)). Last output:\n${lastOutput || "(no output)"}` };
-        }
-        await sleepAbortable(intervalMs, ctx.signal);
-      }
-    },
-  },
   "context.retrieve": {
     fn: async (args, ctx) => {
       const { loadBlob } = await import("../compress/store.js");
@@ -1587,23 +1110,6 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<"timeout" | "
     const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve("timeout"); }, ms);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
-}
-function parseTimeSpec(spec: string): number | undefined {
-  const s = spec.trim();
-  if (!s) return undefined;
-  const iso = Date.parse(s);
-  if (Number.isFinite(iso)) return iso;
-  if (/^\d+$/.test(s)) return Number(s);
-  const hms = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (!hms) return undefined;
-  const hour = Number(hms[1]);
-  const minute = Number(hms[2]);
-  const second = hms[3] !== undefined ? Number(hms[3]) : 0;
-  if (hour > 23 || minute > 59 || second > 59) return undefined;
-  const now = new Date();
-  let target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, second).getTime();
-  if (target <= now.getTime()) target += 24 * 60 * 60 * 1000;
-  return target;
 }
 interface SearchResult { title: string; snippet: string; url: string; }
 const STEALTH_HEADERS: Record<string, string> = {

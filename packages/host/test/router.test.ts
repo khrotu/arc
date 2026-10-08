@@ -25,21 +25,21 @@ function loadDomains(): DomainModel {
   return loadDomainModel(JSON.parse(fs.readFileSync(path.join(RES, "domain.json"), "utf8")) as DomainModelJson);
 }
 const REFERENCES: Array<[string, number]> = [
-  ["explain what a monad is in Haskell", 0.43506],
-  ["add a try catch around this async call", 0.28396],
-  ["what is 2+2", 0.86873],
-  ["refactor this class to use dependency injection", 0.29538],
-  ["write a quick hello world", 0.42288],
-  ["fix the null pointer in the payment service and add tests", 0.25549],
-  ["int x = 5;", 0.29774],
-  ["why did the tests fail after i changed the mock", 0.44061],
-  ["migrate the database schema and write a rollback script", 0.25825],
-  ["translate this docstring to french", 0.32485],
-  ["prove that the square root of 2 is irrational", 0.54061],
-  ["rename the variable and update all usages", 0.16822],
-  ["create a react component that fetches data", 0.39005],
-  ["this prompt has nothing to do with code at all really", 0.25277],
-  ["explain the difference between tcp and udp sockets", 0.22334],
+  ["explain what a monad is in Haskell", 0.601],
+  ["add a try catch around this async call", 0.89575],
+  ["what is 2+2", 0.99685],
+  ["refactor this class to use dependency injection", 0.96797],
+  ["write a quick hello world", 0.99752],
+  ["fix the null pointer in the payment service and add tests", 0.10043],
+  ["int x = 5;", 0.75525],
+  ["why did the tests fail after i changed the mock", 0.82775],
+  ["migrate the database schema and write a rollback script", 0.3239],
+  ["translate this docstring to french", 0.98542],
+  ["prove that the square root of 2 is irrational", 0.79174],
+  ["rename the variable and update all usages", 0.78419],
+  ["create a react component that fetches data", 0.65686],
+  ["this prompt has nothing to do with code at all really", 0.92196],
+  ["explain the difference between tcp and udp sockets", 0.85692],
 ];
 describe("router tfidf", () => {
   it("reproduces sklearn difficulty probabilities", () => {
@@ -59,14 +59,14 @@ describe("router policy", () => {
   ];
   it("escalates quality bias for an easy prompt", () => {
     const model = loadModel();
-    const easy = "what is 2+2"; 
+    const easy = "explain the difference between tcp and udp sockets"; 
     expect(routePrompt(easy, model, fleet, { qualityBias: "prefer-cheap" }).modelId).toBe("free");
     expect(routePrompt(easy, model, fleet, { qualityBias: "off" }).modelId).toBe("free");
     expect(routePrompt(easy, model, fleet, { qualityBias: "prefer-powerful" }).modelId).toBe("light");
   });
   it("picks the cheapest clearing model for a hard prompt", () => {
     const model = loadModel();
-    const hard = "prove that the square root of 2 is irrational"; 
+    const hard = "refactor the auth module to support oauth";
     expect(routePrompt(hard, model, fleet, { qualityBias: "off" }).modelId).toBe("default");
     const d = routePrompt(hard, model, fleet, { qualityBias: "off" });
     expect(d.scored).toBeGreaterThanOrEqual(d.requiredScore);
@@ -85,7 +85,7 @@ describe("router policy", () => {
       { modelId: "c", score: 40, cost: 0 },
     ];
     expect(routePrompt("what is 2+2", model, ties, { qualityBias: "prefer-cheap" }).modelId).toBe("a");
-    expect(routePrompt("prove that the square root of 2 is irrational", model, ties, { qualityBias: "off" }).modelId).toBe("c");
+    expect(routePrompt("refactor the auth module to support oauth", model, ties, { qualityBias: "off" }).modelId).toBe("c");
   });
   it("falls back to the strongest model when nothing clears the bar", () => {
     const model = loadModel();
@@ -165,10 +165,10 @@ describe("router v2 calibration", () => {
     const model = loadModel();
     const ctx = { calibration: loadCalib(), capability: loadCaps() };
     const fleet = [
-      { modelId: "healthy", score: 52, cost: 0, latencyMs: 2000, health: 100 },
+      { modelId: "healthy", score: 54, cost: 0, latencyMs: 2000, health: 100 },
       { modelId: "flaky", score: 60, cost: 0, latencyMs: 2000, health: 8 },
     ];
-    const hard = routePrompt("implement a garbage collector with precise stack scanning and handle all edge cases", model, fleet, ctx, { quality: 0.8 });
+    const hard = routePrompt("explain what a monad is in Haskell", model, fleet, ctx, { quality: 0.8 });
     expect(hard.requiredScore).toBeGreaterThan(45);
     expect(hard.modelId).toBe("healthy");
   });

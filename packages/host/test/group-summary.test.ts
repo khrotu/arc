@@ -39,9 +39,9 @@ describe("groupSummaryFor", () => {
     const steps = [s("shell.run"), s("shell.run"), s("shell.run"), s("shell.run"), s("shell.run"), s("file.read")];
     expect(groupSummaryFor(steps, "tools")).toBe("Ran commands and read files");
   });
-  it("semanticSearch+tests yields merged-verb phrasing", () => {
-    const steps = [s("file.semanticSearch"), s("file.semanticSearch"), s("test.run")];
-    expect(groupSummaryFor(steps, "tools")).toBe("Ran semantic search and tests");
+  it("syms+shell yields merged-verb phrasing", () => {
+    const steps = [s("syms.context"), s("syms.context"), s("shell.run")];
+    expect(groupSummaryFor(steps, "tools")).toBe("Built code context and ran commands");
   });
   it("count and ai modes return the fallback", () => {
     const steps = [s("file.read")];

@@ -1,6 +1,6 @@
 import { AsyncEventQueue, readableToAsyncIterable } from "../util/stream.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
-import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
+import { createToolNameResolver, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
 import { readBodyLimited } from "../security/network.js";
 import { redactSecrets } from "../security/redact.js";
 import { safeParseJson } from "../util/json.js";
@@ -21,6 +21,7 @@ function stripImagePrefix(url: string): string {
   const m = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
   return m ? m[2].replace(/\s+/g, "") : url;
 }
+  const resolveToolName = createToolNameResolver(req.tools ?? []);
     const body: Record<string, unknown> = {
       model: remoteModel,
       stream: true,
@@ -91,7 +92,7 @@ function stripImagePrefix(url: string): string {
               q.push({
                 type: "tool_call",
                 id: String(tc.id ?? `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
-                name: fromApiToolName(tc.function.name),
+                name: resolveToolName(tc.function.name),
                 args: args ?? {},
               });
             }

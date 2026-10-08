@@ -47,7 +47,7 @@ describe("security hardening", () => {
     expect(resolveApproval(DEFAULT_APPROVALS, mk("safe"), "subagent")).toBe("ask");
     expect(resolveApproval(DEFAULT_APPROVALS, mk("safe"), "mcp.configure")).toBe("ask");
     expect(resolveApproval(DEFAULT_APPROVALS, mk("allowlist"), "read.external", { toolName: "file.read", filePath: outside, workspaceRoot: root })).toBe("auto");
-    expect(resolveApproval(DEFAULT_APPROVALS, mk("allowlist"), "shell.other", { toolName: "git.commit", command: "git commit -m x", workspaceRoot: root })).toBe("auto");
+    expect(resolveApproval(DEFAULT_APPROVALS, mk("allowlist"), "shell.other", { toolName: "shell.run", command: "git commit -m x", workspaceRoot: root })).toBe("auto");
     expect(resolveApproval(DEFAULT_APPROVALS, mk("allowlist"), "code.execute")).toBe("ask");
     expect(resolveApproval(DEFAULT_APPROVALS, mk("allowlist"), "mcp.configure")).toBe("ask");
     expect(resolveApproval(DEFAULT_APPROVALS, mk("all"), "code.execute")).toBe("auto");

@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { applyEdit, type ApplyEditResult } from "./apply.js";
+import { splitLines } from "./line-diff.js";
 import { fileLock } from "./lock.js";
 import { resolveAuthorizedPath } from "../security/path-policy.js";
 export class FileEditor {
@@ -59,7 +60,7 @@ export class FileEditor {
           after: replace,
           matches: 1,
           strategy: "write",
-          diff: [{ value: "", count: 0, added: false, removed: false }, { value: replace, count: 0, added: true, removed: false }],
+          diff: [{ value: "", count: 0, added: false, removed: false }, { value: replace, count: splitLines(replace).length, added: true, removed: false }],
           file,
         };
       }
@@ -101,8 +102,8 @@ export class FileEditor {
     return {
       ok: true,
       diff: [
-        { value: before, count: 0, removed: true },
-        { value: after, count: 0, added: true },
+        { value: before, count: splitLines(before).length, removed: true },
+        { value: after, count: splitLines(after).length, added: true },
       ],
     };
   }

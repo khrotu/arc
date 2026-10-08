@@ -80,10 +80,14 @@ describe("sanitizeToolChains", () => {
   });
 });
 describe("tool name codec", () => {
-  it("round-trips dots, slashes, underscores, and dunder names", () => {
-    for (const name of ["file.read", "mcp.call", "a/b", "x_y", "mcp__fs__echo", "a.b_c/d__e"]) {
+  it("round-trips slashes, underscores, and dunder names", () => {
+    for (const name of ["a/b", "x_y", "mcp__fs__echo"]) {
       expect(fromApiToolName(toApiToolName(name))).toBe(name);
     }
+  });
+  it("drops dots one-way; the resolver table restores them", () => {
+    expect(toApiToolName("file.read")).toBe("fileread");
+    expect(fromApiToolName("fileread")).toBe("fileread");
   });
   it("emits API-safe names", () => {
     expect(toApiToolName("file.read")).toMatch(/^[A-Za-z0-9_-]+$/);

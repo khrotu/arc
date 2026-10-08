@@ -1,6 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
+import { setRuntimePrefs } from "../src/runtime-prefs";
 import { attributionHeaders, opencodeSessionHeader, isOpencodeEndpoint, APP_VERSION, OPENCODE_UA, OPENCODE_CLIENT, OPENCODE_VER_DEFAULT, setOpencodeVer, opencodeMessageId, opencodeSessionId, opencodeProjectId } from "../src/providers/attribution";
+const ON = { backendDebugOverride: true, backendDebugAgreedAt: "2026-01-01T00:00:00.000Z" };
 describe("attribution headers", () => {
+  beforeEach(() => setRuntimePrefs(ON));
   it("sends the OpenRouter dialect for openrouter with its own title header", () => {
     const h = attributionHeaders("openrouter");
     expect(h["http-referer"]).toBe("https://github.com/khrotu/arc");
@@ -81,9 +84,21 @@ describe("attribution headers", () => {
     expect(opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", "conv-1", "req-123")["x-opencode-request"]).toBe("req-123");
     expect(opencodeSessionHeader("https://api.openai.com/v1", "openai", "conv-1")).toEqual({});
   });
-  it("uses OpenCode identity on Zen/Go endpoints", () => {
+  it("uses OpenCode identity on Zen/Go endpoints only when the debug override is on", () => {
+    setRuntimePrefs(ON);
     expect(attributionHeaders("opencode")["user-agent"]).toBe(OPENCODE_UA);
     expect(attributionHeaders("opencode-go")["user-agent"]).toBe(OPENCODE_UA);
+    setRuntimePrefs({});
+    expect(attributionHeaders("opencode")["user-agent"]).toBe(`Arc/${APP_VERSION} (+https://github.com/khrotu/arc)`);
+    expect(attributionHeaders("opencode-go")["user-agent"]).toBe(`Arc/${APP_VERSION} (+https://github.com/khrotu/arc)`);
+    setRuntimePrefs({ backendDebugOverride: true });
+    expect(attributionHeaders("opencode")["user-agent"]).toBe(`Arc/${APP_VERSION} (+https://github.com/khrotu/arc)`);
+  });
+  it("attributes Zen/Go requests to Arc unless impersonation is enabled", () => {
+    setRuntimePrefs({});
+    const h = opencodeSessionHeader("https://opencode.ai/zen/v1", "opencode", "conv-1", undefined, "C:/work/arc");
+    expect(h).toEqual({ "user-agent": `Arc/${APP_VERSION} (+https://github.com/khrotu/arc)` });
+    expect(opencodeSessionHeader("https://api.openai.com/v1", "openai", "conv-1")).toEqual({});
   });
   it("generates OpenCode-format message and session ids", () => {
     expect(opencodeMessageId()).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
@@ -103,6 +118,8 @@ describe("attribution headers", () => {
   it("updates UA when cached version refreshes", () => {
     setOpencodeVer("9.9.9");
     expect(attributionHeaders("opencode")["user-agent"]).toBe("opencode/latest/9.9.9/cli");
+    setRuntimePrefs({});
+    expect(attributionHeaders("opencode")["user-agent"]).toBe(`Arc/${APP_VERSION} (+https://github.com/khrotu/arc)`);
     setOpencodeVer(OPENCODE_VER_DEFAULT);
   });
 });

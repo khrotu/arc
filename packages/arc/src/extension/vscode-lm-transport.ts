@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import {
   chargeStreamContent,
-  fromApiToolName,
+  createToolNameResolver,
   toApiToolName,
   toVscodeLmMessages,
   toVscodeLmTools,
@@ -201,6 +201,7 @@ async function streamViaVscodeLm(req: StreamRequest, opts: { warmupMs?: number }
     throw new Error(classifyVscodeLmError(e).message);
   }
   let aborted = false;
+  const resolveToolName = createToolNameResolver(req.tools ?? []);
   const events = (async function* (): AsyncGenerator<StreamEvent> {
     const budget = { bytes: 0 };
     let text = "";
@@ -216,7 +217,7 @@ async function streamViaVscodeLm(req: StreamRequest, opts: { warmupMs?: number }
           yield {
             type: "tool_call",
             id: part.callId,
-            name: fromApiToolName(part.name),
+            name: resolveToolName(part.name),
             args: (part.input ?? {}) as Record<string, unknown>,
           };
         }

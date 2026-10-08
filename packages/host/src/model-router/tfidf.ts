@@ -5,6 +5,7 @@ export interface DifficultyFold {
   sigmoidB: number;
 }
 export interface DifficultyModel {
+  v?: number;
   vocab: Record<string, number>;
   idf: number[];
   folds: DifficultyFold[];
@@ -26,7 +27,10 @@ export function loadDifficultyModel(json: DifficultyModel): DifficultyModel {
   }
   if (vocabSize !== json.idf.length) throw new Error("Invalid difficulty model: vocab/idf size mismatch.");
   for (const fold of json.folds) {
-    if (!fold || !Array.isArray(fold.coef) || fold.coef.length !== json.idf.length || !fold.coef.every(Number.isFinite)) {
+    if (!fold || !Array.isArray(fold.coef) || !fold.coef.every(Number.isFinite)) {
+      throw new Error("Invalid difficulty model: bad fold coefficients.");
+    }
+    if (fold.coef.length !== json.idf.length) {
       throw new Error("Invalid difficulty model: bad fold coefficients.");
     }
     if (!Number.isFinite(fold.intercept) || !Number.isFinite(fold.sigmoidA) || !Number.isFinite(fold.sigmoidB)) {
@@ -67,11 +71,25 @@ export function transformDocument(text: string, model: DifficultyModel): number[
   return Array.from(out);
 }
 export function estimateDifficulty(text: string, model: DifficultyModel): number {
-  const x = transformDocument(text, model);
+  const tokens = tokenize(text);
+  const counts = new Map<number, number>();
+  for (const g of ngrams(tokens)) {
+    const j = model.vocab[g];
+    if (j !== undefined) counts.set(j, (counts.get(j) ?? 0) + 1);
+  }
+  const idf = model.idf;
+  let normSq = 0;
+  const weighted = new Map<number, number>();
+  for (const [j, c] of counts) {
+    const w = (1.0 + Math.log(c)) * idf[j];
+    weighted.set(j, w);
+    normSq += w * w;
+  }
+  const norm = Math.sqrt(normSq) || 1;
   let sum = 0;
   for (const f of model.folds) {
     let dec = f.intercept;
-    for (let i = 0; i < x.length; i++) dec += f.coef[i] * x[i];
+    for (const [j, w] of weighted) dec += f.coef[j] * (w / norm);
     sum += 1.0 / (1.0 + Math.exp(f.sigmoidA * dec + f.sigmoidB));
   }
   return sum / model.folds.length;

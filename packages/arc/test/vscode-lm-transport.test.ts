@@ -60,6 +60,7 @@ vi.mock("@arc/host", async () => {
   const t = await import("../../host/src/providers/transport.ts");
   return {
     chargeStreamContent: t.chargeStreamContent,
+    createToolNameResolver: t.createToolNameResolver,
     fromApiToolName: t.fromApiToolName,
     toApiToolName: t.toApiToolName,
     toVscodeLmMessages: lm.toVscodeLmMessages,
@@ -156,7 +157,7 @@ describe("createVscodeLmTransport", () => {
     const { LanguageModelToolCallPart } = await import("vscode");
     store.sendImpl = () => ({
       stream: (async function* () {
-        yield new (LanguageModelToolCallPart as any)("c1", "file_dread", { path: "a.ts" });
+        yield new (LanguageModelToolCallPart as any)("c1", "fileread", { path: "a.ts" });
       })(),
     });
     store.models = [fakeModel()];
@@ -171,7 +172,7 @@ describe("createVscodeLmTransport", () => {
     const toolCall = events.find((e) => e.type === "tool_call") as any;
     expect(toolCall).toMatchObject({ id: "c1", name: "file.read", args: { path: "a.ts" } });
     expect(store.sent[0].options.tools).toEqual([
-      { name: "file_dread", description: "Read a file", inputSchema: { type: "object" } },
+      { name: "fileread", description: "Read a file", inputSchema: { type: "object" } },
     ]);
   });
   it("queries the full model set and matches locally instead of narrowing by selector", async () => {

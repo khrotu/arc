@@ -18,12 +18,12 @@ export function escapePsXml(s: string): string {
 function psQuote(s: string): string {
   return "'" + s.replace(/'/g, "''") + "'";
 }
-export function buildWinToast(title: string, body: string, logoPath: string | undefined, appId: string): string {
+export function buildWinToast(title: string, body: string, logoPath: string | undefined, appId: string, launch?: string): string {
   const ps = [
     "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null",
     `[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime]|Out-Null`,
     `$xml = New-Object Windows.Data.Xml.Dom.XmlDocument`,
-    `$xml.LoadXml('<toast><visual><binding template="ToastGeneric">${logoPath ? `<image placement="appLogoOverride" src="${escapePsXml(logoPath)}" />` : ""}<text>${escapePsXml(title)}</text><text>${escapePsXml(body)}</text></binding></visual></toast>')`,
+    `$xml.LoadXml('<toast${launch ? ` activationType="protocol" launch="${escapePsXml(launch)}"` : ""}><visual><binding template="ToastGeneric">${logoPath ? `<image placement="appLogoOverride" src="${escapePsXml(logoPath)}" />` : ""}<text>${escapePsXml(title)}</text><text>${escapePsXml(body)}</text></binding></visual></toast>')`,
     `$n=[Windows.UI.Notifications.ToastNotification]::new($xml)`,
     `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(${psQuote(appId)}).Show($n)`,
   ].join("\n");

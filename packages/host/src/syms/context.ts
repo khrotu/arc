@@ -1,5 +1,5 @@
 import type { CodeSymbol } from "./extract.js";
-import { rankSymbols } from "./rank.js";
+import { rankSymbols, tokenizeQuery, expandBigrams, extractSymbolTokens } from "./rank.js";
 const CROSS_FILE_BLOCKLIST = new Set(
   "result,option,string,clone,new,iter,len,push,run,init,open,spawn,send,recv,get,set,map,filter,foreach,log,info,warn,error,assert,require,println,print,format,to_string,from,into,default".split(
     ",",
@@ -21,11 +21,16 @@ export interface ContextBlock {
 }
 export interface CodeContext {
   query: string;
-  entryPoints: { id: string; qualified: string; file: string; line: number; score: number }[];
+  entryPoints: { id: string; qualified: string; file: string; line: number; score: number; matched: string[] }[];
   related: { id: string; qualified: string; file: string; line: number; via: string }[];
   blocks: ContextBlock[];
+  omittedBlocks: string[];
   ambiguous: { ref: string; candidates: string[] }[];
   filesTouched: string[];
+}
+export function sanitizeQueryEcho(q: string): string {
+  const flat = q.replace(/[\r\n\t]+/g, " ").replace(/```/g, "~~~").replace(/[<>&]/g, (c) => (c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&amp;"));
+  return flat.length > 200 ? `${flat.slice(0, 199)}…` : flat;
 }
 export type FileReader = (file: string) => string | undefined;
 function resolveTargets(
@@ -133,6 +138,20 @@ export function buildCodeContext(
     }
   }
   const blocks: ContextBlock[] = [];
+  const omittedBlocks: string[] = [];
+  const queryTokens = new Set(expandBigrams(tokenizeQuery(query)));
+  const queryNames = new Set(extractSymbolTokens(query).map((t) => t.toLowerCase()));
+  const matchedFor = (symbol: CodeSymbol): string[] => {
+    const out: string[] = [];
+    const push = (t: string): void => {
+      if (t && !out.includes(t) && out.length < 6) out.push(t);
+    };
+    if (queryNames.has(symbol.name.toLowerCase()) || queryNames.has(symbol.qualified.toLowerCase())) push(symbol.name);
+    for (const t of symbol.searchTerms) if (queryTokens.has(t)) push(t);
+    const sigTokens = new Set(symbol.signature.toLowerCase().split(/[^a-z0-9_]+/));
+    for (const q of queryTokens) if (sigTokens.has(q)) push(q);
+    return out;
+  };
   if (includeCode) {
     const fileCache = new Map<string, string[]>();
     const getLines = (file: string): string[] | undefined => {
@@ -146,7 +165,10 @@ export function buildCodeContext(
       return lines;
     };
     const pushBlock = (sym: CodeSymbol): void => {
-      if (blocks.length >= maxBlocks) return;
+      if (blocks.length >= maxBlocks) {
+        omittedBlocks.push(sym.qualified);
+        return;
+      }
       const lines = getLines(sym.file);
       if (!lines || sym.startLine > lines.length) return;
       const start = Math.max(1, sym.startLine);
@@ -161,7 +183,7 @@ export function buildCodeContext(
       } else if (end < sym.endLine) code += `\n${commentMarkerFor(sym.file)} ... (symbol continues past line ${end}) ...`;
       blocks.push({ file: sym.file, startLine: start, endLine: end, code, symbol: sym.qualified });
     };
-    for (const r of ranked.slice(0, Math.min(maxBlocks, maxNodes))) pushBlock(r.symbol);
+    for (const r of ranked.slice(0, maxNodes)) pushBlock(r.symbol);
     for (const rel of related) {
       if (blocks.length >= maxBlocks) break;
       const sym = byId.get(rel.id);
@@ -178,9 +200,11 @@ export function buildCodeContext(
       file: r.symbol.file,
       line: r.symbol.startLine,
       score: Math.round(r.score * 100) / 100,
+      matched: matchedFor(r.symbol),
     })),
     related: related.slice(0, maxNodes * 2),
     blocks: merged.slice(0, maxBlocks),
+    omittedBlocks,
     ambiguous: ambiguous.slice(0, 10),
     filesTouched,
   };
@@ -193,9 +217,10 @@ export function commentMarkerFor(file: string): string {
 }
 export function formatCodeContext(ctx: CodeContext): string {
   const out: string[] = [];
-  out.push(`Context for: ${ctx.query}`);
+  out.push(`Context for: ${sanitizeQueryEcho(ctx.query)}`);
   out.push(`Entry points (${ctx.entryPoints.length}):`);
-  for (const e of ctx.entryPoints) out.push(`- ${e.qualified} (${e.file}:${e.line})`);
+  for (const e of ctx.entryPoints) out.push(`- ${e.qualified} (${e.file}:${e.line})${e.matched.length > 0 ? ` [${e.matched.join(", ")}]` : ""}`);
+  if (ctx.entryPoints.length === 0) out.push("No symbols matched. Matching is whole-token and case-insensitive: typos, substrings and file paths do not match. Use file.grep for those.");
   if (ctx.related.length > 0) {
     out.push(`Related (${ctx.related.length}):`);
     for (const r of ctx.related.slice(0, 15)) out.push(`- ${r.qualified} (${r.file}:${r.line}) [${r.via}]`);
@@ -204,6 +229,11 @@ export function formatCodeContext(ctx: CodeContext): string {
     const ext = b.file.split(".").pop() ?? "";
     const safe = b.code.replace(/```/g, "~~~");
     out.push(`\n${b.file}:${b.startLine}-${b.endLine} (${b.symbol})\n\`\`\`${ext}\n${safe}\n\`\`\``);
+  }
+  if (ctx.omittedBlocks.length > 0) {
+    const names = ctx.omittedBlocks.slice(0, 8).join(", ");
+    const more = ctx.omittedBlocks.length > 8 ? ` and ${ctx.omittedBlocks.length - 8} more` : "";
+    out.push(`… (code omitted for ${ctx.omittedBlocks.length} more: ${names}${more}. Raise maxCodeBlocks to include them)`);
   }
   if (ctx.ambiguous.length > 0) {
     out.push(`Ambiguous refs (not resolved, candidates shown):`);

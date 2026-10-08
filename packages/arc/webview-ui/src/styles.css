@@ -380,6 +380,20 @@ body {
 }
 .arc-composer-route-bar .arc-btn,
 .arc-composer-route-bar .arc-btn-ghost { padding: 2px 8px; font-size: 11px; font-weight: 500; flex-shrink: 0; }
+.arc-composer-queue { display: flex; flex-direction: column; margin: 0 2px; padding: 4px 8px 6px; border-bottom: 1px solid var(--arc-line-faint); }
+.arc-composer-queue-bar { display: flex; align-items: center; gap: 8px; }
+.arc-composer-queue-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.arc-composer-queue-text.is-dim { color: var(--arc-muted); }
+.arc-composer-qattach { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--arc-muted); flex-shrink: 0; }
+.arc-composer-queue-bar .arc-btn,
+.arc-composer-queue-bar .arc-btn-ghost { padding: 2px 8px; font-size: 11px; font-weight: 500; flex-shrink: 0; }
+.arc-composer-queue-bar .arc-iconbtn { flex-shrink: 0; }
+.arc-composer-qedit { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.arc-composer-qedit textarea { width: 100%; min-height: 64px; resize: vertical; background: rgba(0,0,0,0.25); border: 1px solid var(--arc-accent); border-radius: 6px; color: var(--arc-fg); font: inherit; font-size: 13px; padding: 6px 8px; }
+.arc-composer-qedit textarea:focus { outline: none; }
+.arc-composer-qedit-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.arc-composer-qedit-actions .arc-btn,
+.arc-composer-qedit-actions .arc-btn-ghost { padding: 2px 8px; font-size: 11px; font-weight: 500; }
 .arc-composer-approval, .arc-composer-clar {
   display: flex; flex-direction: column; gap: 2px;
   margin: 0 2px; padding: 4px 4px 6px;
@@ -469,6 +483,53 @@ body {
   font: inherit; font-size: 12px;
 }
 .arc-composer-clar-input button:hover { background: var(--arc-hover); color: var(--arc-fg); }
+.arc-composer-diffs { display: flex; flex-direction: column; margin: 0 2px; border-bottom: 1px solid var(--arc-line-faint); }
+.arc-composer-diffs-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 2px 6px; min-height: 26px;
+}
+.arc-composer-diffs-title {
+  display: inline-flex; align-items: center; flex: 0 1 auto; min-width: 0;
+  padding: 0; border: 0; background: none;
+  font: inherit; font-size: 12.5px; font-weight: 500; color: var(--arc-fg);
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.arc-composer-diffs-title:hover { color: var(--arc-accent); }
+.arc-composer-diffs-stat {
+  margin-left: auto;
+  display: inline-flex; align-items: baseline; gap: 6px; flex-shrink: 0;
+  font-family: var(--arc-font-mono); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.arc-composer-diffs-stat .is-add { color: var(--vscode-gitDecoration-addedResourceForeground, var(--arc-accent)); }
+.arc-composer-diffs-stat .is-rem { color: var(--vscode-gitDecoration-deletedResourceForeground, var(--arc-muted)); }
+.arc-composer-diffs-head .arc-btn,
+.arc-composer-diffs-head .arc-btn-ghost {
+  padding: 2px 8px; font-size: 11px; font-weight: 500; border: 0; flex-shrink: 0;
+}
+.arc-composer-diffs-head .arc-btn-ghost { color: var(--arc-muted); }
+.arc-composer-diffs-head .arc-btn-ghost:hover { color: var(--arc-fg); }
+.arc-composer-diffs-head .arc-iconbtn { padding: 0; width: 20px; height: 20px; flex-shrink: 0; }
+.arc-composer-diffs-head .arc-iconbtn svg { transition: transform var(--arc-dur) var(--arc-ease); }
+.arc-composer-diffs-head .arc-iconbtn .is-open { transform: rotate(180deg); }
+.arc-composer-diffs-body {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 0 0 6px; max-height: 240px; overflow-y: auto;
+}
+.arc-composer-diffs-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 2px 2px 10px; min-height: 24px;
+  border-left: 1px solid var(--arc-line-faint);
+}
+.arc-composer-diffs-row .arc-composer-diffs-stat { margin-left: 0; }
+.arc-composer-diffs-path {
+  flex: 1 1 auto; min-width: 0; padding: 0; border: 0; background: none; text-align: left;
+  font-family: var(--arc-font-mono); font-size: 11.5px; color: var(--arc-fg);
+  cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.arc-composer-diffs-path:hover { color: var(--arc-accent); text-decoration: underline; }
+.arc-composer-diffs-row .arc-iconbtn { width: 20px; height: 20px; flex-shrink: 0; }
+.arc-composer-diffs-row .arc-iconbtn.is-reject:hover { color: var(--vscode-gitDecoration-deletedResourceForeground, var(--arc-fg)); }
+.arc-composer-diffs-row .arc-iconbtn.is-accept:hover { color: var(--vscode-gitDecoration-addedResourceForeground, var(--arc-accent)); }
 .arc-composer-suggestions { display: flex; flex-direction: column; margin: 0 2px; border-bottom: 1px solid var(--arc-line-faint); }
 .arc-composer-suggest-save {
   flex-shrink: 0; font-size: 10px; font-weight: 600; padding: 1px 6px;

@@ -11,17 +11,7 @@ export type StepType =
 export interface TodoItem {
   id: string;
   text: string;
-  state: "pending" | "in_progress" | "done" | "skipped" | "blocked" | "failed";
-  children?: TodoItem[];
-  evidence?: {
-    filesTouched?: string[];
-    commandsRun?: string[];
-    testOutput?: string;
-    screenshots?: string[];
-  };
-  assignedTo?: string;
-  retries?: number;
-  blockedBy?: string[];
+  state: "pending" | "in_progress" | "done";
 }
 export interface DiffHunk {
   added: boolean;
@@ -29,6 +19,7 @@ export interface DiffHunk {
   value: string;
   oldStart?: number;
   newStart?: number;
+  count?: number;
 }
 export interface ProcessStep {
   id: string;

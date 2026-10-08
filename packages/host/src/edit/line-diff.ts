@@ -6,7 +6,7 @@ export interface LineChange {
   oldStart?: number;
   newStart?: number;
 }
-function splitLines(value: string): string[] {
+export function splitLines(value: string): string[] {
   if (!value) return [];
   const lines = value.match(/.*?(?:\r\n|\n|$)/g) ?? [];
   if (lines[lines.length - 1] === "") lines.pop();
@@ -51,6 +51,8 @@ export function diffLines(before: string, after: string): LineChange[] {
       oldIndex = nextOld + 1;
       newIndex = nextNew + 1;
     }
+    if (oldIndex < removed.length) push({ removed: true, value: removed.slice(oldIndex).join("") });
+    if (newIndex < added.length) push({ added: true, value: added.slice(newIndex).join("") });
   }
   if (oldEnd < oldLines.length) push({ value: oldLines.slice(oldEnd).join("") });
   let oldAt = 1;

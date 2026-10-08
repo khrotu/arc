@@ -27,19 +27,10 @@ const POLICY: Record<string, AutoApproveLevel | null> = {
 const TOOL_OVERRIDES: Record<string, AutoApproveLevel | null> = {
   "browser.evaluate|browser": "allowlist",
   "browser.runCode|code.execute": "allowlist",
-  "shell.customRun|shell.other": "safe",
-  "shell.editCustomRun|shell.other": "safe",
-  "shell.runCustomRun|shell.other": "safe",
   "mcp.toggle|mcp.configure": "safe",
   "mcp.create|mcp.configure": "allowlist",
   "mcp.remove|mcp.configure": "allowlist",
-  "git.stage|shell.other": "safe",
-  "git.commit|shell.other": "safe",
-  "git.push|shell.other": "allowlist",
-  "git.branch|shell.other": "allowlist",
-  "git.pr|shell.other": "allowlist",
   "checkpoint.revert|none": "allowlist",
-  "rule.create|write.external": "safe",
   "file.edit|write.local-protected": "all",
 };
 export function policyLevelFor(toolName: string, category: string): AutoApproveLevel | null {

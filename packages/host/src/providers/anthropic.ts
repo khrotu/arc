@@ -1,6 +1,6 @@
 import { AsyncEventQueue, readableToAsyncIterable } from "../util/stream.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
-import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
+import { createToolNameResolver, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
 import { withRetry, policyFor } from "./retry.js";
 import { attributionHeaders, opencodeSessionHeader } from "./attribution.js";
 import { readBodyLimited } from "../security/network.js";
@@ -123,6 +123,7 @@ export const anthropicTransport: Transport = {
         input_schema: t.parameters,
       }));
     }
+    const resolveToolName = createToolNameResolver(req.tools ?? []);
     if (req.reasoningEffort) {
       const anthropicEff = ANTHROPIC_EFFORT[req.reasoningEffort];
       if (anthropicEff) {
@@ -211,7 +212,7 @@ export const anthropicTransport: Transport = {
                     name: j.content_block.name ?? "tool",
                     json: "",
                   });
-                  q.push({ type: "tool_call_delta", id: toolBlocks.get(j.index)!.id, name: fromApiToolName(j.content_block.name ?? "tool"), argsDelta: "" });
+                  q.push({ type: "tool_call_delta", id: toolBlocks.get(j.index)!.id, name: resolveToolName(j.content_block.name ?? "tool"), argsDelta: "" });
                 }
               } else if (j.type === "content_block_delta" && j.delta) {
                 if (j.delta.type === "text_delta" && j.delta.text) {
@@ -223,7 +224,7 @@ export const anthropicTransport: Transport = {
                   const blk = toolBlocks.get(j.index);
                   if (blk) {
                     blk.json += j.delta.partial_json;
-                    q.push({ type: "tool_call_delta", id: blk.id, name: fromApiToolName(blk.name), argsDelta: j.delta.partial_json });
+                    q.push({ type: "tool_call_delta", id: blk.id, name: resolveToolName(blk.name), argsDelta: j.delta.partial_json });
                   }
                 }
               } else if (j.type === "content_block_stop" && typeof j.index === "number") {
@@ -231,7 +232,7 @@ export const anthropicTransport: Transport = {
                 if (blk) {
                   let args: Record<string, unknown> = {};
 try { args = blk.json ? JSON.parse(blk.json) : {}; } catch { hostLog(`Anthropic stream: failed to parse tool args JSON: ${blk.json?.slice(0, 200)}`); }
-                  q.push({ type: "tool_call", id: blk.id, name: fromApiToolName(blk.name), args });
+                  q.push({ type: "tool_call", id: blk.id, name: resolveToolName(blk.name), args });
                   toolBlocks.delete(j.index);
                 }
               } else if (j.type === "message_start" && j.message?.usage) {

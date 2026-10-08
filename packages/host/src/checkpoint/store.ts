@@ -128,7 +128,7 @@ export class CheckpointStore {
     }
   }
   async restoreSingleFile(root: string, rel: string, hash: string): Promise<RestoreResult> {
-    if (!CheckpointStore.isBlobHash(hash) || hash === "__none__") {
+    if (!CheckpointStore.isBlobHash(hash)) {
       return { restored: [], conflicts: [], errors: [`${rel}: invalid blob hash`] };
     }
     const snap: TurnSnapshot = { turnId: "(single)", ts: Date.now(), root, files: { [rel]: hash } };

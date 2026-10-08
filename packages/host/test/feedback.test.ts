@@ -29,7 +29,7 @@ compaction: () => {  },
   return { sink, messages, getSteps: () => steps, getTodos: () => todos };
 }
 describe("Agent post-edit feedback loop", () => {
-  it("injects an lsp.problemsFor step + tool message after file.edit when diagnostics are present", async () => {
+  it("injects an lsp step + tool message after file.edit when diagnostics are present", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "arc-fb-"));
     const registry = new ModelRegistry();
     registry.load({

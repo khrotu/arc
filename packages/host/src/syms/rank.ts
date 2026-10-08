@@ -139,6 +139,11 @@ export function rankSymbols(
 ): RankedSymbol[] {
   const tokens = new Set(expandBigrams(tokenizeQuery(query)));
   const symToks = new Set(extractSymbolTokens(query).map((t) => t.toLowerCase()));
+  if (tokens.size === 0 && symToks.size === 0) {
+    for (const w of query.toLowerCase().split(/[^a-z0-9_]+/)) {
+      if (w.length >= 2) tokens.add(w);
+    }
+  }
   const phrases = extractPhrases(query);
   const fanIn = computeFanIn(symbols);
   const ranked = symbols.map((symbol) => {

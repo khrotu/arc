@@ -38,8 +38,8 @@ export function detectTerminals(): TerminalDescriptor[] {
   const seenIds = new Set<string>();
   const push = (d: TerminalDescriptor | undefined) => {
     if (!d || seenIds.has(d.id) || seenExecutables.has(d.executable.toLowerCase())) return;
-    seenIds.add(d.id);
     seenExecutables.add(d.executable.toLowerCase());
+    seenIds.add(d.id);
     out.push(d);
   };
   if (process.platform === "win32") {

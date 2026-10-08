@@ -6,6 +6,8 @@ export interface RpcClient {
   send(msg: WebviewRequest): void;
   on(listener: Listener): () => void;
   request<T = unknown>(key: string): Promise<T | undefined>;
+  getViewState: () => Record<string, unknown>;
+  setViewState: (patch: Record<string, unknown>) => void;
 }
 declare function acquireVsCodeApi(): {
   postMessage: (m: unknown) => void;
@@ -38,6 +40,21 @@ export function createClient(): RpcClient {
     on(l) {
       listeners.add(l);
       return () => listeners.delete(l);
+    },
+    getViewState() {
+      try {
+        const s = vscode?.getState() as Record<string, unknown> | undefined;
+        return s && typeof s === "object" ? s : {};
+      } catch {
+        return {};
+      }
+    },
+    setViewState(patch) {
+      try {
+        const prev = client.getViewState();
+        vscode?.setState({ ...prev, ...patch });
+      } catch {
+      }
     },
     request<T>(key: string): Promise<T | undefined> {
       const id = `req-${Math.random().toString(36).slice(2, 10)}`;

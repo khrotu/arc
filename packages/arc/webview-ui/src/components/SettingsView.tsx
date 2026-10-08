@@ -818,7 +818,7 @@ function ProvidersTab({ client, providers, models, providerCatalog, serverStates
       {showBanner && (
         <div className="arc-provider-banner">
           <p className="arc-provider-banner-text">
-            Limited-time offer: free access to the GLM 5.3 Flash model for all users. Set up in one click.
+            Limited-time offer: free access to the MiMo-V2.6-Pro model for all users. Set up in one click.
           </p>
           {!internalSetup || (internalSetup.error || internalSetup.pct >= 100) ? (
             <div className="arc-provider-banner-actions">
@@ -1183,7 +1183,7 @@ function CompactionSection({ client }: { client: RpcClient }) {
           <li className="arc-row"><div className="arc-row-main">
             <span className="arc-row-label">Strategy</span>
             {compactionStrategy === "model-aware" && (
-              <span className="arc-info-icon" title="Learns from recent turns: reserves headroom for the model's average thinking + response length plus the safety margin below, and may compact at the cost-optimal point once pricing is known — but never before half the usable window (see the context tooltip). Falls back to a fixed output reserve when few turns have been observed.">
+              <span className="arc-info-icon" title="Learns from recent turns: reserves headroom for the model's average thinking + response length plus the safety margin below, and may compact at the cost-optimal point once pricing is known, but never before half the usable window (see the context tooltip). Falls back to a fixed output reserve when few turns have been observed.">
                 <Info size={13} />
               </span>
             )}
@@ -1492,7 +1492,6 @@ function ToolsTab({ client, toolCatalog, onUseChat }: { client: RpcClient; toolC
       <Section collapsible title="Tool calls">
         <ToolTogglesSection client={client} toolCatalog={toolCatalog} />
         <ShellSection client={client} />
-        <SemanticSearchSection client={client} />
         <WebSearchSection client={client} />
       </Section>
       <McpCategory client={client} />
@@ -1500,31 +1499,43 @@ function ToolsTab({ client, toolCatalog, onUseChat }: { client: RpcClient; toolC
     </>
   );
 }
+interface ToolPreset {
+  id: string;
+  label: string;
+  description: string;
+  enabled: string[];
+}
 function ToolTogglesSection({ client, toolCatalog }: { client: RpcClient; toolCatalog: ToolSpec[] }) {
   const [disabled, setDisabled] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loaded, setLoaded] = useState(false);
+  const [presets, setPresets] = useState<ToolPreset[]>([]);
   useEffect(() => {
-    void client.request("arc.tools.disabled").then((v) => {
-      const arr = Array.isArray(v) ? v as string[] : [];
-      setDisabled(new Set(arr));
-      setLoaded(true);
-    });
+    void Promise.all([
+      client.request("arc.tools.disabled").then((v) => {
+        const arr = Array.isArray(v) ? v as string[] : [];
+        setDisabled(new Set(arr));
+      }),
+      client.request("arc.tools.presets").then((v) => {
+        if (Array.isArray(v)) setPresets((v as ToolPreset[]).filter((p) => p && typeof p.id === "string" && Array.isArray(p.enabled)));
+      }),
+    ]).then(() => setLoaded(true));
   }, [client]);
   const saveDisabled = (next: Set<string>) => {
     setDisabled(next);
     client.send({ type: SET, key: "arc.tools.disabled", value: [...next] });
   };
-  const resetToCurated = () => {
-    const curated = new Set<string>([
-      "shell.customRun", "shell.editCustomRun", "shell.runCustomRun",
-      "browser.drag", "browser.evaluate", "browser.hover", "browser.domSnapshot", "browser.readPage", "browser.newTab", "browser.switchTab", "browser.listTabs",
-      "git.stage", "git.commit", "git.push", "git.branch", "git.branchDiff", "git.changedFiles", "git.commitMessage", "git.diffStaged", "git.diffUnstaged", "git.pr",
-      "notebook.read", "notebook.execute", "notebook.editCell", "notebook.addCell", "notebook.deleteCell",
-      "test.run", "session.exportTrace",
-    ]);
-    saveDisabled(curated);
+  const catalogNames = toolCatalog.map((t) => t.name);
+  const impliedDisabled = (p: ToolPreset): Set<string> => new Set(catalogNames.filter((n) => n !== "syms.context" && !p.enabled.includes(n)));
+  const comparableDisabled = new Set([...disabled].filter((n) => n !== "syms.context"));
+  const setsEqual = (a: Set<string>, b: Set<string>): boolean => a.size === b.size && [...a].every((x) => b.has(x));
+  const activePreset = presets.find((p) => setsEqual(impliedDisabled(p), comparableDisabled))?.id;
+  const applyPreset = (id: string) => {
+    const p = presets.find((x) => x.id === id);
+    if (!p) return;
+    saveDisabled(impliedDisabled(p));
   };
+  const resetToBalanced = () => applyPreset("balanced");
   const categories: { category: string; tools: ToolSpec[] }[] = [];
   const byCat = new Map<string, ToolSpec[]>();
   for (const t of toolCatalog) {
@@ -1532,7 +1543,7 @@ function ToolTogglesSection({ client, toolCatalog }: { client: RpcClient; toolCa
     list.push(t);
     byCat.set(t.category, list);
   }
-  const CAT_ORDER = ["File", "Shell", "Browser", "Web", "Git", "MCP", "Hooks", "Memory", "Notebook", "Rules", "Skills", "Code intelligence", "Session", "Communication", "Orchestration", "Wait"];
+  const CAT_ORDER = ["File", "Shell", "Browser", "Web", "MCP", "Hooks", "Memory", "Notebook", "Skills", "Code intelligence", "Session", "Communication", "Orchestration", "Other"];
   for (const cat of CAT_ORDER) {
     const tools = byCat.get(cat);
     if (tools?.length) categories.push({ category: cat, tools });
@@ -1555,7 +1566,15 @@ function ToolTogglesSection({ client, toolCatalog }: { client: RpcClient; toolCa
   const catCount = (tools: ToolSpec[]) => tools.filter((t) => !disabled.has(t.name)).length;
   const enabledCount = toolCatalog.filter((t) => !disabled.has(t.name)).length;
   return (
-      <Section collapsible nested title="Enable/disable tool calls" titleExtra={loaded ? <button className="arc-iconbtn" onClick={resetToCurated} title="Reset to the default curated tool set" style={{ marginLeft: 4 }}><RefreshCw size={13} /></button> : undefined} description="Unselect tools the agent doesn't need." action={loaded ? (
+      <Section collapsible nested title="Enable/disable tool calls" titleExtra={loaded ? (
+        <span style={{ display: "inline-flex", gap: 4, alignItems: "center", marginLeft: 4 }}>
+          <button className="arc-iconbtn" onClick={resetToBalanced} title="Reset to Balanced (default)"><RefreshCw size={13} /></button>
+          <select className="arc-input arc-input-sm" value={activePreset ?? ""} onChange={(e) => { if (e.target.value) applyPreset(e.target.value); }} title={presets.find((p) => p.id === activePreset)?.description ?? "Apply a tool preset"}>
+            {!activePreset && <option value="">Custom…</option>}
+            {presets.map((p) => <option key={p.id} value={p.id} title={p.description}>{p.label}{p.id === "balanced" ? " (default)" : ""}</option>)}
+          </select>
+        </span>
+      ) : undefined} description="Pick a preset or unselect tools the agent doesn't need." action={loaded ? (
         <span className="arc-row-meta">{enabledCount}/{toolCatalog.length} enabled</span>
       ) : undefined}>
         {!loaded ? <p className="arc-empty">Loading...</p> : toolCatalog.length === 0 ? <p className="arc-empty">No tools available.</p> : (
@@ -1705,123 +1724,6 @@ function SecuritySection({ client }: { client: RpcClient }) {
       </Section>
   );
 }
-function SemanticSearchSection({ client }: { client: RpcClient }) {
-  const [searchEnabled, setSearchEnabled] = useState(true);
-  const [searchBackend, setSearchBackend] = useState<"hash-based" | "semantic">("hash-based");
-  const [searchProvider, setSearchProvider] = useState<"ollama" | "openrouter">("ollama");
-  const [searchModelTier, setSearchModelTier] = useState<"low" | "mid" | "high">("low");
-  const [openrouterModel, setOpenrouterModel] = useState("");
-  const [orModels, setOrModels] = useState<{ slug: string; name: string; contextLength: number }[] | null>(null);
-  const [searchChunks, setSearchChunks] = useState(0);
-  const [autoReindex, setAutoReindex] = useState<"off" | "hourly" | "daily">("off");
-  const [indexing, setIndexing] = useState(false);
-  const [progress, setProgress] = useState<{ scanned: number; indexed: number; chunks: number; errors: number }>({ scanned: 0, indexed: 0, chunks: 0, errors: 0 });
-  useEffect(() => {
-    void client.request("arc.search.enabled").then((v) => setSearchEnabled(v !== false));
-    void client.request("arc.search.backend").then((v) => setSearchBackend((v === "semantic" ? "semantic" : "hash-based")));
-    void client.request("arc.search.provider").then((v) => setSearchProvider(v === "openrouter" ? "openrouter" : "ollama"));
-    void client.request("arc.search.modelTier").then((v) => {
-      if (v === "mid") setSearchModelTier("mid");
-      else if (v === "high") setSearchModelTier("high");
-      else setSearchModelTier("low");
-    });
-    void client.request("arc.search.openrouterModel").then((v) => setOpenrouterModel(typeof v === "string" ? v : ""));
-    void client.request("arc.search.chunkCount").then((v) => setSearchChunks(typeof v === "number" ? v : 0));
-    void client.request("arc.search.autoReindex").then((v) => setAutoReindex(v === "hourly" || v === "daily" ? v : "off"));
-    const off = client.on((e: any) => {
-      if (e.type === "search/indexProgress") {
-        setIndexing(true);
-        setProgress({ scanned: e.filesScanned, indexed: e.filesIndexed, chunks: e.chunksEmbedded, errors: e.errors });
-        setSearchChunks(e.chunksEmbedded);
-        if (e.filesScanned === e.filesIndexed) setIndexing(false);
-      }
-    });
-    return off;
-  }, [client]);
-  useEffect(() => {
-    if (searchBackend !== "semantic" || searchProvider !== "openrouter" || orModels) return;
-    void client.request("arc.search.openrouterModels").then((v) => setOrModels(Array.isArray(v) ? v : []));
-  }, [client, searchBackend, searchProvider, orModels]);
-  const pct = progress.scanned > 0 ? (progress.indexed / progress.scanned) * 100 : 0;
-  return (
-    <Section collapsible nested title="Semantic search" description="Indexes the workspace with an embedding model for natural-language queries.">
-      <ul className="arc-rows">
-        <li className="arc-row"><div className="arc-row-main">
-          <span className="arc-row-label">Enable</span>
-            <span className="arc-row-meta">index the workspace on activation and keep it in sync</span>
-          <span className="arc-spacer" />
-          <Toggle checked={searchEnabled} onChange={(v) => { setSearchEnabled(v); client.send({ type: SET, key: "arc.search.enabled", value: v }); }} />
-        </div></li>
-        <li className="arc-row"><div className="arc-row-main">
-          <span className="arc-row-label">Backend</span>
-          <span className="arc-spacer" />
-          <select className="arc-input arc-input-sm" value={searchBackend} onChange={(e) => { const v = e.target.value as typeof searchBackend; setSearchBackend(v); client.send({ type: SET, key: "arc.search.backend", value: v }); }}>
-            <option value="hash-based">hash-based</option>
-            <option value="semantic">semantic</option>
-          </select>
-        </div></li>
-        {searchBackend === "semantic" && (
-          <li className="arc-row"><div className="arc-row-main">
-            <span className="arc-row-label">Model provider</span>
-            <span className="arc-row-meta">where the embedding model runs</span>
-            <span className="arc-spacer" />
-            <select className="arc-input arc-input-sm" value={searchProvider} onChange={(e) => { const v = e.target.value as typeof searchProvider; setSearchProvider(v); client.send({ type: SET, key: "arc.search.provider", value: v }); }}>
-              <option value="ollama">ollama</option>
-              <option value="openrouter">openrouter</option>
-            </select>
-          </div></li>
-        )}
-        {searchBackend === "semantic" && searchProvider === "ollama" && (
-          <li className="arc-row"><div className="arc-row-main">
-            <span className="arc-row-label">Model</span>
-            <span className="arc-spacer" />
-            <select className="arc-input arc-input-sm" value={searchModelTier} onChange={(e) => { const v = e.target.value as typeof searchModelTier; setSearchModelTier(v); client.send({ type: SET, key: "arc.search.modelTier", value: v }); }}>
-              <option value="low">nomic-embed-text (768d)</option>
-              <option value="mid">qwen3-embedding:0.6b (1024d)</option>
-              <option value="high">qwen3-embedding:8b (4096d)</option>
-            </select>
-          </div></li>
-        )}
-        {searchBackend === "semantic" && searchProvider === "openrouter" && (
-          <li className="arc-row"><div className="arc-row-main">
-            <span className="arc-row-label">Model</span>
-            <span className="arc-spacer" />
-            <select
-              className="arc-input arc-input-sm"
-              value={openrouterModel}
-              onChange={(e) => { const v = e.target.value; setOpenrouterModel(v); if (v) client.send({ type: SET, key: "arc.search.openrouterModel", value: v }); }}
-            >
-              {!openrouterModel && <option value="">select a model...</option>}
-              {openrouterModel && !orModels?.some((m) => m.slug === openrouterModel) && <option value={openrouterModel}>{openrouterModel}</option>}
-              {(orModels ?? []).map((m) => <option key={m.slug} value={m.slug}>{m.name}</option>)}
-              {orModels === null && <option value="" disabled>loading...</option>}
-              {orModels !== null && orModels.length === 0 && <option value="" disabled>no embedding models found</option>}
-            </select>
-          </div></li>
-        )}
-        <li className="arc-row"><div className="arc-row-main">
-          <span className="arc-row-label">Automatic reindexing</span>
-            <span className="arc-row-meta">periodically rebuild the full index, in addition to live file watching</span>
-          <span className="arc-spacer" />
-          <select className="arc-input arc-input-sm" value={autoReindex} onChange={(e) => { const v = e.target.value as typeof autoReindex; setAutoReindex(v); client.send({ type: SET, key: "arc.search.autoReindex", value: v }); }}>
-            <option value="off">off</option>
-            <option value="hourly">hourly</option>
-            <option value="daily">daily</option>
-          </select>
-        </div></li>
-      </ul>
-      <div className="arc-progress-wrap">
-        <button className="arc-chip" onClick={() => { setIndexing(true); setProgress({ scanned: 0, indexed: 0, chunks: 0, errors: 0 }); client.send({ type: "search/reindex" }); }} disabled={indexing}>Reindex {searchChunks > 0 ? `(${searchChunks} chunks)` : ""}</button>
-        {indexing && (
-          <div style={{ marginTop: 8 }}>
-            <div className="arc-progress-bar"><div className="arc-progress-fill" style={{ width: `${pct}%` }} /></div>
-            <p className="arc-progress-text">{progress.indexed} files · {progress.chunks} chunks{progress.errors > 0 ? ` · ${progress.errors} errors` : ""}</p>
-          </div>
-        )}
-      </div>
-    </Section>
-  );
-}
 const WEB_SEARCH_BACKENDS = [
   { id: "builtin", label: "built-in (free)", keyUrl: "" },
   { id: "exa", label: "exa", keyUrl: "https://dashboard.exa.ai/api-keys" },
@@ -1930,7 +1832,7 @@ function ModesSection({ client, models }: { client: RpcClient; models: ModelDesc
           {error && <p className="arc-section-desc" style={{ color: "var(--vscode-errorForeground)" }}>{error}</p>}
           <input className="arc-input" placeholder="name (slug, e.g. reviewer)" value={editing.slug} onChange={(e) => setEditing({ ...editing, slug: e.target.value })} />
           <textarea className="arc-input" style={{ width: "100%", resize: "vertical" }} rows={6} placeholder="prompt (system role definition)" value={editing.roleDefinition} onChange={(e) => setEditing({ ...editing, roleDefinition: e.target.value })} />
-          <input className="arc-input" placeholder="tools (comma-separated, e.g. file.read, file.grep, lsp.problems)" value={toolsText} onChange={(e) => setToolsText(e.target.value)} />
+          <input className="arc-input" placeholder="tools (comma-separated, e.g. file.read, file.grep, lsp)" value={toolsText} onChange={(e) => setToolsText(e.target.value)} />
           <div className="arc-form-row">
             <input className="arc-input" placeholder="write glob (optional, e.g. **/*.ts)" value={editing.writeGlob ?? ""} onChange={(e) => setEditing({ ...editing, writeGlob: e.target.value })} />
             <select className="arc-input" value={editing.model ?? ""} onChange={(e) => setEditing({ ...editing, model: e.target.value })}>

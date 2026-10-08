@@ -23,11 +23,11 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     }, ["path"]),
   },
   "file.edit": {
-    description: "Apply an edit to an existing file. PREFER the SEARCH/REPLACE block format in `search` over plain text - it expresses intent unambiguously and survives whitespace drift:\n\npath/to/file.ts\n<<<<<<< SEARCH\nexact text to find (include enough surrounding lines to be unique)\n=======\nreplacement text\n>>>>>>> REPLACE\n\nFall back to plain `search` + `replace` strings only for trivial one-line tweaks. If you must pass plain text, include enough surrounding lines to make the match unique.",
+    description: "Apply an edit to an existing file. Prefer a SEARCH/REPLACE block in `search`; use plain text only for trivial one-line tweaks.",
     parameters: obj({
       path: str("Workspace-relative file path."),
-      search: str("SEARCH/REPLACE block (preferred) or exact text to find. For SEARCH/REPLACE: include a header line, then '<<<<<<< SEARCH' / search content / '=======' / replace content / '>>>>>>> REPLACE'."),
-      replace: str("Replacement text. Ignored when `search` is a SEARCH/REPLACE block (the block's REPLACE section is used)."),
+      search: str("SEARCH/REPLACE block (preferred) or exact text to find, with enough surrounding lines to be unique."),
+      replace: str("Replacement text. Ignored when `search` is a SEARCH/REPLACE block."),
       replaceAll: bool("Replace every occurrence instead of the first."),
       runAfter: str("Optional shell command to run after the edit (e.g. 'pnpm build')."),
     }, ["path"]),
@@ -59,6 +59,8 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
       command: str("The command line to run."),
       cwd: str("Optional working directory (defaults to the workspace root)."),
       timeout: str("Optional timeout in seconds. Use -1 for no limit (default). On timeout the process is moved to the background instead of killed: the result returns partial output plus a background id for shell.check."),
+      untilSuccess: bool("Repeat the command until it exits 0 (condition wait, e.g. server readiness). Uses interval/timeout below instead of the single-run timeout."),
+      interval: num("Poll interval in seconds for untilSuccess (default 1, min 0.25)."),
     }),
   },
   "shell.backgroundRun": {
@@ -69,58 +71,35 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     }, ["command"]),
   },
   "shell.check": {
-    description: "Poll output and status of a background process.",
+    description: "Poll output and status of a background process. Prefer a single check with waitForExit over repeated polling.",
     parameters: obj({
       id: str("The background process id returned by shell.backgroundRun."),
+      waitForExit: bool("Block until the process exits instead of returning immediately."),
+      timeout: num("Max seconds to wait with waitForExit (default 3600)."),
     }, ["id"]),
   },
   "shell.write": {
-    description: "Send input to a running background process.",
+    description: "Send input to a running background process. To stop a server, use shell.kill: a Ctrl+C byte only affects programs that read it from stdin.",
     parameters: obj({
       id: str("The background process id."),
-      input: str("The input to send (e.g. y/n confirmation, arrow keys)."),
-    }, ["id", "input"]),
-  },
-  "shell.customRun": {
-    description: "Define a named series of shell commands and persist them as a skill. Use for repeatable workflows like build-test-lint cycles.",
-    parameters: obj({
-      name: str("A short, descriptive name for this custom run (e.g. 'full-check')."),
-      commands: { type: "array", items: { type: "string" }, description: "Ordered list of shell commands to run." },
-      overwrite: bool("Set true to replace an existing run with the same name."),
-    }, ["name", "commands"]),
-  },
-  "shell.editCustomRun": {
-    description: "Update a previously-defined custom run by its id. Renaming also renames the id used by shell.runCustomRun.",
-    parameters: obj({
-      id: str("The custom run id (returned when it was created)."),
-      commands: { type: "array", items: { type: "string" }, description: "New ordered list of shell commands." },
-      name: str("Optional new name for the run."),
+      input: str("Plain-text input sent verbatim. Must not contain control characters: they may be stripped before delivery, failing silently."),
+      inputEscaped: str("Alternative to input for bytes that cannot be sent raw. Backslash escapes (\\n, \\t, \\\\, \\x03, \\u0003) are decoded before sending; Ctrl+C is \\u0003. Takes precedence over input when non-empty."),
     }, ["id"]),
   },
-  "shell.runCustomRun": {
-    description: "Execute a previously-defined custom run by its id or display name. Runs each command sequentially and reports per-command results.",
+  "shell.kill": {
+    description: "Terminate a running background process by id. Use this to stop servers started with shell.backgroundRun.",
     parameters: obj({
-      id: str("The custom run id or display name to execute."),
-      cwd: str("Optional working directory (defaults to workspace root)."),
+      id: str("The background process id."),
     }, ["id"]),
   },
-  "test.run": {
-    description: "Run tests in the workspace. Auto-detects vitest, jest, mocha, pytest, or go test. Use scope to narrow: 'workspace' (all), 'file' (single file), 'failed' (re-run failures).",
+  "lsp": {
+    description: "Get LSP problems across the workspace, or for a single file when path is given.",
     parameters: obj({
-      scope: enumStr(["workspace", "file", "nearest", "failed"], "Test scope to run. Defaults to 'workspace'."),
-      path: str("Optional file path to test when scope is 'file'."),
+      path: str("Optional workspace-relative file path to scope diagnostics to."),
     }),
   },
-  "lsp.problems": {
-    description: "Get ALL current LSP problems across the workspace.",
-    parameters: obj({}),
-  },
-  "lsp.problemsFor": {
-    description: "Get LSP problems for a single file.",
-    parameters: obj({ path: str("Workspace-relative file path.") }, ["path"]),
-  },
   "todo.write": {
-    description: "Set the live to-do plan. Keep exactly one item in_progress at a time. Tasks can have nested children for substeps.",
+    description: "Set the live to-do plan as a flat list. Mark the active item in_progress and flip items to done after verifying; independent items may progress together.",
     parameters: obj({
       items: {
         type: "array",
@@ -128,16 +107,7 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
         items: obj({
           id: str("Stable id for the item."),
           text: str("What the step does."),
-          state: enumStr(["pending", "in_progress", "done", "skipped", "blocked", "failed"], "Item state."),
-          children: {
-            type: "array",
-            description: "Optional sub-steps for this item.",
-            items: obj({
-              id: str("Stable id for the sub-step."),
-              text: str("What the sub-step does."),
-              state: enumStr(["pending", "in_progress", "done", "skipped", "blocked", "failed"], "Sub-step state."),
-            }, ["id", "text", "state"]),
-          },
+          state: enumStr(["pending", "in_progress", "done"], "Item state."),
         }, ["id", "text", "state"]),
       },
     }, ["items"]),
@@ -170,21 +140,13 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     description: "Close the browser.",
     parameters: obj({}),
   },
-  "browser.newTab": {
-    description: "Open a new browser tab, optionally navigating to a URL. The new tab becomes active.",
-    parameters: obj({ url: str("Optional URL to navigate the new tab to.") }),
-  },
-  "browser.switchTab": {
-    description: "Switch the active tab used by browser tools that omit tabId.",
-    parameters: obj({ tabId: str("The tab id to make active (see browser.listTabs).") }, ["tabId"]),
-  },
-  "browser.closeTab": {
-    description: "Close a browser tab by id.",
-    parameters: obj({ tabId: str("The tab id to close.") }, ["tabId"]),
-  },
-  "browser.listTabs": {
-    description: "List all open browser tabs with their ids, URLs, and which one is active.",
-    parameters: obj({}),
+  "browser.tab": {
+    description: "Manage browser tabs: list them, open one, switch the active tab, or close one.",
+    parameters: obj({
+      action: enumStr(["list", "new", "switch", "close"], "Tab action (default list)."),
+      tabId: str("Tab id for switch/close (see list)."),
+      url: str("Optional URL for a new tab to navigate to."),
+    }),
   },
   "browser.intercept": {
     description: "Intercept network requests matching a URL glob pattern (e.g. '**/api/**'), to mock a response or block the request entirely. Applies to all tabs.",
@@ -213,19 +175,14 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
       count: num("Maximum number of results to return (default 10, max 20)."),
     }, ["query"]),
   },
-  "file.semanticSearch": {
-    description: "Semantic search across the workspace via the local embedding index.",
-    parameters: obj({
-      query: str("Natural-language query."),
-      k: num("Optional max results (default 10)."),
-    }, ["query"]),
-  },
   "syms.context": {
-    description: "One-call code context: returns entry-point symbols, callers/callees, and code blocks for a task. Use instead of N grep/read round-trips when exploring unfamiliar code.",
+    description: "One-call code context: whole-token symbol search (case-insensitive, OR semantics) returning entry points, callers/callees and code blocks. Paths, typos and prose do not match; use file.grep for those. Use instead of N grep/read round-trips when exploring unfamiliar code.",
     parameters: obj({
-      query: str("Task description or symbol name (e.g. 'user authentication' or 'validateToken')."),
-      maxNodes: num("Optional max symbols (default 20, max 60)."),
+      query: str("Symbol name or keywords (e.g. 'validateToken'). Whole tokens only: no substrings, typos or file paths."),
+      maxNodes: num("Max entry-point symbols, 1-60 (default 20). Related callers/callees may add more nodes."),
       includeCode: bool("Include code blocks (default true)."),
+      maxCodeBlocks: num("Max code blocks rendered (default 5). Entries past the budget list without code."),
+      maxCodeLines: num("Max lines per code block (default 120)."),
     }, ["query"]),
   },
   "mcp.call": {
@@ -360,7 +317,7 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
     }, ["question"]),
   },
   "handoff": {
-    description: "Hand the conversation to a different model tier. USE THIS when the task exceeds your capabilities: escalate to a heavier model for hard reasoning, complex refactors, ambiguous architecture, or repeated failures; de-escalate to a lighter/cheaper model for grunt work, bulk edits, or simple follow-ups once the hard part is done. Your todo plan, conversation, and file context carry over automatically — you do NOT lose progress. You are the current tier (see Environment / model label in context); heavier = default→heavy or light→default, lighter = reverse. Prefer escalating early over failing repeatedly: if you have tried 2 approaches and are stuck, hand off with a clear reason stating what was tried, what failed, and what the next model should do first.",
+    description: "Hand the conversation to a different model tier. USE THIS when the task exceeds your capabilities: escalate to a heavier model for hard reasoning, complex refactors, ambiguous architecture, or repeated failures; de-escalate to a lighter/cheaper model for grunt work, bulk edits, or simple follow-ups once the hard part is done. Your todo plan, conversation, and file context carry over automatically: you do NOT lose progress. You are the current tier (see Environment / model label in context); heavier = default→heavy or light→default, lighter = reverse. Prefer escalating early over failing repeatedly: if you have tried 2 approaches and are stuck, hand off with a clear reason stating what was tried, what failed, and what the next model should do first.",
     parameters: obj({
       reason: str("Why the handoff is needed: what you tried, what failed or is beyond you, and what the next model should do first."),
       direction: enumStr(["escalate", "de-escalate"], "escalate to a heavier/more capable model or de-escalate to a lighter/cheaper one."),
@@ -379,110 +336,21 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
         slug: str("The mode slug to switch to (plan, code, debug, audit, or a user-defined mode)."),
     }, ["slug"]),
   },
-  "skill.read": {
-    description: "Read a skill's full instructions by name. Skills provide specialized workflows, tool integrations, and domain expertise.",
+  "skill": {
+    description: "Load a skill's full instructions and enumerate its available scripts, references, and assets. Skills provide specialized workflows, tool integrations, and domain expertise.",
     parameters: obj({
-      name: str("The skill name to read (as listed in the Available Skills section of the system prompt)."),
+      name: str("The skill name to load (as listed in the Available Skills section of the system prompt)."),
     }, ["name"]),
   },
-  "skill.use": {
-    description: "Load a skill's full instructions and enumerate its available scripts, references, and assets. Use this over skill.read when you need to know what bundled resources (scripts, references, assets) the skill provides.",
+  "memory": {
+    description: "Workspace memory: list, add, edit or delete durable facts, or append a handoff note for future sessions.",
     parameters: obj({
-      name: str("The skill name to load."),
-    }, ["name"]),
-  },
-  "memory.list": {
-    description: "List stored memories from MEMORY.md.",
-    parameters: obj({ limit: num("Max entries to return (default 20).") }),
-  },
-  "memory.edit": {
-    description: "Edit a memory by its index from memory.list.",
-    parameters: obj({
-      index: num("Memory index to edit."),
-      content: str("New content for the memory."),
-    }, ["index", "content"]),
-  },
-  "memory.delete": {
-    description: "Delete a memory by its index from memory.list.",
-    parameters: obj({
-      index: num("Memory index to delete."),
-    }, ["index"]),
-  },
-  "memory.add": {
-    description: "Persist a durable fact, preference, or gotcha to MEMORY.md.",
-    parameters: obj({
-      category: str("Category: preferences, architecture, or gotchas."),
-      content: str("The memory content to store."),
-    }, ["category", "content"]),
-  },
-  "rule.list": {
-    description: "List all available rules with their glob patterns and descriptions.",
-    parameters: obj({}, []),
-  },
-  "rule.read": {
-    description: "Read a rule's full body by name.",
-    parameters: obj({ name: str("Rule name to read.") }, ["name"]),
-  },
-  "rule.create": {
-    description: "Create a workspace-scoped rule under ~/.arc/workspaces/<workspace>/rules/.",
-    parameters: obj({
-      name: str("Rule name (filename without .md)."),
-      glob: str("File glob pattern to match (e.g. *.ts)."),
-      description: str("What this rule governs."),
-      body: str("Markdown body with the rule instructions."),
-    }, ["name", "glob", "description", "body"]),
-  },
-  "git.diffStaged": {
-    description: "Show the staged diff (git diff --cached). Optionally scope to a single file with `path`.",
-    parameters: obj({ path: str("Optional workspace-relative file path to scope the diff to.") }),
-  },
-  "git.diffUnstaged": {
-    description: "Show the unstaged diff (git diff). Optionally scope to a single file with `path`.",
-    parameters: obj({ path: str("Optional workspace-relative file path to scope the diff to.") }),
-  },
-  "git.changedFiles": {
-    description: "List all changed files in the working tree with their status (staged vs unstaged).",
-    parameters: obj({}),
-  },
-  "git.branchDiff": {
-    description: "Show the diff between the current branch and its merge base with a target branch (defaults to 'main'). Falls back to 'master' if merge-base fails.",
-    parameters: obj({ base: str("Optional target branch to diff against. Defaults to 'main'.") }),
-  },
-  "git.commitMessage": {
-    description: "Supply a diff to compose a conventional commit message, or call without arguments to fetch the current staged diff.",
-    parameters: obj({ diff: str("Optional diff text to base the commit message on.") }),
-  },
-  "git.stage": {
-    description: "Stage changes for commit.",
-    parameters: obj({
-      paths: { type: "array", items: { type: "string" }, description: "Paths to stage." },
-      all: bool("Stage every change including untracked files."),
-      update: bool("Stage modifications of tracked files only."),
+      action: enumStr(["list", "add", "edit", "delete", "note"], "Action to perform (default list)."),
+      index: num("Memory index for edit/delete (numbers shown by list)."),
+      content: str("Content for add/edit, or note text for note."),
+      category: str("Category for add: preferences, architecture, or gotchas (default preferences)."),
+      limit: num("Max entries for list (default 20)."),
     }),
-  },
-  "git.commit": {
-    description: "Commit the staged changes.",
-    parameters: obj({
-      message: str("Commit message."),
-      all: bool("Also stage modifications of tracked files before committing."),
-    }, ["message"]),
-  },
-  "git.push": {
-    description: "Push commits to a remote.",
-    parameters: obj({
-      remote: str("Remote name. Defaults to the push default."),
-      branch: str("Branch to push. Defaults to the current branch."),
-      setUpstream: bool("Set upstream tracking for the branch."),
-      force: bool("Use --force-with-lease (safer forced push)."),
-    }),
-  },
-  "git.branch": {
-    description: "Branch operations.",
-    parameters: obj({
-      action: enumStr(["list", "create", "switch", "delete"], "Operation to perform."),
-      name: str("Branch name for create/switch/delete."),
-      force: bool("switch reuses an existing branch (-C); delete uses -D."),
-    }, ["action"]),
   },
   "hooks.list": {
     description: "List the workspace lifecycle hooks.",
@@ -516,16 +384,6 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
   "hooks.delete": {
     description: "Delete a lifecycle hook by index.",
     parameters: obj({ index: num("Index from hooks.list.") }, ["index"]),
-  },
-  "git.pr": {
-    description: "GitHub pull request operations via the gh CLI.",
-    parameters: obj({
-      action: enumStr(["create", "view", "list"], "Operation to perform (default create)."),
-      title: str("PR title for create."),
-      body: str("PR body for create."),
-      base: str("Base branch for create."),
-      draft: bool("Create as a draft PR."),
-    }),
   },
   "browser.hover": {
     description: "Hover over an element matching a CSS selector.",
@@ -624,45 +482,17 @@ export const TOOL_PARAM_SPECS: Record<string, { description: string; parameters:
       cellIndex: num("0-based index of the code cell to execute."),
     }, ["path", "cellIndex"]),
   },
-  "wait.for": {
-    description: "Sleep for a fixed number of seconds without polling. Use when you know how long a delay is needed.",
-    parameters: obj({
-      seconds: num("Seconds to sleep (0.1 to 21600)."),
-    }, ["seconds"]),
-  },
-  "wait.until": {
-    description: "Sleep until a wall-clock time. Accepts an ISO timestamp, 'HH:MM' / 'HH:MM:SS' (next occurrence today or tomorrow), or epoch milliseconds.",
-    parameters: obj({
-      time: str("ISO timestamp, HH:MM, HH:MM:SS, or epoch milliseconds."),
-    }, ["time"]),
-  },
-  "wait.forProcess": {
-    description: "Wait for a background process to exit and return its final output. Replaces manual shell.check polling loops.",
-    parameters: obj({
-      id: str("The background process id returned by shell.backgroundRun."),
-      timeout: num("Optional timeout in seconds (default 3600, max 21600)."),
-    }, ["id"]),
-  },
-  "wait.forCommand": {
-    description: "Run a shell command repeatedly until it exits 0 or the timeout elapses. Use to wait for a condition such as a build artifact, server readiness, or a lock file release.",
-    parameters: obj({
-      command: str("The command line to run until it succeeds."),
-      interval: num("Optional poll interval in seconds (default 1, min 0.25)."),
-      timeout: num("Optional overall timeout in seconds (default 600, max 21600)."),
-      cwd: str("Optional working directory (defaults to the workspace root)."),
-    }, ["command"]),
-  },
   "context.retrieve": {
     description: "Restore the full original content of a compressed tool output. Use the id shown in the compressed output marker when you need details that were omitted.",
     parameters: obj({
       id: str("The retrieval id shown in a compressed tool output marker."),
     }, ["id"]),
   },
-  "memory.note": {
-    description: "Append a short note to the workspace's agent-facing notes (stored in ~/.arc, shown to future sessions in the system prompt). Use for handoff context: what was done, what is next, gotchas.",
+  "tool.search": {
+    description: "Search for tools by keyword when the loaded tools do not cover the task. Matching tools are returned with their full schemas and loaded for subsequent calls in this session.",
     parameters: obj({
-      content: str("One or two lines of note text (max ~500 chars)."),
-    }, ["content"]),
+      query: str("Keywords describing the capability needed (e.g. 'browser tabs', 'notebook cells')."),
+    }, ["query"]),
   },
 };
 export function buildToolSpecs(

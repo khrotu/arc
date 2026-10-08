@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { extractFileSymbols, stableSymbolId, splitSearchTerms } from "../src/syms/extract";
 import { rankSymbols, extractSymbolTokens } from "../src/syms/rank";
-import { buildCodeContext, formatCodeContext } from "../src/syms/context";
+import { buildCodeContext, formatCodeContext, sanitizeQueryEcho } from "../src/syms/context";
 import { gini, fileDepth, riskScore, findRedundantPairs, assertUniqueAnchor, countOccurrences } from "../src/syms/health";
 const TS_SAMPLE = `export class AuthService {
   async login(user: string) {
@@ -135,5 +135,57 @@ describe("syms health", () => {
   });
   it("counts every anchor occurrence", () => {
     expect(countOccurrences("a a a a a", "a")).toBe(5);
+  });
+});
+describe("syms report fixes", () => {
+  it("clamps ranges to the real end of file", () => {
+    const text = "line1\nline2\nline3\nline4\n";
+    const syms = extractFileSymbols("a.ts", `export function last() {\n${text}}`);
+    const last = syms[syms.length - 1];
+    expect(last.endLine).toBeLessThanOrEqual(6);
+    const one = extractFileSymbols("b.ts", "const status = compute();\nconst other = 1;\n");
+    expect(one[0].endLine).toBe(1);
+  });
+  it("records calls on braceless declaration lines", () => {
+    const syms = extractFileSymbols("a.ts", "const result = helper();\n");
+    expect(syms[0].calls.map((c) => c.name)).toContain("helper");
+  });
+  it("matches stopword-only keyword queries", () => {
+    const syms = extractFileSymbols("src/auth.ts", TS_SAMPLE);
+    const ranked = rankSymbols("function", syms, 5);
+    expect(ranked.length).toBeGreaterThan(0);
+  });
+  it("reports omitted blocks instead of dropping them silently", () => {
+    const syms = extractFileSymbols("src/auth.ts", TS_SAMPLE);
+    const ctx = buildCodeContext("login validateToken AuthService", syms, () => TS_SAMPLE, { maxNodes: 10, maxCodeBlocks: 1 });
+    expect(ctx.blocks.length).toBeLessThanOrEqual(1);
+    expect(ctx.omittedBlocks.length).toBeGreaterThan(0);
+    expect(formatCodeContext(ctx)).toContain("code omitted for");
+  });
+  it("annotates entries with matched terms", () => {
+    const syms = extractFileSymbols("src/auth.ts", TS_SAMPLE);
+    const ctx = buildCodeContext("validateToken", syms, () => TS_SAMPLE, { maxNodes: 5 });
+    const top = ctx.entryPoints[0];
+    expect(top.qualified).toBeTruthy();
+    expect(top.matched.length).toBeGreaterThan(0);
+    expect(formatCodeContext(ctx)).toContain("[");
+  });
+  it("sanitizes the echoed query", () => {
+    expect(sanitizeQueryEcho("line1\nline2 ``` injected")).not.toContain("```");
+    expect(sanitizeQueryEcho("<span>per")).toContain("&lt;");
+    expect(sanitizeQueryEcho("  spaced\tout  ")).not.toMatch(/[\r\n\t]/);
+  });
+  it("models test-wrapper callbacks so nested calls resolve", () => {
+    const syms = extractFileSymbols("t/example.test.ts", "import { it, expect } from 'vitest';\nimport { helper } from './u';\nit('works', () => {\n  expect(helper()).toBe(1);\n});\n");
+    const names = syms.map((s) => s.name);
+    expect(names).toContain("it");
+    const itSym = syms.find((s) => s.name === "it")!;
+    expect(itSym.calls.map((c) => c.name)).toContain("helper");
+  });
+  it("hints at grep when nothing matches", () => {
+    const syms = extractFileSymbols("src/auth.ts", TS_SAMPLE);
+    const ctx = buildCodeContext("zzz_fake_function_xyz", syms, () => TS_SAMPLE, { maxNodes: 5 });
+    expect(ctx.entryPoints.length).toBe(0);
+    expect(formatCodeContext(ctx)).toContain("file.grep");
   });
 });

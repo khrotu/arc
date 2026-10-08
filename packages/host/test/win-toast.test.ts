@@ -34,4 +34,12 @@ describe("buildWinToast", () => {
   it("omits the image element without a logo", () => {
     expect(buildWinToast("Arc", "hi", undefined, "Microsoft.VisualStudioCode")).not.toContain("<image");
   });
+  it("uses protocol activation so clicks fire the launch URI", () => {
+    const ps = buildWinToast("Arc", "hi", undefined, "Microsoft.VisualStudioCode", "vscode://khrotu.arc-code/notification");
+    expect(ps).toContain('activationType="protocol"');
+    expect(ps).toContain('launch="vscode://khrotu.arc-code/notification"');
+  });
+  it("omits activation when no launch URI is set", () => {
+    expect(buildWinToast("Arc", "hi", undefined, "Microsoft.VisualStudioCode")).not.toContain("activationType");
+  });
 });

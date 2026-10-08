@@ -67,6 +67,7 @@ interface PendingDef {
   classScope: string;
 }
 const PATTERNS: { kind: SymbolKind; re: RegExp; nameIdx: number; check?: (line: string, name: string) => boolean }[] = [
+  { kind: "function", re: /^\s*(describe|it|test|beforeEach|afterEach|beforeAll|afterAll)\s*\(/, nameIdx: 1, check: (line) => line.includes("=>") || line.includes("{") },
   { kind: "class", re: /^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z0-9_]+)/, nameIdx: 1 },
   { kind: "interface", re: /^\s*(?:export\s+)?interface\s+([A-Za-z0-9_]+)/, nameIdx: 1 },
   { kind: "type", re: /^\s*(?:export\s+)?type\s+([A-Za-z0-9_]+)\s*=/, nameIdx: 1 },
@@ -102,6 +103,7 @@ function indentOf(line: string): number {
 }
 export function extractFileSymbols(file: string, text: string): CodeSymbol[] {
   const lines = text.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   const pending: PendingDef[] = [];
   let classScope = "";
   const classStack: { name: string; indent: number }[] = [];
@@ -117,7 +119,10 @@ export function extractFileSymbols(file: string, text: string): CodeSymbol[] {
       const name = m[p.nameIdx];
       if (!name || DEF_KEYWORDS.has(name) || name === "if") break;
       if (p.check && !p.check(line, name)) continue;
-      if (p.kind === "method" && !classScope && TEST_WRAPPERS.has(name)) break;
+      if (p.kind === "method" && !classScope && TEST_WRAPPERS.has(name)) {
+        pending.push({ kind: "function", name, line: lineNo, indent, isExported: false, classScope: "" });
+        break;
+      }
       if (p.kind === "method" && !classScope) {
         pending.push({ kind: "function", name, line: lineNo, indent, isExported: /^\s*export\s+/.test(line), classScope: "" });
       } else {
@@ -137,6 +142,7 @@ export function extractFileSymbols(file: string, text: string): CodeSymbol[] {
   return pending.map((def, i) => {
     const next = pending[i + 1];
     let endLine = next && next.line > def.line ? Math.min(next.line - 1, def.line + 400) : Math.min(lines.length, def.line + 120);
+    if ((def.kind === "const" || def.kind === "type" || def.kind === "interface") && !lines[def.line - 1].includes("{")) endLine = def.line;
     if (endLine < def.line) endLine = def.line;
     const clamped = endLine >= def.line + 400 || (next === undefined && endLine >= def.line + 120);
     const qualified = def.classScope ? `${def.classScope}::${def.name}` : def.name;
@@ -169,8 +175,7 @@ function extractCalls(body: string, baseLine: number, selfName: string): SymbolC
     let line = bodyLines[li];
     if (li === 0) {
       const brace = line.indexOf("{");
-      if (brace < 0) continue;
-      line = line.slice(brace + 1);
+      if (brace >= 0) line = line.slice(brace + 1);
     }
     CALL_RE.lastIndex = 0;
     let m: RegExpExecArray | null;

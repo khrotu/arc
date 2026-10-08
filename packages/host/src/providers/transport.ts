@@ -81,19 +81,36 @@ export interface ToolSpec {
   parameters: Record<string, unknown>;
 }
 export const toApiToolName = (name: string): string =>
-  name.replace(/_/g, "_u").replace(/\./g, "_d").replace(/\//g, "_s");
+  name.replace(/_/g, "_u").replace(/\./g, "").replace(/\//g, "_s");
 export function fromApiToolName(name: string): string {
   let out = "";
   for (let i = 0; i < name.length; i++) {
     if (name[i] === "_" && i + 1 < name.length) {
       const c = name[i + 1];
       if (c === "u") { out += "_"; i++; continue; }
-      if (c === "d") { out += "."; i++; continue; }
       if (c === "s") { out += "/"; i++; continue; }
     }
     out += name[i];
   }
   return out;
+}
+const squeezeApiToolName = (name: string): string => name.replace(/_([us])/g, "$1");
+export function createToolNameResolver(tools: { name: string }[]): (raw: string) => string {
+  const byApi = new Map<string, string>();
+  const squeezed = new Map<string, string>();
+  for (const t of tools) {
+    const api = toApiToolName(t.name);
+    if (!byApi.has(api)) byApi.set(api, t.name);
+    const k = squeezeApiToolName(api);
+    const prior = squeezed.get(k);
+    if (prior === undefined) squeezed.set(k, api);
+    else if (prior !== api) squeezed.set(k, "");
+  }
+  return (raw: string): string => {
+    const api = byApi.has(raw) ? raw : squeezed.get(squeezeApiToolName(raw));
+    if (!api) return raw;
+    return byApi.get(api) ?? raw;
+  };
 }
 export interface StreamRequest {
   model: import("../protocol/protocol.js").ModelDescriptor;

@@ -1,6 +1,6 @@
 import { AsyncEventQueue, readableToAsyncIterable } from "../util/stream.js";
 import { makeProxyDispatcher } from "../util/proxy.js";
-import { fromApiToolName, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
+import { createToolNameResolver, toApiToolName, sanitizeToolChains, chargeStreamContent, StreamContentLimitError, type StreamEvent, type StreamHandle, type StreamRequest, type StreamContentBudget, type Transport } from "./transport.js";
 import { caps } from "./capability-tracker.js";
 import { withRetry, policyFor } from "./retry.js";
 import { attributionHeaders, opencodeSessionHeader, isOpencodeEndpoint } from "./attribution.js";
@@ -63,6 +63,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
   const eff = req.reasoningEffort ? effortLevels[req.reasoningEffort] : undefined;
   let skipStreamOptions = false;
   let skipTemperature = false;
+  let resolveToolName = createToolNameResolver([]);
   const buildBody = (skipReasoning: boolean): Record<string, unknown> => {
     const wantsThink = hasThinking && !skipReasoning && caps.isSupported(modelKey, "thinking");
     const wantsEffort = !skipReasoning && eff && caps.isSupported(modelKey, "reasoning_effort");
@@ -80,6 +81,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
         type: "function",
         function: { name: toApiToolName(t.name), description: t.description, parameters: t.parameters },
       }));
+      resolveToolName = createToolNameResolver(req.tools);
     }
     if (req.provider.kind === "openrouter" && (wantsEffort || wantsThink)) {
       body.reasoning = {
@@ -181,7 +183,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
       q.push({
         type: "tool_call",
         id: entry.id,
-        name: fromApiToolName(entry.name),
+        name: resolveToolName(entry.name),
         args: safeParseJson<Record<string, unknown>>(entry.args) ?? {},
       });
     }
@@ -304,7 +306,7 @@ async function streamChatCompletions(req: StreamRequest, base: string, modelKey:
                 if (tc.function?.name) entry.name = tc.function.name;
                 if (typeof tc.function?.arguments === "string") entry.args += tc.function.arguments;
                 if (entry.name) {
-                  q.push({ type: "tool_call_delta", id: entry.id, name: fromApiToolName(entry.name), argsDelta: tc.function?.arguments ?? "" });
+                  q.push({ type: "tool_call_delta", id: entry.id, name: resolveToolName(entry.name), argsDelta: tc.function?.arguments ?? "" });
                 }
               }
               q.push({ type: "ping" });
@@ -454,6 +456,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
   Object.assign(headers, opencodeSessionHeader(base, req.provider.kind, req.conversationId, undefined, req.workspaceRoot));
   const MAX_ATTEMPTS = 2;
   const policy = policyFor(req.provider.kind);
+  const resolveToolName = createToolNameResolver(req.tools ?? []);
   let res!: Response;
   let lastText = "";
   let skipReasoning = false;
@@ -515,7 +518,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
           if (payload === "[DONE]") {
             for (const entry of toolAcc.values()) {
               if (!entry.name) continue;
-              q.push({ type: "tool_call", id: entry.callId, name: fromApiToolName(entry.name), args: safeParseJson<Record<string, unknown>>(entry.args) ?? {} });
+              q.push({ type: "tool_call", id: entry.callId, name: resolveToolName(entry.name), args: safeParseJson<Record<string, unknown>>(entry.args) ?? {} });
             }
             toolAcc.clear();
             flushUsage();
@@ -552,7 +555,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
                   const itemId = j.item.id ?? j.item.call_id ?? "";
                   const callId = j.item.call_id ?? j.item.id ?? "";
                   toolAcc.set(itemId, { callId, name: j.item.name ?? "", args: j.item.arguments ?? "" });
-                  if (j.item.name) q.push({ type: "tool_call_delta", id: callId, name: fromApiToolName(j.item.name), argsDelta: "" });
+                  if (j.item.name) q.push({ type: "tool_call_delta", id: callId, name: resolveToolName(j.item.name), argsDelta: "" });
                 }
                 break;
               }
@@ -560,7 +563,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
                 const entry = j.item_id ? toolAcc.get(j.item_id) : undefined;
                 if (entry && j.delta) {
                   entry.args += j.delta;
-                  q.push({ type: "tool_call_delta", id: entry.callId, name: fromApiToolName(entry.name), argsDelta: j.delta });
+                  q.push({ type: "tool_call_delta", id: entry.callId, name: resolveToolName(entry.name), argsDelta: j.delta });
                 }
                 break;
               }
@@ -573,7 +576,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
                   q.push({
                     type: "tool_call",
                     id: j.item.call_id ?? j.item.id ?? acc?.callId ?? "",
-                    name: fromApiToolName(j.item.name ?? acc?.name ?? "tool"),
+                    name: resolveToolName(j.item.name ?? acc?.name ?? "tool"),
                     args: safeParseJson<Record<string, unknown>>(argsText) ?? {},
                   });
                 }
@@ -616,7 +619,7 @@ async function streamResponses(req: StreamRequest, base: string, modelKey: strin
       if (!aborted) {
         for (const entry of toolAcc.values()) {
           if (!entry.name) continue;
-          q.push({ type: "tool_call", id: entry.callId, name: fromApiToolName(entry.name), args: safeParseJson<Record<string, unknown>>(entry.args) ?? {} });
+          q.push({ type: "tool_call", id: entry.callId, name: resolveToolName(entry.name), args: safeParseJson<Record<string, unknown>>(entry.args) ?? {} });
         }
         flushUsage();
       }

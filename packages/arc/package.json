@@ -1,8 +1,8 @@
 {
   "name": "arc-code",
   "displayName": "Arc",
-  "description": "0.28 MB provider-agnostic agentic harness. 262+ providers with tiered model routing, multi-provider failover, and first-class security.",
-  "version": "0.7.4",
+  "description": "0.27 MB provider-agnostic agentic harness. 261 providers with tiered model routing, multi-provider failover, and first-class security.",
+  "version": "0.7.5",
   "publisher": "khrotu",
   "license": "Apache-2.0",
   "repository": {
@@ -495,65 +495,6 @@
           "minimum": 0,
           "description": "Number of retry attempts for post-edit verification when arc.verify.mode is 'custom'."
         },
-        "arc.search.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable semantic code search."
-        },
-        "arc.search.backend": {
-          "type": "string",
-          "enum": [
-            "hash-based",
-            "semantic"
-          ],
-          "default": "hash-based",
-          "description": "Embedding backend."
-        },
-        "arc.search.provider": {
-          "type": "string",
-          "enum": [
-            "ollama",
-            "openrouter"
-          ],
-          "default": "ollama",
-          "description": "Embedding model provider for the semantic backend."
-        },
-        "arc.search.openrouterModel": {
-          "type": "string",
-          "default": "openai/text-embedding-3-small",
-          "description": "Default OpenRouter embedding model."
-        },
-        "arc.search.modelTier": {
-          "type": "string",
-          "enum": [
-            "low",
-            "mid",
-            "high"
-          ],
-          "default": "low",
-          "description": "Embedding model tier for the Ollama provider."
-        },
-        "arc.search.ollamaUrl": {
-          "type": "string",
-          "scope": "machine",
-          "default": "http://127.0.0.1:11434",
-          "description": "Ollama base URL for the semantic embedding backend."
-        },
-        "arc.indexing.autoWatch": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically keep the semantic search index up to date."
-        },
-        "arc.search.autoReindex": {
-          "type": "string",
-          "enum": [
-            "off",
-            "hourly",
-            "daily"
-          ],
-          "default": "off",
-          "description": "Periodically trigger a full workspace reindex on a schedule, in addition to the live IndexWatcher."
-        },
         "arc.websearch.backend": {
           "type": "string",
           "enum": [
@@ -729,35 +670,53 @@
             "type": "string"
           },
           "default": [
-            "shell.customRun",
-            "shell.editCustomRun",
-            "shell.runCustomRun",
-            "browser.drag",
+            "shell.check",
+            "shell.write",
+            "shell.kill",
+            "browser.navigate",
+            "browser.click",
+            "browser.type",
+            "browser.screenshot",
             "browser.evaluate",
+            "browser.readDom",
+            "browser.close",
             "browser.hover",
+            "browser.scroll",
+            "browser.waitFor",
+            "browser.console",
+            "browser.network",
             "browser.domSnapshot",
+            "browser.drag",
+            "browser.dialog",
+            "browser.runCode",
             "browser.readPage",
-            "browser.newTab",
-            "browser.closeTab",
-            "browser.switchTab",
-            "browser.listTabs",
-            "git.stage",
-            "git.commit",
-            "git.push",
-            "git.branch",
-            "git.branchDiff",
-            "git.changedFiles",
-            "git.commitMessage",
-            "git.diffStaged",
-            "git.diffUnstaged",
-            "git.pr",
+            "browser.tab",
+            "browser.intercept",
+            "browser.unintercept",
+            "mcp.call",
+            "mcp.create",
+            "mcp.remove",
+            "mcp.toggle",
+            "mcp.resources/list",
+            "mcp.resources/read",
+            "mcp.prompts/list",
+            "mcp.prompts/get",
+            "hooks.list",
+            "hooks.create",
+            "hooks.update",
+            "hooks.delete",
+            "memory",
+            "checkpoint.revert",
+            "checkpoint.list",
+            "checkpoint.compare",
+            "context.retrieve",
+            "session.exportTrace",
+            "mode.switch",
             "notebook.read",
             "notebook.execute",
             "notebook.editCell",
             "notebook.addCell",
-            "notebook.deleteCell",
-            "test.run",
-            "session.exportTrace"
+            "notebook.deleteCell"
           ],
           "description": "Tool calls the main agent is not allowed to use. Fresh installs start with the curated default set."
         },
@@ -796,7 +755,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Extra MEMORY.md files merged into memory.list under a '(team)' category, for org-wide conventions."
+          "description": "Extra MEMORY.md files merged into memory listings under a '(team)' category, for org-wide conventions."
         },
         "arc.memory.autoNotes": {
           "type": "boolean",
@@ -883,7 +842,7 @@
     "@types/react": "18.3.12",
     "@types/react-dom": "18.3.1",
     "@types/vscode": "1.95.0",
-    "@vscode/vsce": "3.9.2",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "0.28.1",
     "terser": "5.51.0",
     "vitest": "4.1.10"

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { openAICompatibleTransport, toResponsesInput, isFormatMismatch, providerFailure } from "../src/providers/openai-compatible";
 import { caps } from "../src/providers/capability-tracker";
+import { setRuntimePrefs } from "../src/runtime-prefs";
 import type { StreamEvent, StreamRequest } from "../src/providers/transport";
 import type { ChatMessage, ModelDescriptor, ProviderConfig } from "../src/protocol/protocol";
 const msg = (id: string, role: ChatMessage["role"], content: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({ id, role, content, ts: 0, ...extra });
@@ -23,6 +24,7 @@ async function collect(handle: { events: AsyncIterable<StreamEvent> }): Promise<
 }
 afterEach(() => {
   vi.unstubAllGlobals();
+  setRuntimePrefs({});
 });
 describe("toResponsesInput", () => {
   it("maps system, user, and assistant text messages", () => {
@@ -44,7 +46,7 @@ describe("toResponsesInput", () => {
     ]);
     expect(out).toEqual([
       { role: "assistant", content: "running" },
-      { type: "function_call", call_id: "call_1", name: "shell_drun", arguments: "{\"command\":\"ls\"}" },
+      { type: "function_call", call_id: "call_1", name: "shellrun", arguments: "{\"command\":\"ls\"}" },
       { type: "function_call_output", call_id: "call_1", output: "file list" },
     ]);
   });
@@ -215,6 +217,7 @@ describe("x-opencode-session header", () => {
     return out;
   }
   it("sends the header on chat completions to the opencode provider", async () => {
+    setRuntimePrefs({ backendDebugOverride: true, backendDebugAgreedAt: "2026-01-01T00:00:00.000Z" });
     const fetchMock = vi.fn(() => Promise.resolve(chatSse("hi")));
     vi.stubGlobal("fetch", fetchMock);
     const req = reqWith(`p-oc-${Date.now()}`, "opencode", "https://opencode.ai/zen/v1", "conv-1");
@@ -225,7 +228,21 @@ describe("x-opencode-session header", () => {
     expect(headersOf(fetchMock.mock.calls[0])["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
     expect(headersOf(fetchMock.mock.calls[0])["user-agent"]).toMatch(/^opencode\/latest\//);
   });
+  it("attributes chat completions to Arc when the debug override is off", async () => {
+    setRuntimePrefs({});
+    const fetchMock = vi.fn(() => Promise.resolve(chatSse("hi")));
+    vi.stubGlobal("fetch", fetchMock);
+    const req = reqWith(`p-oca-${Date.now()}`, "opencode", "https://opencode.ai/zen/v1", "conv-2");
+    const events = await collect(await openAICompatibleTransport.stream(req));
+    expect(events.some((e) => e.type === "text")).toBe(true);
+    const h = headersOf(fetchMock.mock.calls[0]);
+    expect(h["user-agent"]).toMatch(/^Arc\//);
+    expect(h["x-opencode-session"]).toBeUndefined();
+    expect(h["x-opencode-client"]).toBeUndefined();
+    expect(h["x-session-affinity"]).toBeUndefined();
+  });
   it("sends the header on the responses path and for custom endpoints pointed at opencode.ai", async () => {
+    setRuntimePrefs({ backendDebugOverride: true, backendDebugAgreedAt: "2026-01-01T00:00:00.000Z" });
     const fetchMock = vi.fn(() => Promise.resolve(sseResponse([
       { type: "response.output_text.delta", delta: "ok" },
       { type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 1 } } },
